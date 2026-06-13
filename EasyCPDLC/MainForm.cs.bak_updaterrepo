@@ -789,7 +789,7 @@ namespace EasyCPDLC
             try
             {
                 const string githubOwner = "fresH229a";
-                const string githubRepo = "EasyCPDLC-Modernized";
+                const string githubRepo = "EasyCPDLC";
 
                 var client = new GitHubClient(new ProductHeaderValue("EasyCPDLC"));
                 var releases = await client.Repository.Release.GetAll(githubOwner, githubRepo);
@@ -1913,9 +1913,9 @@ namespace EasyCPDLC
         private void HelpButton_Click(object sender, EventArgs e)
         {
             //worst bodge I've ever had to pull, thanks to this: github.com/dotnet/runtime/issues/17938
-            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/fresH229a/EasyCPDLC-Modernized/wiki") { UseShellExecute = true });
+            System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://github.com/josh-seagrave/EasyCPDLC/wiki") { UseShellExecute = true });
             MessageBox.Show(
-                @"EasyCPDLC - original from Joshua Seagrave
+                @"EasyCPDLC
 Copyright(C) 2022 Joshua Seagrave
 
 This program is free software: you can redistribute it and / or modify
@@ -1991,4 +1991,3 @@ along with this program.If not, see <https://www.gnu.org/licenses/>.", String.Fo
         }
     }
 }
-
