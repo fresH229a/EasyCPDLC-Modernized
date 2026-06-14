@@ -803,6 +803,12 @@ namespace EasyCPDLC
                         return;
                     }
 
+                    if (!this.parent.TryReserveFreeTextSlot(out TimeSpan remaining))
+                    {
+                        this.parent.NotifyFreeTextCooldown(remaining);
+                        return;
+                    }
+
                     _ = Task.Run(() => this.parent.SendCPDLCMessage(recipientText, "TELEX", formatMessage.Trim()));
                     break;
 
