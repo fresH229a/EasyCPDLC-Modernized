@@ -148,7 +148,6 @@ To create a Flow Pro button that opens EasyCPDLC in-game:
 6. Open the widget editor.
 7. Paste this JavaScript code:
 
-
 ```js
 run(() => {
     this.$api.command.open_browser("easycpdlc://toggle");
