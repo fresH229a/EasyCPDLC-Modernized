@@ -265,6 +265,7 @@ namespace EasyCPDLC
         public DataEntry(object _hoppieLogonCode = null, object _vatsimCID = null)
         {
             InitializeComponent();
+            this.ShowInTaskbar = false;
             Size = new Size(300, 533);
             MinimumSize = new Size(300, 533);
             MaximumSize = new Size(300, 533);

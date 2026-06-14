@@ -19,7 +19,6 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Drawing.Drawing2D;
 using System.Linq;
 using System.Net.Http;
 using System.Windows.Forms;
@@ -37,11 +36,19 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private const int cGrip = 16;
         private const int cCaption = 32;
 
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const int WS_EX_APPWINDOW = 0x00040000;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
+        private const int ScrollBarBoth = 3;
+
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool ReleaseCapture();
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
 
+        private bool requestPanelScrollHooksInstalled;
         private readonly ContextMenuStrip popupMenu = new();
         private ToolStripMenuItem directRequestMenu;
         private ToolStripMenuItem levelRequestMenu;
@@ -66,9 +73,6 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private readonly Font controlFontBold;
         private readonly Font textFont;
         private readonly Font textFontBold;
-
-        private string currentRequestTitle = string.Empty;
-        private string currentRequestSubtitle = string.Empty;
 
         private bool _needsLogon;
 
@@ -103,10 +107,12 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         public RequestForm(MainForm parent)
         {
             InitializeComponent();
+            this.ShowInTaskbar = false;
             requestFrame.AssetFileName = DcduStyleManager.AssetFile("RequestWindowFrame.png");
             ApplyTransparentScreenOverlays();
             ApplyWindowLayout();
             DcduWindowHelper.ApplyDeviceWindow(this, requestFrame, 22);
+            KeepRequestPanelScrollClean();
             InitialiseHotspots();
             this.MainForm = parent;
             this.TopMost = parent.TopMost;
@@ -147,7 +153,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void ApplyWindowLayout()
         {
             bool isBoeing = DcduStyleManager.IsBoeing;
-            Size targetSize = isBoeing ? new Size(960, 303) : new Size(850, 283);
+            Size targetSize = isBoeing ? new Size(800, 252) : new Size(750, 250);
             ClientSize = targetSize;
             Size = targetSize;
             MinimumSize = targetSize;
@@ -168,35 +174,36 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 clearButton.Bounds = ScaleRect(new Rectangle(960, 189, 98, 48), baseSize, targetSize);
                 sendButton.Bounds = ScaleRect(new Rectangle(960, 249, 98, 48), baseSize, targetSize);
 
-                requestScreen.Bounds = ScaleRect(new Rectangle(220, 32, 706, 294), baseSize, targetSize);
-                titleLabel.Bounds = new Rectangle(18, 6, requestScreen.Width - 36, 34);
-                messageFormatPanel.Bounds = new Rectangle(14, 45, requestScreen.Width - 28, requestScreen.Height - 57);
-                messageFormatPanel.Padding = new Padding(6, 0, 6, 6);
-                radioContainer.Location = new Point(54, targetSize.Height - 28);
+                requestScreen.Bounds = new Rectangle(92, 24, 596, 186);
+                messageFormatPanel.Bounds = new Rectangle(4, 4, requestScreen.Width - 8, requestScreen.Height - 8);
+                messageFormatPanel.Padding = new Padding(2, 0, 2, 0);
+                ConfigureRequestMessageGrid();
+                radioContainer.Location = new Point(44, 228);
                 radioContainer.Size = new Size(110, 20);
-                requestContainer.Location = new Point(targetSize.Width - 164, targetSize.Height - 28);
+                requestContainer.Location = new Point(684, 228);
                 requestContainer.Size = new Size(110, 20);
             }
             else
             {
-                pdcButton.Bounds = new Rectangle(19, 56, 95, 36);
-                logonButton.Bounds = new Rectangle(19, 100, 95, 36);
-                requestButton.Bounds = new Rectangle(19, 143, 95, 36);
-                reportButton.Bounds = new Rectangle(19, 186, 95, 36);
-                exitButton.Bounds = new Rectangle(733, 54, 92, 35);
-                clearButton.Bounds = new Rectangle(734, 145, 91, 36);
-                sendButton.Bounds = new Rectangle(733, 188, 92, 35);
-                requestScreen.Bounds = new Rectangle(126, 32, 604, 214);
-                titleLabel.Bounds = new Rectangle(16, 6, requestScreen.Width - 32, 34);
-                messageFormatPanel.Bounds = new Rectangle(12, 44, requestScreen.Width - 24, requestScreen.Height - 52);
-                messageFormatPanel.Padding = new Padding(4, 0, 4, 6);
-                radioContainer.Location = new Point(22, 255);
+                pdcButton.Bounds = new Rectangle(17, 50, 84, 32);
+                logonButton.Bounds = new Rectangle(17, 88, 84, 32);
+                requestButton.Bounds = new Rectangle(17, 125, 84, 32);
+                reportButton.Bounds = new Rectangle(17, 162, 84, 32);
+                exitButton.Bounds = new Rectangle(646, 48, 81, 31);
+                clearButton.Bounds = new Rectangle(647, 127, 80, 32);
+                sendButton.Bounds = new Rectangle(646, 164, 81, 31);
+                requestScreen.Bounds = new Rectangle(78, 24, 582, 188);
+                messageFormatPanel.Bounds = new Rectangle(4, 4, requestScreen.Width - 8, requestScreen.Height - 8);
+                messageFormatPanel.Padding = new Padding(2, 0, 2, 0);
+                ConfigureRequestMessageGrid();
+                radioContainer.Location = new Point(18, 224);
                 radioContainer.Size = new Size(105, 18);
-                requestContainer.Location = new Point(715, 255);
+                requestContainer.Location = new Point(628, 224);
                 requestContainer.Size = new Size(105, 18);
             }
 
-            ApplyPanelMetrics();
+            messageFormatPanel.AutoScroll = false;
+            KeepRequestPanelScrollClean();
             sendButton.Enabled = false;
             requestFrame.Invalidate();
         }
@@ -261,107 +268,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
             }
         }
 
-        private void ApplyTransparentScreenOverlays()
-        {
-            // Same visual behavior as the main DCDU: do not paint a separate dark block over the bitmap screen.
-            requestScreen.BackColor = Color.Transparent;
-            messageFormatPanel.BackColor = Color.Transparent;
-            radioContainer.BackColor = Color.Transparent;
-            requestContainer.BackColor = Color.Transparent;
-        }
-
-        private Color AccentColor()
-        {
-            return DcduStyleManager.IsBoeing
-                ? Color.FromArgb(86, 255, 103)
-                : Color.FromArgb(45, 231, 245);
-        }
-
-        private Color PrimaryTextColor()
-        {
-            return DcduStyleManager.IsBoeing
-                ? Color.FromArgb(178, 255, 188)
-                : controlFrontColor;
-        }
-
-        private Color MutedTextColor()
-        {
-            return DcduStyleManager.IsBoeing
-                ? Color.FromArgb(96, 128, 100)
-                : Color.FromArgb(78, 102, 120);
-        }
-
-        private Color FieldBackColor()
-        {
-            return Color.FromArgb(3, 8, 15);
-        }
-
-        private void SetRequestTitle(string title, string subtitle = "")
-        {
-            if (titleLabel == null)
-            {
-                return;
-            }
-
-            currentRequestTitle = title ?? string.Empty;
-            currentRequestSubtitle = subtitle ?? string.Empty;
-
-            titleLabel.Visible = true;
-            titleLabel.AutoSize = false;
-            titleLabel.Text = string.Empty;
-            titleLabel.BackColor = Color.Transparent;
-            titleLabel.Padding = new Padding(0);
-            titleLabel.Paint -= TitleLabel_Paint;
-            titleLabel.Paint += TitleLabel_Paint;
-            titleLabel.Invalidate();
-            titleLabel.BringToFront();
-        }
-
-        private void TitleLabel_Paint(object sender, PaintEventArgs e)
-        {
-            if (sender is not Label label)
-            {
-                return;
-            }
-
-            Color accent = AccentColor();
-
-            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-            Rectangle iconRect = new Rectangle(4, 7, 18, 14);
-            using Pen iconPen = new Pen(Color.FromArgb(175, accent), 1.4f);
-            e.Graphics.DrawRectangle(iconPen, iconRect);
-            e.Graphics.DrawLine(iconPen, iconRect.Left + 2, iconRect.Top + 2, iconRect.Left + iconRect.Width / 2, iconRect.Bottom - 3);
-            e.Graphics.DrawLine(iconPen, iconRect.Right - 2, iconRect.Top + 2, iconRect.Left + iconRect.Width / 2, iconRect.Bottom - 3);
-
-            using Font titleFont = new Font(textFontBold.FontFamily, Math.Max(9.2f, textFontBold.Size - 0.6f), FontStyle.Bold);
-            using Font subtitleFont = new Font(textFont.FontFamily, Math.Max(7.8f, textFont.Size - 1.5f), FontStyle.Regular);
-
-            TextRenderer.DrawText(
-                e.Graphics,
-                currentRequestTitle,
-                titleFont,
-                new Rectangle(30, 2, label.Width - 38, 17),
-                AccentColor(),
-                TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
-
-            if (!string.IsNullOrWhiteSpace(currentRequestSubtitle))
-            {
-                TextRenderer.DrawText(
-                    e.Graphics,
-                    currentRequestSubtitle,
-                    subtitleFont,
-                    new Rectangle(30, 18, label.Width - 38, 13),
-                    MutedTextColor(),
-                    TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
-            }
-
-            using Pen separator = new Pen(Color.FromArgb(28, accent), 1.0f);
-            e.Graphics.DrawLine(separator, 30, label.Height - 3, Math.Max(70, label.Width - 10), label.Height - 3);
-        }
-
-        private void ApplyPanelMetrics()
+        private void ConfigureRequestMessageGrid()
         {
             if (messageFormatPanel == null)
             {
@@ -370,79 +277,77 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
             messageFormatPanel.SuspendLayout();
 
-            messageFormatPanel.CellBorderStyle = TableLayoutPanelCellBorderStyle.None;
-            messageFormatPanel.GrowStyle = TableLayoutPanelGrowStyle.FixedSize;
-            messageFormatPanel.AutoScroll = false;
-            messageFormatPanel.ColumnCount = 6;
-            messageFormatPanel.RowCount = 7;
-
             messageFormatPanel.ColumnStyles.Clear();
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 10F));
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 26F));
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 24F));
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 25F));
-            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 10F));
+            messageFormatPanel.ColumnCount = 6;
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 8F));
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, DcduStyleManager.IsBoeing ? 88F : 82F));
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 44F));
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, DcduStyleManager.IsBoeing ? 105F : 98F));
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 42F));
+            messageFormatPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 8F));
 
-            float rowHeight = DcduStyleManager.IsBoeing ? 26F : 24F;
             messageFormatPanel.RowStyles.Clear();
-            for (int i = 0; i < 7; i++)
-            {
-                messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, rowHeight));
-            }
+            messageFormatPanel.RowCount = 7;
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 24F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Absolute, 20F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
+            messageFormatPanel.RowStyles.Add(new RowStyle(SizeType.Percent, 50F));
 
-            messageFormatPanel.ResumeLayout(true);
+            messageFormatPanel.ResumeLayout(false);
         }
 
-        private void MessageFormatPanel_CellPaint(object sender, TableLayoutCellPaintEventArgs e)
+        private void KeepRequestPanelScrollClean()
         {
-            // Field chrome is drawn in messageFormatPanel_Paint so spanning controls,
-            // especially REMARKS, get one clean border instead of per-cell fragments.
+            try
+            {
+                if (messageFormatPanel == null || messageFormatPanel.IsDisposed)
+                {
+                    return;
+                }
+
+                if (!requestPanelScrollHooksInstalled)
+                {
+                    requestPanelScrollHooksInstalled = true;
+                    messageFormatPanel.ControlAdded += (_, __) => BeginInvoke(new Action(KeepRequestPanelScrollClean));
+                    messageFormatPanel.ControlRemoved += (_, __) => BeginInvoke(new Action(KeepRequestPanelScrollClean));
+                    messageFormatPanel.SizeChanged += (_, __) => BeginInvoke(new Action(KeepRequestPanelScrollClean));
+                    messageFormatPanel.Layout += (_, __) =>
+                    {
+                        if (messageFormatPanel.IsHandleCreated)
+                        {
+                            ShowScrollBar(messageFormatPanel.Handle, ScrollBarBoth, false);
+                        }
+                    };
+                }
+
+                messageFormatPanel.HorizontalScroll.Visible = false;
+                messageFormatPanel.HorizontalScroll.Enabled = false;
+                messageFormatPanel.HorizontalScroll.Maximum = 0;
+
+                // Keep vertical scrolling available for longer templates, but avoid the ugly bottom bar.
+                messageFormatPanel.AutoScrollMinSize = new Size(0, 0);
+
+                if (messageFormatPanel.IsHandleCreated)
+                {
+                    ShowScrollBar(messageFormatPanel.Handle, ScrollBarBoth, false);
+                }
+            }
+            catch
+            {
+                // Cosmetic only.
+            }
         }
 
-        private void DrawFieldChrome(Graphics g, Rectangle bounds, bool focused, bool multiline)
+        private void ApplyTransparentScreenOverlays()
         {
-            if (bounds.Width <= 4 || bounds.Height <= 4)
-            {
-                return;
-            }
-
-            Color accent = AccentColor();
-
-            g.SmoothingMode = SmoothingMode.AntiAlias;
-            g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-
-            using GraphicsPath path = DcduPanel.RoundedRect(bounds, multiline ? 4 : 3);
-            using LinearGradientBrush brush = new LinearGradientBrush(
-                bounds,
-                Color.FromArgb(246, 2, 7, 12),
-                Color.FromArgb(246, 8, 17, 24),
-                LinearGradientMode.Vertical);
-
-            int borderAlpha = focused ? 205 : (DcduStyleManager.IsBoeing ? 118 : 132);
-            int glowAlpha = focused ? 58 : 25;
-
-            using Pen glow = new Pen(Color.FromArgb(glowAlpha, accent), focused ? 2.0f : 1.0f);
-            using Pen border = new Pen(Color.FromArgb(borderAlpha, accent), focused ? 1.35f : 1.0f);
-
-            g.FillPath(brush, path);
-
-            Rectangle glowRect = Rectangle.Inflate(bounds, 1, 1);
-            using GraphicsPath glowPath = DcduPanel.RoundedRect(glowRect, multiline ? 5 : 4);
-            g.DrawPath(glow, glowPath);
-            g.DrawPath(border, path);
-
-            using Pen innerLine = new Pen(Color.FromArgb(focused ? 80 : 38, Color.White), 1.0f);
-            int y = bounds.Top + 1;
-            g.DrawLine(innerLine, bounds.Left + 5, y, bounds.Right - 5, y);
-        }
-
-        private void InvalidateFieldChrome(object sender, EventArgs e)
-        {
-            if (messageFormatPanel != null && !messageFormatPanel.IsDisposed)
-            {
-                messageFormatPanel.Invalidate();
-            }
+            // Opaque content panels avoid WinForms transparent repaint artifacts while scrolling.
+            requestScreen.BackColor = Color.Transparent;
+            messageFormatPanel.BackColor = Color.Transparent;
+            radioContainer.BackColor = Color.Transparent;
+            requestContainer.BackColor = Color.Transparent;
         }
 
         private ToolStripMenuItem CreateMenuItem(string name)
@@ -518,24 +423,22 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private void AddRemarksField(TableLayoutPanel _control)
         {
-            _control.Controls.Add(CreateTemplate("REMARKS:"), 1, 4);
-
+            _control.Controls.Add(CreateTemplate("REMARKS: "), 1, 4);
             UITextBox remarksBox = CreateMultiLineBox("");
-            remarksBox.Name = "remarksTextBox";
-            remarksBox.TextChanged += ExpandMultiLineBox;
             _control.Controls.Add(remarksBox, 1, 5);
             _control.SetColumnSpan(remarksBox, 4);
-
-            ResizeRemarksBox(remarksBox);
+            _control.SetRowSpan(remarksBox, 2);
+            _control.Controls.Add(CreateBoxTemplate("[", AnchorStyles.Left), 0, 5);
+            _control.Controls.Add(CreateBoxTemplate("[", AnchorStyles.Left), 0, 6);
+            _control.Controls.Add(CreateBoxTemplate("]", AnchorStyles.Right), 5, 5);
+            _control.Controls.Add(CreateBoxTemplate("]", AnchorStyles.Right), 5, 6);
         }
 
         private void DepClxClick(object sender, EventArgs e)
         {
             depClxRadioButton.Checked = true;
-            SetRequestTitle("PRE-DEPARTURE CLEARANCE", "Datalink clearance request");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox("", 4), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("CALLSIGN: "), 1, 1);
@@ -557,10 +460,8 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void OcnClxClick(object sender, EventArgs e)
         {
             ocnClxRadioButton.Checked = true;
-            SetRequestTitle("OCEANIC CLEARANCE", "Oceanic clearance request");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox("", 4), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("CALLSIGN: "), 1, 1);
@@ -581,10 +482,8 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void DirectRequestClick(object sender, EventArgs e)
         {
             directRadioButton.Checked = true;
-            SetRequestTitle("REQUEST DIRECT", "Route change");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(MainForm.CurrentATCUnit, 4, true), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("REQUEST DIRECT TO "), 1, 1);
@@ -600,10 +499,8 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void LevelRequestClick(object sender, EventArgs e)
         {
             levelRadioButton.Checked = true;
-            SetRequestTitle("REQUEST LEVEL", "Altitude change");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(MainForm.CurrentATCUnit, 4, true), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("REQUESTED FL: "), 1, 1);
@@ -618,10 +515,8 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void SpeedRequestClick(object sender, EventArgs e)
         {
             speedRadioButton.Checked = true;
-            SetRequestTitle("REQUEST SPEED", "Speed change");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(MainForm.CurrentATCUnit, 4, true), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("REQUEST"), 1, 1);
@@ -639,10 +534,8 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void WhenCanWeRequestClick(object sender, EventArgs e)
         {
             wcwRadioButton.Checked = true;
-            SetRequestTitle("WHEN CAN WE EXPECT", "ATC query");
 
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(MainForm.CurrentATCUnit, 4, true), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("WHEN CAN WE EXPECT:"), 1, 1);
@@ -679,9 +572,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
             fix1.Text = MainForm.nextFix ?? "";
 
             reportRadioButton.Checked = true;
-            SetRequestTitle("POSITION REPORT", "Enroute report");
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("RECIPIENT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(MainForm.CurrentATCUnit, 4, true), 2, 0);
             messageFormatPanel.Controls.Add(CreateTemplate("FIX: "), 1, 1);
@@ -730,9 +621,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private void LogonButton_Click(object sender, EventArgs e)
         {
-            SetRequestTitle(NeedsLogon ? "CPDLC LOGON" : "CPDLC LOGOFF", "ATC unit");
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             messageFormatPanel.Controls.Add(CreateTemplate("ATC UNIT:"), 1, 0);
             messageFormatPanel.Controls.Add(CreateTextBox(NeedsLogon ? "" : MainForm.CurrentATCUnit, 4), 2, 0);
 
@@ -772,10 +661,10 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private AccessibleLabel CreateTemplate(string _text)
         {
-            AccessibleLabel _temp = new(PrimaryTextColor())
+            AccessibleLabel _temp = new(controlFrontColor)
             {
                 BackColor = Color.Transparent,
-                ForeColor = PrimaryTextColor(),
+                ForeColor = controlFrontColor,
                 Font = textFont,
                 AutoSize = true,
                 Text = _text,
@@ -783,7 +672,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 Height = 20,
 
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(0, 6, 0, 0),
+                Padding = new Padding(0, 4, 0, 0),
                 Margin = new Padding(0, 0, 0, 0),
                 TabStop = true,
                 TabIndex = 0
@@ -794,10 +683,10 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private AccessibleLabel CreateBoxTemplate(string _text, AnchorStyles _leftOrRight)
         {
-            AccessibleLabel _temp = new(PrimaryTextColor())
+            AccessibleLabel _temp = new(controlFrontColor)
             {
                 BackColor = Color.Transparent,
-                ForeColor = PrimaryTextColor(),
+                ForeColor = controlFrontColor,
                 Font = textFont,
                 AutoSize = true,
                 Text = _text,
@@ -805,7 +694,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 Height = 20,
 
                 TextAlign = ContentAlignment.MiddleLeft,
-                Padding = new Padding(0, 6, 0, 0),
+                Padding = new Padding(0, 4, 0, 0),
                 Margin = new Padding(0, 0, 0, 0),
                 TabStop = false,
                 Anchor = _leftOrRight
@@ -816,10 +705,10 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private UITextBox CreateTextBox(string _text, int _maxLength, bool _readOnly = false, bool _numsOnly = false)
         {
-            UITextBox _temp = new(PrimaryTextColor())
+            UITextBox _temp = new(controlFrontColor)
             {
-                BackColor = FieldBackColor(),
-                ForeColor = PrimaryTextColor(),
+                BackColor = controlBackColor,
+                ForeColor = controlFrontColor,
                 Font = textFontBold,
                 MaxLength = _maxLength,
                 BorderStyle = BorderStyle.None,
@@ -827,17 +716,12 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 CharacterCasing = CharacterCasing.Upper,
                 Top = 10,
                 PlaceholderText = new string('▯', _maxLength),
-                Height = DcduStyleManager.IsBoeing ? 22 : 21,
+                Height = 24,
                 ReadOnly = _readOnly,
                 TextAlign = HorizontalAlignment.Left,
                 TabIndex = 0,
-                Anchor = AnchorStyles.Left,
-                Margin = new Padding(7, 3, 10, 2)
+                Anchor = AnchorStyles.Left
             };
-
-            _temp.Enter += InvalidateFieldChrome;
-            _temp.Leave += InvalidateFieldChrome;
-            _temp.TextChanged += InvalidateFieldChrome;
 
             if (_numsOnly)
             {
@@ -866,10 +750,10 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
             UICheckBox _temp = new(_group)
             {
                 BackColor = Color.Transparent,
-                ForeColor = PrimaryTextColor(),
+                ForeColor = controlFrontColor,
                 Font = textFont,
                 Text = _text,
-                Padding = new Padding(2, 3, 6, 0),
+                Padding = new Padding(3, 4, 10, -30),
                 AutoSize = true,
                 TabIndex = 0
             };
@@ -893,13 +777,13 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private UITextBox CreateMultiLineBox(string _text)
         {
-            UITextBox _temp = new(PrimaryTextColor())
+            UITextBox _temp = new(controlFrontColor)
             {
-                BackColor = FieldBackColor(),
-                ForeColor = PrimaryTextColor(),
+                BackColor = controlBackColor,
+                ForeColor = controlFrontColor,
                 Font = textFontBold,
                 BorderStyle = BorderStyle.None,
-                Width = Math.Max(420, messageFormatPanel.Width - 88),
+                Width = Math.Max(180, messageFormatPanel.ClientSize.Width - 20),
                 Multiline = true,
                 WordWrap = true,
                 ScrollBars = ScrollBars.None,
@@ -907,17 +791,14 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 AcceptsTab = false,
                 Text = _text,
                 MaxLength = 255,
-                Height = MinimumRemarksHeight(),
+                Height = Math.Max(42, messageFormatPanel.ClientSize.Height - 118),
                 TabIndex = 0
             };
 
             _temp.CharacterCasing = CharacterCasing.Upper;
-            _temp.Padding = new Padding(3, 0, 3, 0);
-            _temp.Margin = new Padding(7, 3, 8, 2);
+            _temp.Padding = new Padding(3, 0, 3, -10);
+            _temp.Margin = new Padding(3, 5, 3, -10);
             _temp.TextAlign = HorizontalAlignment.Left;
-            _temp.Enter += InvalidateFieldChrome;
-            _temp.Leave += InvalidateFieldChrome;
-            _temp.TextChanged += InvalidateFieldChrome;
 
             return _temp;
         }
@@ -930,7 +811,6 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
         private void ClearButton_Click(object sender, EventArgs e)
         {
             messageFormatPanel.Controls.Clear();
-            ApplyPanelMetrics();
             sendButton.Enabled = false;
         }
 
@@ -960,6 +840,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
                 box.CheckedChanged += MessageInputChanged;
             }
 
+            KeepRequestPanelScrollClean();
             UpdateSendButtonState();
         }
 
@@ -1323,88 +1204,28 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
             }
         }
 
-        private int MinimumRemarksHeight()
-        {
-            return DcduStyleManager.IsBoeing ? 34 : 32;
-        }
-
-        private int MaximumRemarksHeight()
-        {
-            if (messageFormatPanel == null)
-            {
-                return DcduStyleManager.IsBoeing ? 76 : 68;
-            }
-
-            int usedHeight = messageFormatPanel.Padding.Top + messageFormatPanel.Padding.Bottom + 6;
-            int rowsToReserve = Math.Min(5, messageFormatPanel.RowStyles.Count);
-            for (int i = 0; i < rowsToReserve; i++)
-            {
-                usedHeight += (int)messageFormatPanel.RowStyles[i].Height;
-            }
-
-            return Math.Max(MinimumRemarksHeight(), messageFormatPanel.ClientSize.Height - usedHeight);
-        }
-
         private void ExpandMultiLineBox(object sender, EventArgs e)
         {
+            // Fixed-height remarks boxes use their own vertical scrollbar.
             if (sender is TextBox textBox)
             {
-                ResizeRemarksBox(textBox);
+                textBox.ScrollBars = ScrollBars.Vertical;
+                if (textBox.Height != 64)
+                {
+                    textBox.Height = 64;
+                }
             }
         }
 
-        private void ResizeRemarksBox(TextBox textBox)
+        protected override CreateParams CreateParams
         {
-            if (textBox == null || messageFormatPanel == null || messageFormatPanel.IsDisposed)
+            get
             {
-                return;
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_TOOLWINDOW;
+                cp.ExStyle &= ~WS_EX_APPWINDOW;
+                return cp;
             }
-
-            int minHeight = MinimumRemarksHeight();
-            int maxHeight = MaximumRemarksHeight();
-            int targetWidth = Math.Max(240, messageFormatPanel.ClientSize.Width - 88);
-
-            if (textBox.Width != targetWidth)
-            {
-                textBox.Width = targetWidth;
-            }
-
-            string measureText = string.IsNullOrEmpty(textBox.Text) ? " " : textBox.Text + " ";
-            Size measured = TextRenderer.MeasureText(
-                measureText,
-                textBox.Font,
-                new Size(Math.Max(40, textBox.ClientSize.Width - 8), int.MaxValue),
-                TextFormatFlags.WordBreak | TextFormatFlags.TextBoxControl);
-
-            int wantedHeight = measured.Height + 12;
-            int newHeight = Math.Max(minHeight, Math.Min(maxHeight, wantedHeight));
-            bool needsScrollbar = wantedHeight > maxHeight;
-            ScrollBars targetScrollBars = needsScrollbar ? ScrollBars.Vertical : ScrollBars.None;
-
-            if (textBox.ScrollBars != targetScrollBars)
-            {
-                textBox.ScrollBars = targetScrollBars;
-            }
-
-            if (textBox.Height != newHeight)
-            {
-                textBox.Height = newHeight;
-            }
-
-            if (messageFormatPanel.RowStyles.Count > 5)
-            {
-                messageFormatPanel.RowStyles[5].SizeType = SizeType.Absolute;
-                messageFormatPanel.RowStyles[5].Height = newHeight + 4;
-            }
-
-            if (messageFormatPanel.RowStyles.Count > 6)
-            {
-                messageFormatPanel.RowStyles[6].SizeType = SizeType.Absolute;
-                messageFormatPanel.RowStyles[6].Height = 0;
-            }
-
-            messageFormatPanel.PerformLayout();
-            messageFormatPanel.Invalidate();
         }
 
         protected override void WndProc(ref Message m)
@@ -1447,25 +1268,7 @@ public const int WM_NCLBUTTONDOWN = 0xA1;
 
         private void messageFormatPanel_Paint(object sender, PaintEventArgs e)
         {
-            if (messageFormatPanel == null || messageFormatPanel.IsDisposed)
-            {
-                return;
-            }
 
-            foreach (Control control in messageFormatPanel.Controls)
-            {
-                if (control is TextBox textBox && textBox.Visible)
-                {
-                    Rectangle bounds = Rectangle.Inflate(textBox.Bounds, 4, 3);
-
-                    bounds.X = Math.Max(0, bounds.X);
-                    bounds.Y = Math.Max(0, bounds.Y);
-                    bounds.Width = Math.Min(bounds.Width, messageFormatPanel.ClientSize.Width - bounds.X - 2);
-                    bounds.Height = Math.Min(bounds.Height, messageFormatPanel.ClientSize.Height - bounds.Y - 2);
-
-                    DrawFieldChrome(e.Graphics, bounds, textBox.Focused, textBox.Multiline);
-                }
-            }
         }
     }
 }

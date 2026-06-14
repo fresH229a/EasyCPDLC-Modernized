@@ -37,6 +37,10 @@ namespace EasyCPDLC
         private const int cGrip = 16;
         private const int cCaption = 32;
 
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const int WS_EX_APPWINDOW = 0x00040000;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
+
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -53,6 +57,7 @@ namespace EasyCPDLC
         public TelexForm(MainForm _parent, string _recipient = null)
         {
             InitializeComponent();
+            this.ShowInTaskbar = false;
             telexFrame.AssetFileName = DcduStyleManager.AssetFile("TelexWindowFrame.png");
             ApplyTransparentScreenOverlays();
             ApplyWindowLayout();
@@ -331,6 +336,13 @@ namespace EasyCPDLC
         {
             try
             {
+                string station = parent.GetSuggestedWeatherStationForRequests();
+
+                if (!string.IsNullOrWhiteSpace(station))
+                {
+                    return station;
+                }
+
                 if (parent.fsuipc.groundspeed < 100)
                 {
                     return parent.userVATSIMData.flight_plan.departure?.Trim().ToUpperInvariant() ?? string.Empty;
@@ -341,6 +353,22 @@ namespace EasyCPDLC
             catch
             {
                 return string.Empty;
+            }
+        }
+
+        private string ResolveWeatherStationForSend(string station)
+        {
+            try
+            {
+                string resolved = parent.ResolveWeatherStationForRequest(station);
+
+                return string.IsNullOrWhiteSpace(resolved)
+                    ? (station ?? string.Empty).Trim().ToUpperInvariant()
+                    : resolved.Trim().ToUpperInvariant();
+            }
+            catch
+            {
+                return (station ?? string.Empty).Trim().ToUpperInvariant();
             }
         }
 
@@ -851,12 +879,13 @@ namespace EasyCPDLC
                     break;
 
                 case "metarRadioButton":
-                    this.parent.WriteMessage("METAR REQUEST", "METAR", recipientText, true);
-                    this.parent.ArtificialDelay("METAR " + recipientText, "INFOREQ", "REQUEST");
+                    string metarRequestIdentifier = ResolveWeatherStationForSend(recipientText);
+                    this.parent.WriteMessage("METAR REQUEST", "METAR", metarRequestIdentifier, true);
+                    this.parent.ArtificialDelay("METAR " + metarRequestIdentifier, "INFOREQ", "REQUEST");
                     break;
 
                 case "atisRadioButton":
-                    string atisRequestIdentifier = GetSelectedAtisRequestIdentifier(recipientText);
+                    string atisRequestIdentifier = GetSelectedAtisRequestIdentifier(ResolveWeatherStationForSend(recipientText));
                     bool autoRefreshAtis = IsAtisAutoRefreshSelected();
                     this.parent.SetAtisAutoRefresh(atisRequestIdentifier, autoRefreshAtis);
                     this.parent.WriteMessage("ATIS REQUEST", "ATIS", atisRequestIdentifier, true);
@@ -873,6 +902,17 @@ namespace EasyCPDLC
             }
 
             this.Close();
+        }
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_TOOLWINDOW;
+                cp.ExStyle &= ~WS_EX_APPWINDOW;
+                return cp;
+            }
         }
 
         protected override void WndProc(ref Message m)

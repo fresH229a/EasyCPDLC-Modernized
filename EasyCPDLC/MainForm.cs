@@ -19,6 +19,7 @@ using Octokit;
 using System;
 using System.Collections.Generic;
 using System.Data;
+using System.Diagnostics;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
@@ -45,6 +46,9 @@ namespace EasyCPDLC
         public const int HT_CAPTION = 0x2;
         private const int cGrip = 16;
         private const int cCaption = 32;
+        private const int WS_EX_TOOLWINDOW = 0x00000080;
+        private const int WS_EX_APPWINDOW = 0x00040000;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern int SendMessage(IntPtr hWnd, int Msg, int wParam, int lParam);
         [System.Runtime.InteropServices.DllImport("user32.dll")]
@@ -53,6 +57,16 @@ namespace EasyCPDLC
         private const int ScrollBarBoth = 3;
         [System.Runtime.InteropServices.DllImport("user32.dll")]
         private static extern bool ShowScrollBar(IntPtr hWnd, int wBar, bool bShow);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool IsIconic(IntPtr hWnd);
+        [System.Runtime.InteropServices.DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        private const int SW_RESTORE = 9;
+        private const string EasyCpdlcUriScheme = "easycpdlc";
+        private const string EasyCpdlcProtocolPipeName = "EasyCPDLC_Show_Pipe_v1";
 
         private static readonly Logger Logger = LogManager.GetCurrentClassLogger();
 
@@ -76,7 +90,8 @@ namespace EasyCPDLC
                 bool focused = Focused;
                 bool hovered = ClientRectangle.Contains(PointToClient(Cursor.Position));
                 string badgeText = Text ?? string.Empty;
-                bool isIndicatorBadge = badgeText.Contains("●") || badgeText.Contains("✓");
+                bool isUpdateBadge = badgeText.Contains("↻");
+                bool isIndicatorBadge = badgeText.Contains("●") || badgeText.Contains("✓") || badgeText.Contains("✈") || isUpdateBadge;
 
                 // LED status badges need more contrast on the Boeing display.
                 // Keep the LED color for state, but draw the box itself in a pale DCDU glass tone.
@@ -110,27 +125,73 @@ namespace EasyCPDLC
                 if (isIndicatorBadge)
                 {
                     bool showCheck = badgeText.Contains("✓");
-                    string title = badgeText.Replace("●", string.Empty).Replace("✓", string.Empty).Trim();
+                    bool showAircraft = badgeText.Contains("✈");
+                    bool showUpdate = badgeText.Contains("↻");
+                    string title = badgeText.Replace("●", string.Empty).Replace("✓", string.Empty).Replace("✈", string.Empty).Replace("↻", string.Empty).Trim();
                     Rectangle textRect = new Rectangle(bounds.Left + 5, bounds.Top, Math.Max(1, bounds.Width - 23), bounds.Height);
 
-                    TextRenderer.DrawText(
-                        e.Graphics,
-                        title,
-                        Font,
-                        textRect,
-                        titleColor,
-                        TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+                    if (!showUpdate)
+                    {
+                        TextRenderer.DrawText(
+                            e.Graphics,
+                            title,
+                            Font,
+                            textRect,
+                            titleColor,
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
+                    }
 
-                    int indicatorSize = Math.Min(10, Math.Max(7, bounds.Height - 8));
-                    Rectangle indicatorRect = new Rectangle(
-                        bounds.Right - indicatorSize - 7,
-                        bounds.Top + (bounds.Height - indicatorSize) / 2,
-                        indicatorSize,
-                        indicatorSize);
+                    int indicatorSize = showUpdate
+                        ? Math.Min(15, Math.Max(12, bounds.Height - 4))
+                        : Math.Min(10, Math.Max(7, bounds.Height - 8));
+                    Rectangle indicatorRect = showUpdate
+                        ? new Rectangle(
+                            bounds.Left + (bounds.Width - indicatorSize) / 2,
+                            bounds.Top + (bounds.Height - indicatorSize) / 2,
+                            indicatorSize,
+                            indicatorSize)
+                        : new Rectangle(
+                            bounds.Right - indicatorSize - 7,
+                            bounds.Top + (bounds.Height - indicatorSize) / 2,
+                            indicatorSize,
+                            indicatorSize);
 
                     using SolidBrush glowBrush = new SolidBrush(Color.FromArgb((focused || hovered) ? 94 : 58, accent));
-                    Rectangle glowRect = Rectangle.Inflate(indicatorRect, 3, 3);
+                    Rectangle glowRect = Rectangle.Inflate(indicatorRect, showUpdate ? 4 : 3, showUpdate ? 4 : 3);
                     e.Graphics.FillEllipse(glowBrush, glowRect);
+
+                    if (showUpdate)
+                    {
+                        using LinearGradientBrush updateFill = new LinearGradientBrush(
+                            indicatorRect,
+                            Color.FromArgb(245, Color.White),
+                            accent,
+                            LinearGradientMode.ForwardDiagonal);
+                        using Pen updateBorder = new Pen(Color.FromArgb(230, Color.White), 1.0f);
+                        using Pen arrowPen = new Pen(Color.White, 2.0f)
+                        {
+                            StartCap = LineCap.Round,
+                            EndCap = LineCap.Custom,
+                            CustomEndCap = new AdjustableArrowCap(3.0f, 3.0f, true)
+                        };
+                        using Pen arrowPen2 = new Pen(Color.White, 2.0f)
+                        {
+                            StartCap = LineCap.Round,
+                            EndCap = LineCap.Custom,
+                            CustomEndCap = new AdjustableArrowCap(3.0f, 3.0f, true)
+                        };
+                        using SolidBrush shineBrush = new SolidBrush(Color.FromArgb(86, Color.White));
+
+                        e.Graphics.FillEllipse(updateFill, indicatorRect);
+                        e.Graphics.DrawEllipse(updateBorder, indicatorRect);
+                        e.Graphics.FillEllipse(shineBrush,
+                            new Rectangle(indicatorRect.Left + 2, indicatorRect.Top + 2, Math.Max(3, indicatorSize / 3), Math.Max(3, indicatorSize / 3)));
+
+                        RectangleF arcOne = new RectangleF(indicatorRect.Left + 3, indicatorRect.Top + 3, indicatorRect.Width - 6, indicatorRect.Height - 6);
+                        e.Graphics.DrawArc(arrowPen, arcOne, 212, 118);
+                        e.Graphics.DrawArc(arrowPen2, arcOne, 32, 118);
+                        return;
+                    }
 
                     if (showCheck)
                     {
@@ -160,6 +221,24 @@ namespace EasyCPDLC
                         e.Graphics.DrawLines(checkShadow, new[] { p1, p2, p3 });
                         e.Graphics.DrawLines(checkPen, new[] { p1, p2, p3 });
                         e.Graphics.DrawLine(checkHighlight, p2.X - 0.5f, p2.Y - 1.2f, p3.X - 1.2f, p3.Y + 0.3f);
+                        return;
+                    }
+
+                    if (showAircraft)
+                    {
+                        using Font aircraftFont = new Font("Segoe UI Symbol", Math.Max(9.0f, indicatorSize + 2.0f), FontStyle.Bold, GraphicsUnit.Pixel);
+                        Rectangle aircraftRect = Rectangle.Inflate(indicatorRect, 4, 4);
+
+                        using SolidBrush aircraftGlow = new SolidBrush(Color.FromArgb((focused || hovered) ? 120 : 76, accent));
+                        e.Graphics.FillEllipse(aircraftGlow, Rectangle.Inflate(indicatorRect, 4, 3));
+
+                        TextRenderer.DrawText(
+                            e.Graphics,
+                            "✈",
+                            aircraftFont,
+                            aircraftRect,
+                            accent,
+                            TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding);
                         return;
                     }
 
@@ -597,6 +676,11 @@ namespace EasyCPDLC
         private Panel atisAvailabilityPopupPanel;
         private System.Windows.Forms.Label atisAvailabilityPopupLabel;
         private bool atisAvailabilityPopupPinned = false;
+        private Panel atisAutoGroupPanel;
+        private System.Windows.Forms.Label atisAutoStatusLabel;
+        private Panel atisAutoPopupPanel;
+        private System.Windows.Forms.Label atisAutoPopupLabel;
+        private bool atisAutoPopupPinned = false;
         private string activeMessageFilter = "ALL";
         private string clearanceStatusText = "CLR --";
         private string datalinkStatusText = "PDC --";
@@ -633,9 +717,10 @@ namespace EasyCPDLC
         private DateTime pendingSilentAtisHoverRequestUtc = DateTime.MinValue;
         private string atisAvailabilityState = "UNKNOWN";
         private DateTime lastSilentAtisHoverRequestUtc = DateTime.MinValue;
-        private static readonly TimeSpan atisHoverRequestCooldown = TimeSpan.FromMinutes(2);
+        private static readonly TimeSpan atisHoverRequestCooldown = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan atisHoverPendingLifetime = TimeSpan.FromSeconds(90);
-        private static readonly TimeSpan atisHoverCacheLifetime = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan atisHoverCacheLifetime = TimeSpan.FromSeconds(90);
+        private static readonly TimeSpan atisHoverVatsimRefreshInterval = TimeSpan.FromMinutes(2);
 
         private AccessibleLabel wilcoLabel;
         private AccessibleLabel rogerLabel;
@@ -672,6 +757,8 @@ namespace EasyCPDLC
         private string atisAutoRefreshDisplayTarget = string.Empty;
         private string atisAutoRefreshLastLetter = string.Empty;
         private DateTime nextAtisAutoRefreshUtc = DateTime.MinValue;
+        private bool preferArrivalStationAfterAirborne = false;
+        private string lastWeatherFlightPlanSignature = string.Empty;
         private string lastPdcAvailabilityHintStation = string.Empty;
 
         private readonly TimeSpan freeTextCooldown = TimeSpan.FromMinutes(5);
@@ -685,6 +772,14 @@ namespace EasyCPDLC
         private static readonly TimeSpan updateTimer = TimeSpan.FromSeconds(20);
         private CancellationTokenSource requestCancellationTokenSource;
         private CancellationToken requestCancellationToken;
+        private CancellationTokenSource protocolPipeCancellationTokenSource;
+        private NotifyIcon trayIcon;
+        private ContextMenuStrip trayMenu;
+        private readonly DcduHotspotButton mainMinimizeButton = new();
+        private readonly DcduHotspotButton mainReloadFlightPlanButton = new();
+        private bool arrivalReloadReminderShown = false;
+        private DateTime arrivalReloadReminderStartUtc = DateTime.MinValue;
+        private string arrivalReloadReminderSignature = string.Empty;
         private const string HoppieConnectUrl = "https://www.hoppie.nl/acars/system/connect.html";
 
         public MainForm()
@@ -694,6 +789,13 @@ namespace EasyCPDLC
             config.AddRule(LogLevel.Debug, LogLevel.Fatal, logFile);
             LogManager.Configuration = config;
             Logger.Info("Logging initialised, beginning setup");
+
+            if (TryForwardProtocolLaunchToExistingInstance())
+            {
+                Logger.Info("Protocol launch forwarded to existing EasyCPDLC instance");
+                Environment.Exit(0);
+                return;
+            }
 
             textFont = new Font("Consolas", 10.5f, FontStyle.Regular);
             textFontBold = new Font("Consolas", 11.5f, FontStyle.Bold);
@@ -713,6 +815,9 @@ namespace EasyCPDLC
             }
             InitializeComponent();
             ApplyDisplayStyle();
+            this.ShowInTaskbar = false;
+            ConfigureTrayIcon();
+            ConfigureMainFrameButtonHotspots();
             this.TopMost = StayOnTop;
             this.FormBorderStyle = FormBorderStyle.None;
             this.DoubleBuffered = true;
@@ -806,6 +911,11 @@ namespace EasyCPDLC
             {
                 ApplyMainBadgeStyle(atisStatusLabel, AtisStatusColor(), false);
             }
+
+            if (atisAutoStatusLabel != null)
+            {
+                ApplyMainBadgeStyle(atisAutoStatusLabel, AtisAutoStatusColor(), false);
+            }
         }
 
         private Color ClearanceStatusColor()
@@ -842,6 +952,13 @@ namespace EasyCPDLC
 
         private Color DatalinkStatusColor()
         {
+            if (IsAirborneForStatusBadges())
+            {
+                // Airborne PDC badge is a flight-phase indicator, so it follows CLR colors
+                // instead of staying green only because PDC is available.
+                return ClearanceStatusColor();
+            }
+
             string upper = (datalinkStatusText ?? string.Empty).ToUpperInvariant();
 
             // PDC availability is based on the Hoppie callsign list:
@@ -879,6 +996,13 @@ namespace EasyCPDLC
             }
 
             return MainPrimaryTextColor();
+        }
+
+        private Color AtisAutoStatusColor()
+        {
+            return IsAtisAutoRefreshEnabled()
+                ? DcduTheme.Green
+                : Color.FromArgb(255, 86, 74);
         }
 
         private void ApplyMainBadgeStyle(System.Windows.Forms.Label label, Color color, bool bold)
@@ -1099,8 +1223,20 @@ namespace EasyCPDLC
 
             if (datalinkStatusLabel == null)
             {
-                datalinkStatusLabel = CreateMainStatusBadge(BuildDotBadgeText("PDC"), Cursors.Default);
+                datalinkStatusLabel = CreateMainStatusBadge(BuildPdcBadgeText(), Cursors.Default);
                 screenPanel.Controls.Add(datalinkStatusLabel);
+            }
+
+            if (atisAutoGroupPanel == null)
+            {
+                atisAutoGroupPanel = new Panel
+                {
+                    BackColor = Color.Transparent,
+                    Enabled = false
+                };
+                atisAutoGroupPanel.Paint += AtisAutoGroupPanel_Paint;
+                screenPanel.Controls.Add(atisAutoGroupPanel);
+                atisAutoGroupPanel.SendToBack();
             }
 
             if (atisStatusLabel == null)
@@ -1118,13 +1254,43 @@ namespace EasyCPDLC
                 screenPanel.Controls.Add(atisStatusLabel);
             }
 
+            if (atisAutoStatusLabel == null)
+            {
+                atisAutoStatusLabel = CreateMainStatusBadge(BuildAtisAutoBadgeText(), Cursors.Hand);
+                atisAutoStatusLabel.MouseEnter += (_, __) => ShowAtisAutoPopup(false);
+                atisAutoStatusLabel.MouseLeave += (_, __) =>
+                {
+                    if (!atisAutoPopupPinned)
+                    {
+                        HideAtisAutoPopup();
+                    }
+                };
+                atisAutoStatusLabel.Click += (_, __) =>
+                {
+                    if (IsAtisAutoRefreshEnabled())
+                    {
+                        SetAtisAutoRefresh(string.Empty, false);
+                    }
+
+                    ToggleAtisAutoPopup();
+                };
+                screenPanel.Controls.Add(atisAutoStatusLabel);
+            }
+
+            if (atisAutoGroupPanel != null)
+            {
+                atisAutoGroupPanel.SendToBack();
+            }
+
             clearanceStatusLabel.BringToFront();
             datalinkStatusLabel.BringToFront();
             atisStatusLabel.BringToFront();
+            atisAutoStatusLabel.BringToFront();
             callsignCaptionLabel.BringToFront();
             callsignDisplayLabel.BringToFront();
             ConfigureClearanceTimelinePopup();
             ConfigureAtisAvailabilityPopup();
+            ConfigureAtisAutoPopup();
             messageFilterLabel.BringToFront();
             ConfigureFilterDropdownMenu();
             UpdateSmartStatusLabelColors();
@@ -1166,7 +1332,7 @@ namespace EasyCPDLC
         {
             ConfigureSmartWidgets();
 
-            if (messageFilterLabel == null || clearanceStatusLabel == null || datalinkStatusLabel == null || atisStatusLabel == null)
+            if (messageFilterLabel == null || clearanceStatusLabel == null || datalinkStatusLabel == null || atisStatusLabel == null || atisAutoStatusLabel == null)
             {
                 return;
             }
@@ -1182,24 +1348,37 @@ namespace EasyCPDLC
                 callsignDisplayLabel.Location = new Point(92, 50);
                 callsignDisplayLabel.Size = new Size(116, 15);
 
-                // CLR / PDC / ATIS belong under the CURRENT ATS UNIT block on the right.
-                clearanceStatusLabel.Location = new Point(246, 57);
+                // CLR / PDC / ATIS + compact auto-refresh icon belong under the CURRENT ATS UNIT block.
+                clearanceStatusLabel.Location = new Point(254, 57);
                 clearanceStatusLabel.Size = new Size(58, 19);
-                datalinkStatusLabel.Location = new Point(320, 57);
+                datalinkStatusLabel.Location = new Point(318, 57);
                 datalinkStatusLabel.Size = new Size(58, 19);
-                atisStatusLabel.Location = new Point(386, 57);
-                atisStatusLabel.Size = new Size(72, 19);
+                if (atisAutoGroupPanel != null)
+                {
+                    atisAutoGroupPanel.Location = new Point(378, 53);
+                    atisAutoGroupPanel.Size = new Size(108, 28);
+                }
+                atisStatusLabel.Location = new Point(382, 57);
+                atisStatusLabel.Size = new Size(61, 19);
+                atisAutoStatusLabel.Location = new Point(445, 57);
+                atisAutoStatusLabel.Size = new Size(33, 19);
 
                 if (clearanceTimelinePopupPanel != null)
                 {
-                    clearanceTimelinePopupPanel.Location = new Point(238, 82);
-                    clearanceTimelinePopupPanel.Size = new Size(230, 72);
+                    clearanceTimelinePopupPanel.Location = new Point(264, 82);
+                    clearanceTimelinePopupPanel.Size = new Size(222, 72);
                 }
 
                 if (atisAvailabilityPopupPanel != null)
                 {
-                    atisAvailabilityPopupPanel.Location = new Point(166, 82);
-                    atisAvailabilityPopupPanel.Size = new Size(300, 118);
+                    atisAvailabilityPopupPanel.Location = new Point(194, 82);
+                    atisAvailabilityPopupPanel.Size = new Size(292, 118);
+                }
+
+                if (atisAutoPopupPanel != null)
+                {
+                    atisAutoPopupPanel.Location = new Point(320, 82);
+                    atisAutoPopupPanel.Size = new Size(166, 58);
                 }
             }
             else
@@ -1213,24 +1392,37 @@ namespace EasyCPDLC
                 callsignDisplayLabel.Location = new Point(88, 54);
                 callsignDisplayLabel.Size = new Size(116, 15);
 
-                // CLR / PDC / ATIS belong under the CURRENT ATS UNIT block on the right.
-                clearanceStatusLabel.Location = new Point(248, 65);
+                // CLR / PDC / ATIS + compact auto-refresh icon belong under the CURRENT ATS UNIT block.
+                clearanceStatusLabel.Location = new Point(250, 65);
                 clearanceStatusLabel.Size = new Size(58, 19);
-                datalinkStatusLabel.Location = new Point(322, 65);
+                datalinkStatusLabel.Location = new Point(314, 65);
                 datalinkStatusLabel.Size = new Size(58, 19);
-                atisStatusLabel.Location = new Point(388, 65);
-                atisStatusLabel.Size = new Size(72, 19);
+                if (atisAutoGroupPanel != null)
+                {
+                    atisAutoGroupPanel.Location = new Point(374, 61);
+                    atisAutoGroupPanel.Size = new Size(100, 28);
+                }
+                atisStatusLabel.Location = new Point(378, 65);
+                atisStatusLabel.Size = new Size(58, 19);
+                atisAutoStatusLabel.Location = new Point(438, 65);
+                atisAutoStatusLabel.Size = new Size(30, 19);
 
                 if (clearanceTimelinePopupPanel != null)
                 {
-                    clearanceTimelinePopupPanel.Location = new Point(240, 90);
-                    clearanceTimelinePopupPanel.Size = new Size(230, 72);
+                    clearanceTimelinePopupPanel.Location = new Point(262, 90);
+                    clearanceTimelinePopupPanel.Size = new Size(212, 72);
                 }
 
                 if (atisAvailabilityPopupPanel != null)
                 {
-                    atisAvailabilityPopupPanel.Location = new Point(170, 90);
-                    atisAvailabilityPopupPanel.Size = new Size(300, 118);
+                    atisAvailabilityPopupPanel.Location = new Point(192, 90);
+                    atisAvailabilityPopupPanel.Size = new Size(282, 118);
+                }
+
+                if (atisAutoPopupPanel != null)
+                {
+                    atisAutoPopupPanel.Location = new Point(308, 90);
+                    atisAutoPopupPanel.Size = new Size(166, 58);
                 }
             }
 
@@ -1243,6 +1435,7 @@ namespace EasyCPDLC
             clearanceStatusLabel.BringToFront();
             datalinkStatusLabel.BringToFront();
             atisStatusLabel.BringToFront();
+            atisAutoStatusLabel.BringToFront();
             if (clearanceTimelinePopupPanel != null && clearanceTimelinePopupPanel.Visible)
             {
                 clearanceTimelinePopupPanel.BringToFront();
@@ -1250,6 +1443,10 @@ namespace EasyCPDLC
             if (atisAvailabilityPopupPanel != null && atisAvailabilityPopupPanel.Visible)
             {
                 atisAvailabilityPopupPanel.BringToFront();
+            }
+            if (atisAutoPopupPanel != null && atisAutoPopupPanel.Visible)
+            {
+                atisAutoPopupPanel.BringToFront();
             }
             messageFilterLabel.BringToFront();
         }
@@ -1261,13 +1458,57 @@ namespace EasyCPDLC
                 : title.Trim().ToUpperInvariant() + " ●";
         }
 
+        private static string BuildAircraftBadgeText(string title)
+        {
+            return string.IsNullOrWhiteSpace(title)
+                ? "✈"
+                : title.Trim().ToUpperInvariant() + " ✈";
+        }
+
+        private bool IsAirborneForStatusBadges()
+        {
+            return ShouldUseArrivalAtisForHover();
+        }
+
         private string BuildClearanceBadgeText()
         {
             string upper = (clearanceStatusText ?? string.Empty).ToUpperInvariant();
 
-            return upper.Contains("ACCEPTED") || upper.Contains("ACC")
-                ? "CLR ✓"
+            if (upper.Contains("ACCEPTED") || upper.Contains("ACC"))
+            {
+                return "CLR ✓";
+            }
+
+            return IsAirborneForStatusBadges()
+                ? BuildAircraftBadgeText("CLR")
                 : BuildDotBadgeText("CLR");
+        }
+
+        private string BuildPdcBadgeText()
+        {
+            return IsAirborneForStatusBadges()
+                ? BuildAircraftBadgeText("PDC")
+                : BuildDotBadgeText("PDC");
+        }
+
+        private string BuildAtisAutoBadgeText()
+        {
+            return "↻";
+        }
+
+        private void UpdateAtisAutoStatusLabel()
+        {
+            if (atisAutoStatusLabel != null)
+            {
+                atisAutoStatusLabel.Text = BuildAtisAutoBadgeText();
+                atisAutoStatusLabel.ForeColor = AtisAutoStatusColor();
+                atisAutoStatusLabel.Invalidate();
+            }
+
+            if (atisAutoPopupPanel != null && atisAutoPopupPanel.Visible)
+            {
+                UpdateAtisAutoPopupText();
+            }
         }
 
         private void UpdateClearanceStatusLabel()
@@ -1281,7 +1522,7 @@ namespace EasyCPDLC
 
             if (datalinkStatusLabel != null)
             {
-                datalinkStatusLabel.Text = BuildDotBadgeText("PDC");
+                datalinkStatusLabel.Text = BuildPdcBadgeText();
                 datalinkStatusLabel.ForeColor = DatalinkStatusColor();
                 datalinkStatusLabel.Invalidate();
             }
@@ -1292,6 +1533,8 @@ namespace EasyCPDLC
                 atisStatusLabel.ForeColor = AtisStatusColor();
                 atisStatusLabel.Invalidate();
             }
+
+            UpdateAtisAutoStatusLabel();
 
             UpdateSmartStatusLabelColors();
 
@@ -1345,13 +1588,27 @@ namespace EasyCPDLC
                 return;
             }
 
+            if (IsClearanceConfirmationText(upper))
+            {
+                // The green check means the network/controller confirmed the clearance,
+                // not merely that the pilot clicked WILCO.
+                SetClearanceStatus("CLR ACC");
+                return;
+            }
+
             if (upper.Contains("REJECT") || upper.Contains("UNABLE") || upper.Contains("DENIED"))
             {
                 SetClearanceStatus("CLR REJ");
                 return;
             }
 
-            lastClearanceHoverText = NormalizeClearanceHoverText(contents);
+            if (IsClearanceDeliveryText(upper))
+            {
+                lastClearanceHoverText = NormalizeClearanceHoverText(contents);
+                SetClearanceStatus("CLR RX");
+                return;
+            }
+
             SetClearanceStatus("CLR RX");
         }
 
@@ -1391,7 +1648,9 @@ namespace EasyCPDLC
             }
             else if (upperReply == "WILCO" || upperReply == "AFFIRMATIVE" || upperReply == "ROGER" || upperReply == "ACCEPT")
             {
-                SetClearanceStatus("CLR ACC");
+                // Pilot acknowledgement sent. Keep CLR in received state until the
+                // actual "CLEARANCE CONFIRMED" message arrives.
+                SetClearanceStatus("CLR RX");
             }
         }
 
@@ -1625,6 +1884,12 @@ namespace EasyCPDLC
                 }
             }
 
+            SafeUi(() =>
+            {
+                UpdateAtisAutoStatusLabel();
+                UpdateSmartStatusLabelColors();
+            });
+
             WriteMessage(enabled && !string.IsNullOrWhiteSpace(cleanTarget)
                 ? "ATIS AUTO REFRESH ON FOR " + FormatAtisTargetForList(cleanTarget)
                 : "ATIS AUTO REFRESH OFF", "SYSTEM", "SYSTEM");
@@ -1673,6 +1938,61 @@ namespace EasyCPDLC
             return cleanLetter + " RECEIVED";
         }
 
+        private string GetAtisLetterForAutoRefresh(string target, string contents)
+        {
+            string letter = GetAtisOverviewLetter(contents, target);
+
+            if (string.IsNullOrWhiteSpace(letter))
+            {
+                letter = ExtractAtisInformationLetter(contents);
+            }
+
+            if (string.IsNullOrWhiteSpace(letter))
+            {
+                letter = ExtractAtisLetterFromVatsimData(target);
+            }
+
+            return (letter ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
+        private bool ShouldEmitAutoAtisUpdateFromContents(string target, string contents)
+        {
+            string formattedTarget = FormatAtisTargetForList(target);
+            string letter = GetAtisLetterForAutoRefresh(formattedTarget, contents);
+
+            if (string.IsNullOrWhiteSpace(letter))
+            {
+                return false;
+            }
+
+            lock (atisAutoRefreshLock)
+            {
+                if (!atisAutoRefreshEnabled || !IsAutoAtisTarget(formattedTarget))
+                {
+                    return false;
+                }
+
+                if (string.IsNullOrWhiteSpace(atisAutoRefreshLastLetter))
+                {
+                    atisAutoRefreshLastLetter = letter;
+                    return false;
+                }
+
+                return !string.Equals(atisAutoRefreshLastLetter, letter, StringComparison.OrdinalIgnoreCase);
+            }
+        }
+
+        private void MaybeEmitAutoAtisUpdateFromHoverCache(string target, string contents)
+        {
+            if (!ShouldEmitAutoAtisUpdateFromContents(target, contents))
+            {
+                return;
+            }
+
+            string formattedTarget = FormatAtisTargetForList(target);
+            WriteMessage(formattedTarget + "\n" + NormalizeAtisHoverContent(contents), "ATIS", "VATATIS");
+        }
+
         private void TrackAutoAtisLetterFromMessage(CPDLCMessage message)
         {
             if (message == null || string.IsNullOrWhiteSpace(message.Text))
@@ -1680,7 +2000,7 @@ namespace EasyCPDLC
                 return;
             }
 
-            Match match = Regex.Match((message.Text ?? string.Empty).ToUpperInvariant(), @"\b([A-Z0-9]{4})\s+ATIS\s+(?:UPDATED\s+[A-Z?]->)?([A-Z?])\b");
+            Match match = Regex.Match((message.Text ?? string.Empty).ToUpperInvariant(), @"\b([A-Z0-9]{4})\s+ATIS\s+(?:(?:UPDATED\s+[A-Z?]->)|)([A-Z?])\b");
             if (!match.Success)
             {
                 return;
@@ -1789,6 +2109,16 @@ namespace EasyCPDLC
                 if (refreshed != null)
                 {
                     vatsimData = refreshed;
+
+                    Pilot refreshedPilot = vatsimData.pilots?
+                        .FirstOrDefault(pilot => pilot.cid == cid ||
+                            (!string.IsNullOrWhiteSpace(callsign) &&
+                             string.Equals(pilot.callsign, callsign, StringComparison.OrdinalIgnoreCase)));
+
+                    if (refreshedPilot != null)
+                    {
+                        userVATSIMData = refreshedPilot;
+                    }
                 }
 
                 lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
@@ -1855,9 +2185,95 @@ namespace EasyCPDLC
             return !reserved.Contains(upper);
         }
 
+        private static bool IsUnavailableAtisText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            string upper = text.ToUpperInvariant();
+            return upper.Contains("THIS ATIS IS NOT AVAILABLE") ||
+                   upper.Contains("ATIS NOT AVAILABLE") ||
+                   upper.Contains("NO ATIS TEXT");
+        }
+
+        private static TimeSpan GetAtisHoverCacheRetention(AtisHoverCacheItem item)
+        {
+            if (item == null)
+            {
+                return TimeSpan.Zero;
+            }
+
+            return IsUnavailableAtisText(item.Content)
+                ? atisHoverRequestCooldown
+                : atisHoverCacheLifetime;
+        }
+
+        private bool HasAtisDataForTarget(string target)
+        {
+            if (string.IsNullOrWhiteSpace(target))
+            {
+                return false;
+            }
+
+            AtisHoverCacheItem cached = GetAtisHoverCache(target);
+            bool hasCachedAtis = cached != null && !IsUnavailableAtisText(cached.Content);
+
+            string vatsimText = GetVatsimAtisTextForTarget(target);
+            bool hasVatsimAtis = !string.IsNullOrWhiteSpace(vatsimText) && !IsUnavailableAtisText(vatsimText);
+
+            return IsAtisOnline(target) || hasCachedAtis || hasVatsimAtis;
+        }
+
+        private void MaybeShowArrivalReloadReminder()
+        {
+            try
+            {
+                if (!Connected || userVATSIMData?.flight_plan == null)
+                {
+                    arrivalReloadReminderStartUtc = DateTime.MinValue;
+                    return;
+                }
+
+                string callsignNow = (userVATSIMData.callsign ?? string.Empty).Trim().ToUpperInvariant();
+                string departure = userVATSIMData.flight_plan.departure?.Trim().ToUpperInvariant() ?? string.Empty;
+                string arrival = userVATSIMData.flight_plan.arrival?.Trim().ToUpperInvariant() ?? string.Empty;
+                string signature = callsignNow + "|" + departure + "|" + arrival;
+
+                if (!string.Equals(signature, arrivalReloadReminderSignature, StringComparison.OrdinalIgnoreCase))
+                {
+                    arrivalReloadReminderSignature = signature;
+                    arrivalReloadReminderShown = false;
+                    arrivalReloadReminderStartUtc = DateTime.MinValue;
+                }
+
+                if (arrivalReloadReminderShown || !preferArrivalStationAfterAirborne || string.IsNullOrWhiteSpace(arrival))
+                {
+                    return;
+                }
+
+                bool appearsLandedAfterArrival = userVATSIMData.groundspeed < 60 && userVATSIMData.altitude < 3000;
+
+                if (!appearsLandedAfterArrival)
+                {
+                    return;
+                }
+
+                arrivalReloadReminderShown = true;
+                arrivalReloadReminderStartUtc = DateTime.UtcNow;
+
+                WriteMessage("LANDED / ARRIVAL DETECTED. IF A NEW FLIGHT PLAN WITH A DIFFERENT CALLSIGN IS FILED, PRESS RLD FP AFTER ABOUT 5 MINUTES SO EASYCPLC CAN UPDATE.", "SYSTEM", "SYSTEM");
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("Arrival reload reminder failed: " + ex.Message);
+            }
+        }
+
         private void UpdateOnlineStatusLabel()
         {
-            string station = GetPrimaryOnlineStatusStation();
+            string station = GetSmartAtisStationForHover();
 
             if (string.IsNullOrWhiteSpace(station))
             {
@@ -1871,18 +2287,18 @@ namespace EasyCPDLC
             station = station.ToUpperInvariant();
 
             bool hasDatalink = IsControllerOnlineForStation(station);
-            bool atisGeneric = IsAtisOnline(station);
-            bool atisArrival = IsAtisOnline(station + "_A");
-            bool atisDeparture = IsAtisOnline(station + "_D");
+            bool atisGeneric = HasAtisDataForTarget(station);
+            bool atisArrival = HasAtisDataForTarget(station + "_A");
+            bool atisDeparture = HasAtisDataForTarget(station + "_D");
             bool hasAnyAtis = atisGeneric || atisArrival || atisDeparture;
 
             string datalinkText = hoppieOnlineStationsLoaded ? (hasDatalink ? "AVAIL" : "NONE") : "?";
 
             datalinkStatusText = "PDC " + datalinkText;
             atisStatusText = BuildDotBadgeText("ATIS");
-            atisAvailabilityState = vatsimData?.atis == null
-                ? "UNKNOWN"
-                : hasAnyAtis ? "ONLINE" : "OFFLINE";
+            atisAvailabilityState = hasAnyAtis
+                ? "ONLINE"
+                : vatsimData?.atis == null ? "UNKNOWN" : "OFFLINE";
 
             UpdateClearanceStatusLabel();
 
@@ -1892,6 +2308,7 @@ namespace EasyCPDLC
             }
 
             MaybeShowPdcAvailabilityHint(station, hasDatalink);
+            MaybeShowArrivalReloadReminder();
         }
 
         private string GetPrimaryOnlineStatusStation()
@@ -1980,8 +2397,123 @@ namespace EasyCPDLC
                 });
         }
 
+        private async Task RefreshVatsimForAtisHoverAsync()
+        {
+            if (!Connected || DateTime.UtcNow - lastVatsimOnlineRefreshUtc < atisHoverVatsimRefreshInterval)
+            {
+                return;
+            }
+
+            await RefreshVatsimOnlineStatusAsync(true);
+
+            SafeUi(() =>
+            {
+                if (atisAvailabilityPopupPanel != null && atisAvailabilityPopupPanel.Visible)
+                {
+                    UpdateAtisAvailabilityPopupText();
+                }
+            });
+        }
+
+        private bool ShouldUseArrivalAtisForHover()
+        {
+            Pilot pilot = userVATSIMData;
+
+            if (pilot == null)
+            {
+                return false;
+            }
+
+            string callsign = (pilot.callsign ?? string.Empty).Trim().ToUpperInvariant();
+            string departure = pilot.flight_plan?.departure?.Trim().ToUpperInvariant() ?? string.Empty;
+            string arrival = pilot.flight_plan?.arrival?.Trim().ToUpperInvariant() ?? string.Empty;
+            string signature = callsign + "|" + departure + "|" + arrival;
+
+            if (!string.Equals(signature, lastWeatherFlightPlanSignature, StringComparison.OrdinalIgnoreCase))
+            {
+                lastWeatherFlightPlanSignature = signature;
+                preferArrivalStationAfterAirborne = false;
+            }
+
+            // Before takeoff / taxi -> DEP.
+            // Once this flight was airborne, keep using ARR even after landing at the destination
+            // until a new flight plan appears. This prevents old DEP PDC/ATIS from staying green at arrival.
+            bool airborneNow = pilot.altitude > 3000 || pilot.groundspeed > 120;
+
+            if (airborneNow && !string.IsNullOrWhiteSpace(arrival))
+            {
+                preferArrivalStationAfterAirborne = true;
+            }
+
+            return preferArrivalStationAfterAirborne && !string.IsNullOrWhiteSpace(arrival);
+        }
+
+        private string GetSmartAtisStationForHover()
+        {
+            string departure = userVATSIMData?.flight_plan?.departure?.Trim().ToUpperInvariant();
+            string arrival = userVATSIMData?.flight_plan?.arrival?.Trim().ToUpperInvariant();
+
+            if (ShouldUseArrivalAtisForHover() && !string.IsNullOrWhiteSpace(arrival))
+            {
+                return arrival;
+            }
+
+            if (!string.IsNullOrWhiteSpace(departure))
+            {
+                return departure;
+            }
+
+            if (!string.IsNullOrWhiteSpace(arrival))
+            {
+                return arrival;
+            }
+
+            return GetPrimaryOnlineStatusStation();
+        }
+
+        public string GetSuggestedWeatherStationForRequests()
+        {
+            try
+            {
+                string station = GetSmartAtisStationForHover();
+
+                return string.IsNullOrWhiteSpace(station)
+                    ? string.Empty
+                    : station.Trim().ToUpperInvariant();
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        public string ResolveWeatherStationForRequest(string station)
+        {
+            string normalized = (station ?? string.Empty).Trim().ToUpperInvariant();
+            string departure = userVATSIMData?.flight_plan?.departure?.Trim().ToUpperInvariant();
+            string arrival = userVATSIMData?.flight_plan?.arrival?.Trim().ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(normalized))
+            {
+                return GetSuggestedWeatherStationForRequests();
+            }
+
+            // If the field still contains the planned DEP ICAO while already airborne,
+            // switch automatically to ARR for METAR/ATIS requests.
+            if (ShouldUseArrivalAtisForHover() &&
+                !string.IsNullOrWhiteSpace(arrival) &&
+                string.Equals(normalized, departure, StringComparison.OrdinalIgnoreCase))
+            {
+                return arrival;
+            }
+
+            return normalized;
+        }
+
         private string BuildAtisAvailabilityPopupText()
         {
+            _ = RefreshVatsimForAtisHoverAsync();
+
             string target = GetPreferredAtisHoverTarget();
 
             if (string.IsNullOrWhiteSpace(target))
@@ -2007,12 +2539,22 @@ namespace EasyCPDLC
                 return FormatAtisHoverPopupText(header, vatsimText);
             }
 
-            return FormatAtisCallsignForHover(target) + "\nREQUESTING ATIS...";
+            lock (atisHoverLock)
+            {
+                if (!string.IsNullOrWhiteSpace(pendingSilentAtisHoverTarget) &&
+                    string.Equals(pendingSilentAtisHoverTarget, FormatAtisTargetForList(target), StringComparison.OrdinalIgnoreCase) &&
+                    DateTime.UtcNow - pendingSilentAtisHoverRequestUtc <= atisHoverPendingLifetime)
+                {
+                    return FormatAtisCallsignForHover(target) + "\nREQUESTING ATIS...";
+                }
+            }
+
+            return FormatAtisCallsignForHover(target) + "\nWAITING FOR NEXT CHECK";
         }
 
         private string GetPreferredAtisHoverTarget()
         {
-            string station = GetPrimaryOnlineStatusStation();
+            string station = GetSmartAtisStationForHover();
 
             if (string.IsNullOrWhiteSpace(station))
             {
@@ -2021,19 +2563,39 @@ namespace EasyCPDLC
 
             station = station.Trim().ToUpperInvariant();
 
-            if (IsAtisOnline(station))
+            if (ShouldUseArrivalAtisForHover())
             {
-                return station;
-            }
+                if (IsAtisOnline(station + "_A"))
+                {
+                    return station + "_A";
+                }
 
-            if (IsAtisOnline(station + "_A"))
-            {
-                return station + "_A";
-            }
+                if (IsAtisOnline(station))
+                {
+                    return station;
+                }
 
-            if (IsAtisOnline(station + "_D"))
+                if (IsAtisOnline(station + "_D"))
+                {
+                    return station + "_D";
+                }
+            }
+            else
             {
-                return station + "_D";
+                if (IsAtisOnline(station + "_D"))
+                {
+                    return station + "_D";
+                }
+
+                if (IsAtisOnline(station))
+                {
+                    return station;
+                }
+
+                if (IsAtisOnline(station + "_A"))
+                {
+                    return station + "_A";
+                }
             }
 
             return station;
@@ -2067,7 +2629,9 @@ namespace EasyCPDLC
                     return null;
                 }
 
-                if (DateTime.UtcNow - item.TimestampUtc > atisHoverCacheLifetime)
+                TimeSpan retention = GetAtisHoverCacheRetention(item);
+
+                if (DateTime.UtcNow - item.TimestampUtc > retention)
                 {
                     atisHoverCache.Remove(key);
                     return null;
@@ -2077,7 +2641,7 @@ namespace EasyCPDLC
             }
         }
 
-        private void StoreAtisHoverContent(string target, string contents, string header = null)
+        private void StoreAtisHoverContent(string target, string contents, string header = null, bool emitAutoMessage = false)
         {
             string key = FormatAtisCallsignForHover(target);
             string cleanContents = NormalizeAtisHoverContent(contents);
@@ -2095,6 +2659,12 @@ namespace EasyCPDLC
                     TimestampUtc = DateTime.UtcNow
                 };
             }
+
+            atisAvailabilityState = IsUnavailableAtisText(cleanContents) ? "OFFLINE" : "ONLINE";
+            SafeUi(() => UpdateClearanceStatusLabel());
+
+            // Main-screen ATIS hover/cache refresh is intentionally silent.
+            // Requested ATIS AUTO remains handled by the normal ATIS auto timer path.
         }
 
         private string GetVatsimAtisTextForTarget(string target)
@@ -2175,11 +2745,6 @@ namespace EasyCPDLC
 
             foreach (string line in WrapAtisHoverText(cleanContents, 36))
             {
-                if (lines.Count >= 6)
-                {
-                    break;
-                }
-
                 lines.Add(line);
             }
 
@@ -2223,7 +2788,7 @@ namespace EasyCPDLC
             lock (atisHoverLock)
             {
                 if (atisHoverCache.TryGetValue(key, out AtisHoverCacheItem item) &&
-                    now - item.TimestampUtc <= atisHoverCacheLifetime)
+                    now - item.TimestampUtc <= GetAtisHoverCacheRetention(item))
                 {
                     return;
                 }
@@ -2276,7 +2841,7 @@ namespace EasyCPDLC
                 return false;
             }
 
-            string target = GetAtisListTarget(contents, recipient, true);
+            string target = GetAtisListTarget(contents, recipient, false);
             string formattedTarget = FormatAtisTargetForList(target);
 
             if (!string.Equals(formattedTarget, pendingTarget, StringComparison.OrdinalIgnoreCase))
@@ -2284,7 +2849,7 @@ namespace EasyCPDLC
                 return false;
             }
 
-            StoreAtisHoverContent(formattedTarget, contents);
+            StoreAtisHoverContent(formattedTarget, contents, null, emitAutoMessage: false);
 
             lock (atisHoverLock)
             {
@@ -2299,6 +2864,7 @@ namespace EasyCPDLC
                 }
             });
 
+            RemovePendingAtisRequestTarget(formattedTarget);
             return true;
         }
 
@@ -2314,7 +2880,8 @@ namespace EasyCPDLC
                 atisAvailabilityPopupPanel = new Panel
                 {
                     BackColor = Color.Transparent,
-                    Visible = false
+                    Visible = false,
+                    AutoScroll = true
                 };
                 atisAvailabilityPopupPanel.Paint += AtisAvailabilityPopup_Paint;
                 atisAvailabilityPopupPanel.MouseLeave += (_, __) =>
@@ -2332,17 +2899,19 @@ namespace EasyCPDLC
             {
                 atisAvailabilityPopupLabel = new System.Windows.Forms.Label
                 {
-                    AutoSize = false,
+                    AutoSize = true,
                     BackColor = Color.Transparent,
                     Font = new Font(textFontBold.FontFamily, Math.Max(6.8f, textFontBold.Size - 2.15f), FontStyle.Bold),
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Dock = DockStyle.Fill,
-                    Padding = new Padding(7, 2, 6, 2),
+                    TextAlign = ContentAlignment.TopLeft,
+                    Location = new Point(7, 2),
+                    MaximumSize = new Size(278, 0),
+                    Padding = new Padding(0, 0, 4, 2),
                     Cursor = Cursors.Hand
                 };
                 atisAvailabilityPopupLabel.Click += (_, __) => ToggleAtisAvailabilityPopup();
                 atisAvailabilityPopupPanel.Controls.Add(atisAvailabilityPopupLabel);
             }
+
         }
 
         private void AtisAvailabilityPopup_Paint(object sender, PaintEventArgs e)
@@ -2384,14 +2953,20 @@ namespace EasyCPDLC
             string text = BuildAtisAvailabilityPopupText();
             bool waiting = text.Contains("REQUESTING") || text.Contains("NO STATION") || text.Contains("NO ATIS TEXT");
 
+            atisAvailabilityPopupPanel.AutoScrollPosition = Point.Empty;
+            atisAvailabilityPopupLabel.Location = new Point(7, 2);
+            atisAvailabilityPopupLabel.MaximumSize = new Size(Math.Max(100, atisAvailabilityPopupPanel.ClientSize.Width - 24), 0);
             atisAvailabilityPopupLabel.Text = text;
             atisAvailabilityPopupLabel.ForeColor = waiting ? DcduTheme.Amber : MainPrimaryTextColor();
+            atisAvailabilityPopupLabel.AutoSize = true;
+            atisAvailabilityPopupPanel.AutoScrollMinSize = new Size(0, atisAvailabilityPopupLabel.Bottom + 6);
             atisAvailabilityPopupPanel.Invalidate();
         }
 
         private void ShowAtisAvailabilityPopup(bool pin)
         {
             HideClearanceTimelinePopup();
+            HideAtisAutoPopup();
             ConfigureAtisAvailabilityPopup();
 
             if (atisAvailabilityPopupPanel == null || atisAvailabilityPopupLabel == null)
@@ -2425,6 +3000,340 @@ namespace EasyCPDLC
 
             atisAvailabilityPopupPinned = true;
             ShowAtisAvailabilityPopup(true);
+        }
+
+        private void AtisAutoGroupPanel_Paint(object sender, PaintEventArgs e)
+        {
+            if (sender is not Panel panel)
+            {
+                return;
+            }
+
+            Rectangle bounds = new Rectangle(0, 0, Math.Max(1, panel.Width - 1), Math.Max(1, panel.Height - 1));
+            Color accent = AtisStatusColor() == DcduTheme.Green || AtisAutoStatusColor() == DcduTheme.Green
+                ? Color.FromArgb(150, 214, 255, 220)
+                : Color.FromArgb(140, 240, 240, 240);
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            using GraphicsPath path = RoundedButtonRect(bounds, 5);
+            using LinearGradientBrush fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(18, accent),
+                Color.FromArgb(6, accent),
+                LinearGradientMode.Vertical);
+            using Pen border = new Pen(Color.FromArgb(92, accent), 1.0f);
+            using Pen separator = new Pen(Color.FromArgb(58, accent), 1.0f);
+
+            e.Graphics.FillPath(fill, path);
+            e.Graphics.DrawPath(border, path);
+
+            int separatorX = Math.Max(60, panel.Width - 42);
+            e.Graphics.DrawLine(separator, separatorX, 4, separatorX, panel.Height - 5);
+        }
+
+        private void ConfigureAtisAutoPopup()
+        {
+            if (screenPanel == null)
+            {
+                return;
+            }
+
+            if (atisAutoPopupPanel == null)
+            {
+                atisAutoPopupPanel = new Panel
+                {
+                    BackColor = Color.Transparent,
+                    Visible = false
+                };
+                atisAutoPopupPanel.Paint += AtisAutoPopup_Paint;
+                atisAutoPopupPanel.MouseLeave += (_, __) =>
+                {
+                    if (!atisAutoPopupPinned)
+                    {
+                        HideAtisAutoPopup();
+                    }
+                };
+                atisAutoPopupPanel.Click += (_, __) =>
+                {
+                    if (IsAtisAutoRefreshEnabled())
+                    {
+                        SetAtisAutoRefresh(string.Empty, false);
+                    }
+
+                    HideAtisAutoPopup();
+                };
+                screenPanel.Controls.Add(atisAutoPopupPanel);
+            }
+
+            if (atisAutoPopupLabel == null)
+            {
+                atisAutoPopupLabel = new System.Windows.Forms.Label
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    Font = new Font(textFontBold.FontFamily, Math.Max(6.8f, textFontBold.Size - 2.1f), FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Dock = DockStyle.Fill,
+                    Padding = new Padding(7, 2, 6, 2),
+                    Cursor = Cursors.Hand
+                };
+                atisAutoPopupLabel.Click += (_, __) =>
+                {
+                    if (IsAtisAutoRefreshEnabled())
+                    {
+                        SetAtisAutoRefresh(string.Empty, false);
+                    }
+
+                    HideAtisAutoPopup();
+                };
+                atisAutoPopupPanel.Controls.Add(atisAutoPopupLabel);
+            }
+        }
+
+        private void AtisAutoPopup_Paint(object sender, PaintEventArgs e)
+        {
+            if (sender is not Panel panel)
+            {
+                return;
+            }
+
+            Rectangle bounds = new Rectangle(0, 0, Math.Max(1, panel.Width - 1), Math.Max(1, panel.Height - 1));
+            Color accent = AtisAutoStatusColor();
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            using GraphicsPath path = RoundedButtonRect(bounds, 6);
+            using LinearGradientBrush fill = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(42, accent),
+                Color.FromArgb(13, accent),
+                LinearGradientMode.Vertical);
+            using Pen border = new Pen(Color.FromArgb(atisAutoPopupPinned ? 190 : 118, accent), atisAutoPopupPinned ? 1.35f : 1.0f);
+            using Pen topLine = new Pen(Color.FromArgb(55, Color.White), 1.0f);
+
+            e.Graphics.FillPath(fill, path);
+            e.Graphics.DrawPath(border, path);
+            e.Graphics.DrawLine(topLine, bounds.Left + 6, bounds.Top + 1, bounds.Right - 6, bounds.Top + 1);
+        }
+
+        private string BuildAtisAutoPopupText()
+        {
+            lock (atisAutoRefreshLock)
+            {
+                if (!atisAutoRefreshEnabled)
+                {
+                    return "ATIS UPDATE OFF\nENABLE IN ATIS REQ";
+                }
+
+                string target = string.IsNullOrWhiteSpace(atisAutoRefreshDisplayTarget)
+                    ? "ATIS"
+                    : atisAutoRefreshDisplayTarget;
+
+                TimeSpan remaining = nextAtisAutoRefreshUtc > DateTime.UtcNow
+                    ? nextAtisAutoRefreshUtc - DateTime.UtcNow
+                    : TimeSpan.Zero;
+
+                int minutes = Math.Max(0, (int)Math.Floor(remaining.TotalMinutes));
+                int seconds = Math.Max(0, remaining.Seconds);
+
+                return "ATIS UPDATE ON\n" + target + "  NEXT " + minutes.ToString("00") + ":" + seconds.ToString("00") + "\nCLICK TO STOP";
+            }
+        }
+
+        private void UpdateAtisAutoPopupText()
+        {
+            ConfigureAtisAutoPopup();
+
+            if (atisAutoPopupPanel == null || atisAutoPopupLabel == null)
+            {
+                return;
+            }
+
+            atisAutoPopupLabel.Text = BuildAtisAutoPopupText();
+            atisAutoPopupLabel.ForeColor = AtisAutoStatusColor();
+            atisAutoPopupPanel.Invalidate();
+        }
+
+        private void ShowAtisAutoPopup(bool pin)
+        {
+            HideClearanceTimelinePopup();
+            HideAtisAvailabilityPopup();
+            ConfigureAtisAutoPopup();
+
+            if (atisAutoPopupPanel == null || atisAutoPopupLabel == null)
+            {
+                return;
+            }
+
+            atisAutoPopupPinned = pin || atisAutoPopupPinned;
+            UpdateAtisAutoPopupText();
+            atisAutoPopupPanel.Visible = true;
+            atisAutoPopupPanel.BringToFront();
+        }
+
+        private void HideAtisAutoPopup()
+        {
+            atisAutoPopupPinned = false;
+
+            if (atisAutoPopupPanel != null)
+            {
+                atisAutoPopupPanel.Visible = false;
+            }
+        }
+
+        private void ToggleAtisAutoPopup()
+        {
+            if (atisAutoPopupPanel != null && atisAutoPopupPanel.Visible && atisAutoPopupPinned)
+            {
+                HideAtisAutoPopup();
+                return;
+            }
+
+            atisAutoPopupPinned = true;
+            ShowAtisAutoPopup(true);
+        }
+
+        private void ConfigureMainFrameButtonHotspots()
+        {
+            mainMinimizeButton.Name = "mainMinimizeButton";
+            mainMinimizeButton.AccessibleName = "Minimize EasyCPDLC";
+            mainMinimizeButton.BackColor = Color.Transparent;
+            mainMinimizeButton.Enabled = true;
+
+            mainReloadFlightPlanButton.Name = "mainReloadFlightPlanButton";
+            mainReloadFlightPlanButton.AccessibleName = "Reload Flight Plan";
+            mainReloadFlightPlanButton.BackColor = Color.Transparent;
+            mainReloadFlightPlanButton.Enabled = true;
+
+            UpdateMainFrameButtonHotspots(DcduStyleManager.IsBoeing);
+        }
+
+        private void UpdateMainFrameButtonHotspots(bool isBoeing)
+        {
+            mainMinimizeButton.Bounds = isBoeing
+                ? new Rectangle(586, 300, 48, 28)
+                : new Rectangle(623, 158, 48, 31);
+
+            mainReloadFlightPlanButton.Bounds = isBoeing
+                ? new Rectangle(149, 300, 54, 28)
+                : new Rectangle(24, 229, 49, 34);
+        }
+
+        private async void ReloadFlightPlanButton_Click(object sender, EventArgs e)
+        {
+            await ReloadFlightPlanDataAsync(true);
+        }
+
+        private async Task ReloadFlightPlanDataAsync(bool showMessage)
+        {
+            string vatsimStatus = "VATSIM ERROR";
+            string simbriefStatus = "SIMBRIEF ERROR";
+
+            try
+            {
+                using HttpClient wc = new();
+                string vatsimJson = await wc.GetStringAsync("https://data.vatsim.net/v3/vatsim-data.json");
+                VATSIMRootobject refreshedData = JsonConvert.DeserializeObject<VATSIMRootobject>(vatsimJson);
+                Pilot refreshedPilot = refreshedData?.pilots?.FirstOrDefault(i => i.cid == cid);
+
+                if (refreshedPilot == null)
+                {
+                    WriteMessage("RELOAD FP FAILED: PILOT NOT FOUND ON VATSIM", "SYSTEM", "SYSTEM");
+                    return;
+                }
+
+                vatsimData = refreshedData;
+                userVATSIMData = refreshedPilot;
+                callsign = refreshedPilot.callsign;
+                UpdateCallsignDisplay();
+
+                if (refreshedPilot.flight_plan == null)
+                {
+                    WriteMessage("RELOAD FP FAILED: NO VATSIM FLIGHT PLAN FILED", "SYSTEM", "SYSTEM");
+                    return;
+                }
+
+                preferArrivalStationAfterAirborne = false;
+                lastWeatherFlightPlanSignature = string.Empty;
+                arrivalReloadReminderShown = false;
+                arrivalReloadReminderStartUtc = DateTime.MinValue;
+                arrivalReloadReminderSignature = string.Empty;
+                lastPdcAvailabilityHintStation = string.Empty;
+                pendingLogon = null;
+                CurrentATCUnit = null;
+                SetAtisAutoRefresh(string.Empty, false);
+                lock (atisHoverLock)
+                {
+                    pendingSilentAtisHoverTarget = string.Empty;
+                    atisHoverCache.Clear();
+                }
+
+                datalinkStatusText = "PDC --";
+                atisStatusText = BuildDotBadgeText("ATIS");
+                atisAvailabilityState = "UNKNOWN";
+                lastClearanceHoverText = string.Empty;
+                SetClearanceStatus("CLR --");
+
+                if (rForm != null && !rForm.IsDisposed)
+                {
+                    rForm.NeedsLogon = true;
+                }
+
+                try
+                {
+                    await RefreshHoppieOnlineStationsAsync();
+                }
+                catch
+                {
+                    hoppieOnlineStationsLoaded = false;
+                }
+
+                lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
+                UpdateOnlineStatusLabel();
+
+                string dep = refreshedPilot.flight_plan.departure?.Trim().ToUpperInvariant() ?? "----";
+                string arr = refreshedPilot.flight_plan.arrival?.Trim().ToUpperInvariant() ?? "----";
+                vatsimStatus = "VATSIM " + callsign + " " + dep + "-" + arr;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Reload flight plan VATSIM failed");
+                WriteMessage("RELOAD FP FAILED: " + ex.Message.ToUpperInvariant(), "SYSTEM", "SYSTEM");
+                return;
+            }
+
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(SimbriefID))
+                {
+                    using HttpClient wc = new();
+                    string simbriefJson = await wc.GetStringAsync(string.Format("https://www.simbrief.com/api/xml.fetcher.php?userid={0}&json=1", SimbriefID));
+                    string simbriefNavlog = JObject.Parse(simbriefJson)["navlog"]?.ToString();
+
+                    if (!string.IsNullOrWhiteSpace(simbriefNavlog))
+                    {
+                        simbriefData = JsonConvert.DeserializeObject<Navlog>(simbriefNavlog);
+                        reportFixes = simbriefData?.fix?
+                            .Where(x => x.is_sid_star == "0" && !new string[] { "apt" }.Contains(x.type))
+                            .Select(x => x.ident)
+                            .ToArray();
+                        simbriefStatus = "SIMBRIEF OK";
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Reload flight plan SimBrief failed");
+                simbriefStatus = "SIMBRIEF ERROR";
+            }
+
+            if (showMessage)
+            {
+                WriteMessage("RELOAD FP COMPLETE: " + vatsimStatus + ", " + simbriefStatus, "SYSTEM", "SYSTEM");
+            }
         }
 
         private void ApplyMainWindowBounds(bool isBoeing)
@@ -2482,9 +3391,11 @@ namespace EasyCPDLC
                 outputTable.Location = new Point(16, 92);
                 outputTable.Size = new Size(454, 105);
                 outputTable.Padding = new Padding(0, 4, 4, 4);
+                outputTable.BackColor = Color.Transparent;
 
                 messageFormatPanel.Location = new Point(16, 92);
                 messageFormatPanel.Size = new Size(454, 105);
+                messageFormatPanel.BackColor = Color.Transparent;
 
                 SendingProgress.Location = new Point(16, 202);
                 SendingProgress.Size = new Size(454, 10);
@@ -2493,6 +3404,7 @@ namespace EasyCPDLC
                 outputScrollBar.Size = new Size(12, 105);
                 outputScrollBar.Target = outputTable;
                 outputScrollBar.Invalidate();
+                UpdateMainFrameButtonHotspots(isBoeing);
                 ApplySmartWidgetLayout(isBoeing);
                 return;
             }
@@ -2525,9 +3437,11 @@ namespace EasyCPDLC
             outputTable.Location = new Point(8, 106);
             outputTable.Size = new Size(466, 106);
             outputTable.Padding = new Padding(0, 4, 12, 4);
+            outputTable.BackColor = Color.Transparent;
 
             messageFormatPanel.Location = new Point(8, 106);
             messageFormatPanel.Size = new Size(466, 106);
+            messageFormatPanel.BackColor = Color.Transparent;
 
             SendingProgress.Location = new Point(8, 218);
             SendingProgress.Size = new Size(466, 8);
@@ -2536,6 +3450,7 @@ namespace EasyCPDLC
             outputScrollBar.Size = new Size(8, 106);
             outputScrollBar.Target = outputTable;
             outputScrollBar.Invalidate();
+            UpdateMainFrameButtonHotspots(isBoeing);
             ApplySmartWidgetLayout(isBoeing);
         }
 
@@ -2561,6 +3476,7 @@ namespace EasyCPDLC
 
                 exitButton.Location = new Point(587, 266);
                 exitButton.Size = new Size(46, 28);
+                UpdateMainFrameButtonHotspots(isBoeing);
                 return;
             }
 
@@ -2582,6 +3498,7 @@ namespace EasyCPDLC
 
             exitButton.Location = new Point(623, 116);
             exitButton.Size = new Size(47, 31);
+            UpdateMainFrameButtonHotspots(isBoeing);
         }
 
         private void ConfigureSoundPlayers()
@@ -2866,6 +3783,18 @@ namespace EasyCPDLC
                 return;
             }
 
+            if (HitDcduButton(mainReloadFlightPlanButton, e.Location))
+            {
+                ReloadFlightPlanButton_Click(mainReloadFlightPlanButton, EventArgs.Empty);
+                return;
+            }
+
+            if (HitDcduButton(mainMinimizeButton, e.Location))
+            {
+                Hide();
+                return;
+            }
+
             if (HitDcduButton(helpButton, e.Location))
             {
                 HelpButton_Click(helpButton, EventArgs.Empty);
@@ -2886,6 +3815,8 @@ namespace EasyCPDLC
                 telexButton,
                 atcButton,
                 settingsButton,
+                mainReloadFlightPlanButton,
+                mainMinimizeButton,
                 helpButton,
                 exitButton
             };
@@ -2944,6 +3875,298 @@ namespace EasyCPDLC
             dcduFrame.HighlightPressed = false;
         }
 
+        private void ConfigureTrayIcon()
+        {
+            try
+            {
+                trayMenu?.Dispose();
+
+                trayMenu = new ContextMenuStrip();
+                trayMenu.Items.Add("Show EasyCPDLC", null, (_, __) => BringEasyCpdlcWindowToFront());
+                trayMenu.Items.Add("Hide EasyCPDLC", null, (_, __) => Hide());
+                trayMenu.Items.Add(new ToolStripSeparator());
+                trayMenu.Items.Add("Exit EasyCPDLC", null, (_, __) => Close());
+
+                trayIcon?.Dispose();
+                trayIcon = new NotifyIcon
+                {
+                    Icon = LoadTrayIcon(),
+                    Text = "EasyCPDLC running",
+                    Visible = true,
+                    ContextMenuStrip = trayMenu
+                };
+
+                trayIcon.DoubleClick += (_, __) => BringEasyCpdlcWindowToFront();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Could not create EasyCPDLC tray icon");
+            }
+        }
+
+        private void EnsureTrayIconVisible()
+        {
+            try
+            {
+                if (trayIcon == null)
+                {
+                    ConfigureTrayIcon();
+                    return;
+                }
+
+                trayIcon.Text = Connected ? "EasyCPDLC connected" : "EasyCPDLC running";
+                trayIcon.Visible = true;
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Could not keep EasyCPDLC tray icon visible");
+            }
+        }
+
+
+        private static Icon LoadTrayIcon()
+        {
+            try
+            {
+                Icon extracted = Icon.ExtractAssociatedIcon(System.Windows.Forms.Application.ExecutablePath);
+                return extracted ?? SystemIcons.Application;
+            }
+            catch
+            {
+                return SystemIcons.Application;
+            }
+        }
+
+        private void DisposeTrayIcon()
+        {
+            try
+            {
+                if (trayIcon != null)
+                {
+                    trayIcon.Visible = false;
+                    trayIcon.Dispose();
+                    trayIcon = null;
+                }
+
+                trayMenu?.Dispose();
+                trayMenu = null;
+            }
+            catch
+            {
+                // Shutdown only.
+            }
+        }
+
+        private void PrepareOverlayChildWindow(Form form)
+        {
+            if (form == null)
+            {
+                return;
+            }
+
+            try
+            {
+                form.ShowInTaskbar = false;
+                form.TopMost = true;
+            }
+            catch
+            {
+                // Cosmetic only.
+            }
+        }
+
+        private static bool TryGetProtocolCommand(out string command)
+        {
+            command = string.Empty;
+
+            try
+            {
+                string[] args = Environment.GetCommandLineArgs();
+
+                foreach (string arg in args)
+                {
+                    if (string.IsNullOrWhiteSpace(arg))
+                    {
+                        continue;
+                    }
+
+                    string trimmed = arg.Trim().Trim('"');
+
+                    if (!trimmed.StartsWith(EasyCpdlcUriScheme + "://", StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    command = trimmed.Contains("toggle", StringComparison.OrdinalIgnoreCase)
+                        ? "TOGGLE"
+                        : "SHOW";
+                    return true;
+                }
+            }
+            catch
+            {
+                // If args cannot be parsed, just continue normal startup.
+            }
+
+            return false;
+        }
+
+        private static bool TryForwardProtocolLaunchToExistingInstance()
+        {
+            if (!TryGetProtocolCommand(out string command))
+            {
+                return false;
+            }
+
+            try
+            {
+                using System.IO.Pipes.NamedPipeClientStream client = new(".", EasyCpdlcProtocolPipeName, System.IO.Pipes.PipeDirection.Out);
+                client.Connect(850);
+
+                using StreamWriter writer = new(client)
+                {
+                    AutoFlush = true
+                };
+
+                writer.WriteLine(command);
+                return true;
+            }
+            catch
+            {
+                // No running EasyCPDLC instance is listening yet.
+                // In that case this protocol launch becomes the normal app launch.
+                return false;
+            }
+        }
+
+        private void RegisterEasyCpdlcUriProtocol()
+        {
+            try
+            {
+                string exePath = System.Windows.Forms.Application.ExecutablePath;
+                string command = "\"" + exePath + "\" \"%1\"";
+
+                using Microsoft.Win32.RegistryKey schemeKey = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Classes\" + EasyCpdlcUriScheme);
+                schemeKey.SetValue(string.Empty, "URL:EasyCPDLC");
+                schemeKey.SetValue("URL Protocol", string.Empty);
+
+                using Microsoft.Win32.RegistryKey iconKey = schemeKey.CreateSubKey("DefaultIcon");
+                iconKey.SetValue(string.Empty, "\"" + exePath + "\",0");
+
+                using Microsoft.Win32.RegistryKey commandKey = schemeKey.CreateSubKey(@"shell\open\command");
+                commandKey.SetValue(string.Empty, command);
+
+                Logger.Info("Registered EasyCPDLC URI protocol: " + EasyCpdlcUriScheme + "://show");
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Could not register EasyCPDLC URI protocol");
+            }
+        }
+
+        private void StartProtocolCommandListener()
+        {
+            try
+            {
+                protocolPipeCancellationTokenSource?.Cancel();
+                protocolPipeCancellationTokenSource = new CancellationTokenSource();
+                CancellationToken token = protocolPipeCancellationTokenSource.Token;
+
+                _ = Task.Run(async () =>
+                {
+                    while (!token.IsCancellationRequested)
+                    {
+                        try
+                        {
+                            using System.IO.Pipes.NamedPipeServerStream server = new(
+                                EasyCpdlcProtocolPipeName,
+                                System.IO.Pipes.PipeDirection.In,
+                                1,
+                                System.IO.Pipes.PipeTransmissionMode.Message,
+                                System.IO.Pipes.PipeOptions.Asynchronous);
+
+                            await server.WaitForConnectionAsync(token).ConfigureAwait(false);
+
+                            using StreamReader reader = new(server);
+                            string command = (await reader.ReadLineAsync().ConfigureAwait(false) ?? "SHOW").Trim().ToUpperInvariant();
+
+                            SafeUi(() => HandleProtocolCommand(command));
+                        }
+                        catch (OperationCanceledException)
+                        {
+                            break;
+                        }
+                        catch (Exception ex)
+                        {
+                            Logger.Warn(ex, "EasyCPDLC protocol listener error");
+                            await Task.Delay(500, token).ConfigureAwait(false);
+                        }
+                    }
+                }, token);
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Could not start EasyCPDLC protocol listener");
+            }
+        }
+
+        private void HandleProtocolCommand(string command)
+        {
+            if (string.Equals(command, "TOGGLE", StringComparison.OrdinalIgnoreCase))
+            {
+                if (Visible && WindowState != FormWindowState.Minimized && ContainsFocus)
+                {
+                    Hide();
+                    return;
+                }
+            }
+
+            BringEasyCpdlcWindowToFront();
+        }
+
+        private void BringEasyCpdlcWindowToFront()
+        {
+            try
+            {
+                if (!Visible)
+                {
+                    Show();
+                }
+
+                if (WindowState == FormWindowState.Minimized || IsIconic(Handle))
+                {
+                    ShowWindow(Handle, SW_RESTORE);
+                    WindowState = FormWindowState.Normal;
+                }
+
+                bool targetTopMost = StayOnTop;
+                TopMost = true;
+                BringToFront();
+
+                // Intentionally do not call Activate() or SetForegroundWindow() here.
+                // In MSFS fullscreen those calls can make Windows show the taskbar.
+                // WS_EX_NOACTIVATE keeps EasyCPDLC clickable without stealing focus from MSFS.
+
+                System.Windows.Forms.Timer restoreTimer = new()
+                {
+                    Interval = 700
+                };
+
+                restoreTimer.Tick += (_, __) =>
+                {
+                    restoreTimer.Stop();
+                    restoreTimer.Dispose();
+                    TopMost = targetTopMost;
+                };
+
+                restoreTimer.Start();
+            }
+            catch (Exception ex)
+            {
+                Logger.Warn(ex, "Could not bring EasyCPDLC window to front");
+            }
+        }
+
         private void MainForm_Load(object sender, EventArgs e)
         {
             outputTable.BorderStyle = BorderStyle.None;
@@ -2953,11 +4176,11 @@ namespace EasyCPDLC
             outputTable.AutoScroll = false;
             outputTable.VerticalScroll.Visible = false;
             outputTable.AutoScroll = true;
-            outputTable.Scroll += (scrollSender, scrollArgs) => HideNativeOutputScrollbars();
-            outputTable.ControlAdded += (controlSender, controlArgs) => HideNativeOutputScrollbars();
-            outputTable.ControlRemoved += (controlSender, controlArgs) => HideNativeOutputScrollbars();
-            outputTable.SizeChanged += (sizeSender, sizeArgs) => HideNativeOutputScrollbars();
-            outputTable.Layout += (layoutSender, layoutArgs) => HideNativeOutputScrollbars();
+            outputTable.Scroll += (scrollSender, scrollArgs) => { HideNativeOutputScrollbars(); RefreshMainDisplaySurface(); };
+            outputTable.ControlAdded += (controlSender, controlArgs) => { HideNativeOutputScrollbars(); RefreshMainDisplaySurface(); };
+            outputTable.ControlRemoved += (controlSender, controlArgs) => { HideNativeOutputScrollbars(); RefreshMainDisplaySurface(); };
+            outputTable.SizeChanged += (sizeSender, sizeArgs) => { HideNativeOutputScrollbars(); RefreshMainDisplaySurface(); };
+            outputTable.Layout += (layoutSender, layoutArgs) => { HideNativeOutputScrollbars(); RefreshMainDisplaySurface(); };
             HideNativeOutputScrollbars();
 
             CheckNewVersion();
@@ -2965,6 +4188,10 @@ namespace EasyCPDLC
             InitialisePopupMenu();
             ShowSetupForm();
             Setup();
+
+            RegisterEasyCpdlcUriProtocol();
+            StartProtocolCommandListener();
+            EnsureTrayIconVisible();
 
             if (Properties.Settings.Default.MainWindowLocation != new Point(0, 0))
             {
@@ -2978,10 +4205,26 @@ namespace EasyCPDLC
             ApplyMessageFilter();
 
             UpdateOnlineStatusLabel();
+            EnsureTrayIconVisible();
 
             Logger.Info("Setup completed successfully");
         }
 
+
+        private void RefreshMainDisplaySurface()
+        {
+            try
+            {
+                dcduFrame?.Invalidate();
+                screenPanel?.Invalidate();
+                outputTable?.Invalidate();
+                messageFormatPanel?.Invalidate();
+            }
+            catch
+            {
+                // Cosmetic repaint only.
+            }
+        }
 
         private void HideNativeOutputScrollbars()
         {
@@ -3240,8 +4483,10 @@ namespace EasyCPDLC
                 ? new TelexForm(this)
                 : new TelexForm(this, message.recipient);
 
-            tForm.TopMost = StayOnTop;
-            tForm.Show();
+            PrepareOverlayChildWindow(tForm);
+            tForm.Show(this);
+            tForm.BringToFront();
+            tForm.Activate();
         }
 
         private void SetSmartWidgetsVisible(bool visible)
@@ -3269,6 +4514,16 @@ namespace EasyCPDLC
             if (atisStatusLabel != null)
             {
                 atisStatusLabel.Visible = visible;
+            }
+
+            if (atisAutoGroupPanel != null)
+            {
+                atisAutoGroupPanel.Visible = visible;
+            }
+
+            if (atisAutoStatusLabel != null)
+            {
+                atisAutoStatusLabel.Visible = visible;
             }
         }
 
@@ -3394,6 +4649,7 @@ namespace EasyCPDLC
             Logger.Info("Login Form Displayed");
 
             DataEntry dataEntry = new(SavedHoppieCode == String.Empty ? null : SavedHoppieCode, SavedCID == new int() ? null : global::EasyCPDLC.MainForm.SavedCID);
+            PrepareOverlayChildWindow(dataEntry);
 
             if (dataEntry.ShowDialog(this) == DialogResult.OK)
             {
@@ -4833,7 +6089,7 @@ namespace EasyCPDLC
             {
                 string line = sourceLine;
 
-                while (line.Length > 34 && outputLines.Count < 4)
+                while (line.Length > 34)
                 {
                     int split = line.LastIndexOf(' ', Math.Min(34, line.Length - 1));
                     if (split < 12)
@@ -4845,22 +6101,58 @@ namespace EasyCPDLC
                     line = line.Substring(split).Trim();
                 }
 
-                if (!string.IsNullOrWhiteSpace(line) && outputLines.Count < 4)
+                if (!string.IsNullOrWhiteSpace(line))
                 {
                     outputLines.Add(line);
-                }
-
-                if (outputLines.Count >= 4)
-                {
-                    break;
                 }
             }
 
             return string.Join("\n", outputLines);
         }
 
+        private static bool IsClearanceConfirmationText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            string upper = text.ToUpperInvariant();
+
+            return upper.Contains("CLEARANCE CONFIRMED") ||
+                   upper.Contains("CLEARANCE CONFIRM") ||
+                   (upper.Contains("RECEIVED CLEARANCE") && upper.Contains("CONFIRM")) ||
+                   upper.Contains("CLR CONFIRMED");
+        }
+
+        private static bool IsClearanceDeliveryText(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text))
+            {
+                return false;
+            }
+
+            string upper = text.ToUpperInvariant();
+
+            if (IsClearanceConfirmationText(upper))
+            {
+                return false;
+            }
+
+            return upper.Contains("CLR TO") ||
+                   upper.Contains("CLRD TO") ||
+                   upper.Contains("CLEARED TO") ||
+                   upper.Contains("PREDEP") ||
+                   upper.Contains("PDC");
+        }
+
         private string BuildClearanceHoverPopupText()
         {
+            if (IsAirborneForStatusBadges())
+            {
+                return "NOT AVAIL WHEN AIRBORNE";
+            }
+
             if (!string.IsNullOrWhiteSpace(lastClearanceHoverText))
             {
                 return lastClearanceHoverText;
@@ -4871,6 +6163,11 @@ namespace EasyCPDLC
 
         private Color ClearanceHoverPopupColor()
         {
+            if (IsAirborneForStatusBadges())
+            {
+                return Color.FromArgb(255, 86, 74);
+            }
+
             if (!string.IsNullOrWhiteSpace(lastClearanceHoverText))
             {
                 string status = (clearanceStatusText ?? string.Empty).ToUpperInvariant();
@@ -4898,8 +6195,12 @@ namespace EasyCPDLC
                 return;
             }
 
+            clearanceTimelinePopupPanel.AutoScrollPosition = Point.Empty;
+            clearanceTimelinePopupLabel.MaximumSize = new Size(Math.Max(80, clearanceTimelinePopupPanel.ClientSize.Width - 24), 0);
             clearanceTimelinePopupLabel.Text = BuildClearanceHoverPopupText();
             clearanceTimelinePopupLabel.ForeColor = ClearanceHoverPopupColor();
+            clearanceTimelinePopupLabel.AutoSize = true;
+            clearanceTimelinePopupPanel.AutoScrollMinSize = new Size(0, clearanceTimelinePopupLabel.Height + 6);
             clearanceTimelinePopupPanel.Invalidate();
         }
 
@@ -4915,7 +6216,8 @@ namespace EasyCPDLC
                 clearanceTimelinePopupPanel = new Panel
                 {
                     BackColor = Color.Transparent,
-                    Visible = false
+                    Visible = false,
+                    AutoScroll = true
                 };
                 clearanceTimelinePopupPanel.Paint += ClearanceTimelinePopup_Paint;
                 clearanceTimelinePopupPanel.MouseLeave += (_, __) =>
@@ -4933,12 +6235,13 @@ namespace EasyCPDLC
             {
                 clearanceTimelinePopupLabel = new System.Windows.Forms.Label
                 {
-                    AutoSize = false,
+                    AutoSize = true,
                     BackColor = Color.Transparent,
                     Font = new Font(textFontBold.FontFamily, Math.Max(7.2f, textFontBold.Size - 1.9f), FontStyle.Bold),
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Dock = DockStyle.Fill,
-                    Padding = new Padding(7, 2, 6, 2),
+                    TextAlign = ContentAlignment.TopLeft,
+                    Location = new Point(7, 2),
+                    MaximumSize = new Size(208, 0),
+                    Padding = new Padding(0, 0, 4, 2),
                     Cursor = Cursors.Hand
                 };
                 clearanceTimelinePopupLabel.Click += (_, __) => ToggleClearanceTimelinePopup();
@@ -5191,6 +6494,7 @@ namespace EasyCPDLC
 
                 HideClearanceTimelinePopup();
                 HideAtisAvailabilityPopup();
+                HideAtisAutoPopup();
                 SetSmartWidgetsVisible(false);
                 messageFormatPanel.Size = outputTable.Size;
                 messageFormatPanel.Visible = true;
@@ -5221,10 +6525,8 @@ namespace EasyCPDLC
 
                     messageFormatPanel.Controls.Add(_response);
                 }
-                if (_sender.type != "CPDLC")
-                {
-                    messageFormatPanel.Controls.Add(deleteLabel);
-                }
+                deleteLabel.Margin = new Padding(deleteLabel.Margin.Left, firstActionButton ? 7 : deleteLabel.Margin.Top, deleteLabel.Margin.Right, deleteLabel.Margin.Bottom);
+                messageFormatPanel.Controls.Add(deleteLabel);
                 messageFormatPanel.PerformLayout();
                 HidePreviewHorizontalScrollbar();
                 messageFormatPanel.Controls[1].Focus();
@@ -5743,6 +7045,11 @@ namespace EasyCPDLC
                     atisHoverCache.Clear();
                 }
                 lastPdcAvailabilityHintStation = string.Empty;
+                preferArrivalStationAfterAirborne = false;
+                lastWeatherFlightPlanSignature = string.Empty;
+                arrivalReloadReminderShown = false;
+                arrivalReloadReminderStartUtc = DateTime.MinValue;
+                arrivalReloadReminderSignature = string.Empty;
                 datalinkStatusText = "PDC --";
                 atisStatusText = BuildDotBadgeText("ATIS");
                 atisAvailabilityState = "UNKNOWN";
@@ -5767,19 +7074,41 @@ namespace EasyCPDLC
         private void TelexButton_Click(object sender, EventArgs e)
         {
             tForm = new TelexForm(this);
-            tForm.Show();
+            PrepareOverlayChildWindow(tForm);
+            tForm.Show(this);
+            tForm.BringToFront();
+            tForm.Activate();
         }
         private void RequestButton_Click(object sender, EventArgs e)
         {
-            rForm = new RequestForm(this)
+            if (rForm != null && !rForm.IsDisposed)
             {
-                TopMost = StayOnTop
-            };
-            rForm.Show();
+                PrepareOverlayChildWindow(rForm);
+                rForm.Show(this);
+                rForm.BringToFront();
+                rForm.Activate();
+                return;
+            }
+
+            rForm = new RequestForm(this);
+            PrepareOverlayChildWindow(rForm);
+            rForm.Show(this);
+            rForm.BringToFront();
+            rForm.Activate();
         }
 
         private async void MainForm_FormClosing(object sender, FormClosingEventArgs e)
         {
+            try
+            {
+                protocolPipeCancellationTokenSource?.Cancel();
+                DisposeTrayIcon();
+            }
+            catch
+            {
+                // Shutdown only.
+            }
+
             Properties.Settings.Default.MainWindowLocation = Location;
             Properties.Settings.Default.MainWindowSize = Size;
             Properties.Settings.Default.Save();
@@ -5808,6 +7137,19 @@ namespace EasyCPDLC
             }
         }
 
+        protected override bool ShowWithoutActivation => true;
+
+        protected override CreateParams CreateParams
+        {
+            get
+            {
+                CreateParams cp = base.CreateParams;
+                cp.ExStyle |= WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE;
+                cp.ExStyle &= ~WS_EX_APPWINDOW;
+                return cp;
+            }
+        }
+
         protected override void WndProc(ref Message m)
         {
             if (m.Msg == 0x84)
@@ -5830,11 +7172,11 @@ namespace EasyCPDLC
 
         private void SettingsButton_Click(object sender, EventArgs e)
         {
-            sForm = new SettingsForm(this)
-            {
-                TopMost = StayOnTop
-            };
-            sForm.Show();
+            sForm = new SettingsForm(this);
+            PrepareOverlayChildWindow(sForm);
+            sForm.Show(this);
+            sForm.BringToFront();
+            sForm.Activate();
         }
 
         private void HelpButton_Click(object sender, EventArgs e)

@@ -1,0 +1,8 @@
+run(() => {
+    this.$api.command.open_browser("easycpdlc://toggle");
+    return 250;
+});
+
+info(() => {
+    return "Toggle EasyCPDLC";
+});
