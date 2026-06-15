@@ -7,7 +7,7 @@
 
 A modernized and visually refreshed fork of **EasyCPDLC**, the lightweight CPDLC client for pilots flying on **VATSIM** via the **Hoppie ACARS** network.
 
-This build updates the project for **.NET 10** and adds a redesigned cockpit-style DCDU interface, Airbus/Boeing visual styles, smarter weather and clearance handling, MSFS/Flow Pro integration, and quality-of-life features for day-to-day online flying.
+This fork updates EasyCPDLC for **.NET 10** and adds a cockpit-style DCDU interface, Airbus/Boeing visual styles, smarter flight-plan handling, ATIS/METAR quick actions, callsign-change protection, MSFS/Flow Pro support, and many day-to-day workflow improvements for online flying.
 
 ---
 
@@ -17,17 +17,22 @@ This build updates the project for **.NET 10** and adds a redesigned cockpit-sty
 - [What is EasyCPDLC?](#what-is-easycpdlc)
 - [What changed in this fork?](#what-changed-in-this-fork)
 - [Features](#features)
+- [Main DCDU overview](#main-dcdu-overview)
+- [Flight plan reload workflow](#flight-plan-reload-workflow)
+- [Callsign mismatch handling](#callsign-mismatch-handling)
+- [Flight phase and next-flight detection](#flight-phase-and-next-flight-detection)
+- [Quick Actions, ATIS and METAR](#quick-actions-atis-and-metar)
+- [Status indicators](#status-indicators)
+- [Smart message handling](#smart-message-handling)
 - [MSFS / Flow Pro integration](#msfs--flow-pro-integration)
 - [Flow Pro setup](#flow-pro-setup)
-- [Flight plan reload workflow](#flight-plan-reload-workflow)
-- [Smart message handling](#smart-message-handling)
-- [Status indicators](#status-indicators)
-- [ATIS, METAR and automatic arrival logic](#atis-metar-and-automatic-arrival-logic)
 - [Free text cooldown](#free-text-cooldown)
 - [Message filtering](#message-filtering)
+- [System tray and window behavior](#system-tray-and-window-behavior)
 - [Requirements](#requirements)
 - [Installation](#installation)
 - [First start](#first-start)
+- [Short release changelog](#short-release-changelog)
 - [Project status](#project-status)
 - [Credits](#credits)
 - [Disclaimer](#disclaimer)
@@ -63,16 +68,23 @@ This fork focuses on modernization, compatibility, cockpit-style visuals, and sm
 ### Highlights
 
 - Updated for **.NET 10**
-- Refreshed login screen with a cleaner VATSIM/Hoppie connection flow
-- Redesigned DCDU-style interface
-- Airbus-inspired and Boeing-inspired panel variants
-- Improved button styling, spacing, shadows, and cockpit-like visual hierarchy
-- Redesigned CPDLC, ATC, TELEX, METAR, and ATIS screens
-- Smart message overview for weather and clearance messages
-- Status indicators for clearance, PDC availability, and ATIS availability
-- Flow Pro integration for opening EasyCPDLC directly from inside MSFS
-- Flight plan reload workflow for multi-leg flying or callsign changes
-- More modern project/runtime foundation for future updates
+- Refreshed login screen and connection flow
+- Redesigned DCDU-style main interface
+- Airbus-inspired and Boeing-inspired display styles
+- Main page with aligned `STATUS`, `CALLSIGN`, `ROUTE`, and `FP PHASE`
+- Route display below the callsign, including `ROUTE: ----` when no route is loaded
+- Smart status badges for CLR, PDC, ATIS, ATIS auto refresh, and Quick Actions
+- Flight-plan reload workflow for multi-leg flying and callsign changes
+- VATSIM prefile support for loading the next route before the new callsign is live
+- Callsign mismatch protection so Hoppie keeps the old callsign until VATSIM confirms the new one
+- Manual callsign refresh icon next to the callsign during mismatch
+- Automatic VATSIM pilot refresh while connected
+- Route flash indication when RLD FP loads a different route
+- Quick Actions popup for METAR/ATIS departure/arrival requests
+- Smarter ATIS/METAR station targeting after departure and after landing
+- Flow Pro integration for opening EasyCPDLC from inside MSFS
+- Tray integration, hide/show support, and no-activate main window behavior
+- Less noisy system messages during normal operation
 
 ---
 
@@ -85,6 +97,7 @@ This fork focuses on modernization, compatibility, cockpit-style visuals, and sm
 - TELEX-style messaging support
 - Datalink clearance workflow support
 - METAR and ATIS request support
+- Quick Actions for departure/arrival METAR and ATIS requests
 - Smart ATIS/METAR message summaries
 - Lightweight standalone desktop client
 - Cockpit-style DCDU interface skins
@@ -95,80 +108,49 @@ This fork focuses on modernization, compatibility, cockpit-style visuals, and sm
 - Exportable message log
 - Optional MSFS Flow Pro shortcut support
 - System tray support with Show / Hide / Exit
+- Main close confirmation
 - Flight plan reload button for new VATSIM flight plans or callsign changes
+- Automatic callsign mismatch warning and dedicated warning sound
+- Manual callsign mismatch re-check button
+- Automatic route display and route-change blink
+- Automatic flight phase detection using live VATSIM data
 
 ---
 
-## MSFS / Flow Pro integration
+## Main DCDU overview
 
-EasyCPDLC can be opened from inside Microsoft Flight Simulator using **Parallel 42 Flow Pro**.
-
-The application registers a Windows URI protocol:
+The main DCDU page now shows the most important flight/session information directly in the top area:
 
 ```text
-easycpdlc://show
+STATUS:   CONNECTED
+CALLSIGN: RYR1234
+ROUTE:    EICK-EGPH
+FP PHASE: 🛫 DEP
 ```
 
-When this URI is called, EasyCPDLC brings its already running window back to the front. This allows you to open the CPDLC client from inside MSFS without going back to the desktop.
-
-There is also an optional toggle URI:
+If no route is available, the route line remains visible and shows:
 
 ```text
-easycpdlc://toggle
+ROUTE:    ----
 ```
 
-For normal use, `easycpdlc://show` is recommended.
+The main page also contains compact badges for:
 
-### Notes
+- `CLR`
+- `PDC`
+- `ATIS`
+- ATIS auto refresh
+- Quick Actions
 
-- This works best with MSFS in borderless/windowed fullscreen.
-- In exclusive fullscreen, Windows may still show the taskbar or change focus behavior.
-- EasyCPDLC uses a tray icon so it can run in the background without a normal taskbar button.
-- If the URI does not work, start EasyCPDLC once normally first. The URI protocol is registered on application start.
-
----
-
-## Flow Pro setup
-
-To create a Flow Pro button that opens EasyCPDLC in-game:
-
-1. Start EasyCPDLC once normally.
-2. Confirm that this works in Windows:
-   - Press `Win + R`
-   - Enter:
-
-     ```text
-     easycpdlc://show
-     ```
-
-   - EasyCPDLC should appear.
-3. Open MSFS.
-4. Open the Flow Pro wheel editor.
-5. Add a **Custom Script Widget**.
-6. Open the widget editor.
-7. Paste this JavaScript code:
-
-```js
-run(() => {
-    this.$api.command.open_browser("easycpdlc://toggle");
-    return 250;
-});
-
-
-info(() => {
-    return "Toggle EasyCPDLC";
-});
-
-
-```
+The Airbus and Boeing layouts are individually tuned so the top rows, message header, and buttons align with the selected panel style.
 
 ---
 
 ## Flight plan reload workflow
 
-EasyCPDLC includes a **RLD FP** button for reloading your current online flight data.
+EasyCPDLC includes a **RLD FP** button for reloading current VATSIM flight data.
 
-Use this when:
+Use **RLD FP** when:
 
 - you have landed and continue with another leg
 - you filed a new VATSIM flight plan
@@ -176,13 +158,27 @@ Use this when:
 - your departure/arrival airport changed
 - EasyCPDLC still shows data from the previous flight
 
+The reload workflow fetches data from:
+
+```text
+https://data.vatsim.net/v3/vatsim-data.json
+```
+
+It checks both:
+
+- your active VATSIM pilot entry
+- your latest VATSIM prefile for the same CID
+
+If a different route is loaded, the `ROUTE` line blinks orange five times.
+
 The **RLD FP** action reloads:
 
 - VATSIM pilot data
-- current callsign
+- current active callsign
+- latest VATSIM prefile if applicable
 - filed VATSIM flight plan
 - departure and arrival airport
-- SimBrief navlog data
+- SimBrief navlog data, if configured
 - report fixes
 - ATIS/PDC target logic
 
@@ -194,32 +190,103 @@ It also resets:
 - ATIS state
 - cached ATIS/PDC data
 - arrival reminder state
+- next-flight detection state
 
-### Arrival reminder
-
-After landing, EasyCPDLC can show a system reminder:
-
-```text
-LANDED / ARRIVAL DETECTED. IF A NEW FLIGHT PLAN WITH A DIFFERENT CALLSIGN IS FILED, PRESS RLD FP AFTER ABOUT 5 MINUTES SO EASYCPLC CAN UPDATE.
-```
-
-This reminder is intended for multi-leg flying. VATSIM data may take a few minutes to update after filing a new flight plan, so waiting briefly before pressing **RLD FP** helps EasyCPDLC load the correct new session data.
+Successful reloads are intentionally silent to avoid cluttering the message list. Errors and callsign mismatch warnings are still shown.
 
 ---
 
-## Smart message handling
+## Callsign mismatch handling
 
-The modernized message overview improves readability by converting common datalink responses into shorter cockpit-style summaries.
+EasyCPDLC is designed to handle the common VATSIM multi-leg situation where a new flight plan is already prefiled, but the pilot is still online with the previous callsign.
 
-Examples:
+Example:
 
-- `REQUESTING ATIS FOR LOWW`
-- `LOWW ATIS E RECEIVED QNH 1012 RWY 29`
-- `REQUESTING METAR FOR LOWW`
-- `LOWW METAR RECEIVED QNH 1012 WIND 290/08 RWY 29`
-- `ATIS NOT AVAILABLE`
+```text
+Online on VATSIM: RYR41WM
+New prefile:      RYR156P
+```
 
-ATIS responses try to detect the current ATIS information letter and display it directly in the message list.
+In this case EasyCPDLC does **not** immediately change the active Hoppie callsign.
+
+Instead:
+
+- Hoppie remains on the old active callsign
+- the new route can already be loaded from the prefile
+- the callsign on the main page turns red
+- a callsign mismatch system message is shown
+- a dedicated mismatch warning sound can play
+- a small refresh icon appears next to the callsign
+
+The refresh icon:
+
+```text
+↻
+```
+
+forces an immediate VATSIM callsign check.
+
+If VATSIM still reports the old callsign, nothing changes.  
+If VATSIM now reports the new callsign, EasyCPDLC automatically switches Hoppie to the new callsign, resets the current ATS unit, and requires a new CPDLC logon.
+
+EasyCPDLC also checks VATSIM automatically while connected, so the manual icon is optional.
+
+> Note: the manual icon forces EasyCPDLC to check the current VATSIM JSON immediately. It cannot force VATSIM itself to publish the new callsign sooner.
+
+---
+
+## Flight phase and next-flight detection
+
+EasyCPDLC tracks a simple flight phase on the main page.
+
+Possible states include:
+
+- `○ STBY`
+- `🛫 DEP`
+- `✈ AIRBORN`
+- `🛬 ARR`
+- `🧳 LND`
+- `🆕 NEXT FP`
+
+While connected, EasyCPDLC refreshes the pilot data from VATSIM automatically and updates the phase without requiring user interaction.
+
+The phase logic is used for:
+
+- departure/arrival weather targeting
+- PDC/ATIS station targeting
+- arrival reminder behavior
+- next flight plan detection
+
+After landing, EasyCPDLC can detect that a new flight plan has been filed and offer a reload prompt. Detection begins shortly after landing and continues periodically while relevant.
+
+---
+
+## Quick Actions, ATIS and METAR
+
+The lightning badge opens **Quick Actions**.
+
+Quick Actions can request:
+
+- departure METAR
+- arrival METAR
+- departure ATIS
+- arrival ATIS
+
+Quick Actions are only clickable when EasyCPDLC is **CONNECTED**. In standby or disconnected state, the popup does not open.
+
+The weather target logic is aware of the loaded flight plan:
+
+- before departure, departure airport is preferred
+- after becoming airborne, arrival airport is preferred
+- after landing, arrival airport remains preferred until RLD FP loads the next flight
+
+If a new route is loaded with RLD FP, the TELEX and Quick Actions weather targets update to the new route.
+
+ATIS station selection can prefer:
+
+- departure ATIS variants for departure requests
+- arrival ATIS variants for arrival requests
+- generic station names when needed
 
 ---
 
@@ -254,18 +321,98 @@ The ATIS indicator shows whether ATIS data is available for the currently releva
 - airborne / after departure: arrival airport
 - after landing: arrival airport until **RLD FP** is used
 
+### ATIS auto refresh
+
+ATIS auto refresh can monitor the active ATIS target and update the state without repeatedly adding unnecessary system messages.
+
 ---
 
-## ATIS, METAR and automatic arrival logic
+## Smart message handling
 
-METAR and ATIS requests are aware of the flight phase.
+The modernized message overview improves readability by converting common datalink responses into shorter cockpit-style summaries.
 
-- On the ground before departure, the suggested airport is the **departure ICAO**.
-- After becoming airborne, the suggested airport changes to the **arrival ICAO**.
-- If the field still contains the departure ICAO while airborne, EasyCPDLC automatically replaces it with the arrival ICAO when sending.
-- Manually entered alternate ICAOs are not overwritten.
+Examples:
 
-This is intended to reduce wrong ATIS/METAR requests during arrival and multi-leg operations.
+- `REQUESTING ATIS FOR LOWW`
+- `LOWW ATIS E RECEIVED QNH 1012 RWY 29`
+- `REQUESTING METAR FOR LOWW`
+- `LOWW METAR RECEIVED QNH 1012 WIND 290/08 RWY 29`
+- `ATIS NOT AVAILABLE`
+- `VATSIM CALLSIGN MISMATCH`
+
+ATIS responses try to detect the current ATIS information letter and display it directly in the message list.
+
+Unread messages are highlighted and can trigger a reminder sound.
+
+---
+
+## MSFS / Flow Pro integration
+
+EasyCPDLC can be opened from inside Microsoft Flight Simulator using **Parallel 42 Flow Pro**.
+
+The application registers a Windows URI protocol:
+
+```text
+easycpdlc://show
+```
+
+When this URI is called, EasyCPDLC brings its already running window back to the front. This allows you to open the CPDLC client from inside MSFS without going back to the desktop.
+
+There is also an optional toggle URI:
+
+```text
+easycpdlc://toggle
+```
+
+For normal use, `easycpdlc://show` is recommended.
+
+### Notes
+
+- This works best with MSFS in borderless/windowed fullscreen.
+- In exclusive fullscreen, Windows may still show the taskbar or change focus behavior.
+- EasyCPDLC uses a tray icon so it can run in the background without a normal taskbar button.
+- If the URI does not work, start EasyCPDLC once normally first. The URI protocol is registered on application start.
+
+---
+
+## Flow Pro setup
+
+To create a Flow Pro button that opens EasyCPDLC:
+
+1. Start EasyCPDLC once normally.
+2. Confirm that this works in Windows:
+   - Press `Win + R`
+   - Enter:
+
+     ```text
+     easycpdlc://show
+     ```
+
+   - EasyCPDLC should appear.
+3. Open MSFS.
+4. Open the Flow Pro wheel editor.
+5. Add a **Custom Script Widget**.
+6. Open the widget editor.
+7. Paste this JavaScript code:
+
+```js
+run(() => {
+    this.$api.command.open_browser("easycpdlc://show");
+    return 250;
+});
+
+state(() => {
+    return "ECPDLC";
+});
+
+info(() => {
+    return "Open EasyCPDLC";
+});
+
+style(() => {
+    return "active";
+});
+```
 
 ---
 
@@ -303,6 +450,22 @@ This makes it easier to keep the DCDU overview readable during busy flights.
 
 ---
 
+## System tray and window behavior
+
+EasyCPDLC supports a system tray icon with:
+
+- Show
+- Hide
+- Exit
+
+The main window can be brought back from the tray or via the Flow Pro URI.
+
+The main DCDU window is designed to appear without stealing focus from MSFS where possible. Child windows such as ATC, TELEX, settings, and request windows remain focusable.
+
+Closing the main window asks for confirmation to avoid accidental shutdown.
+
+---
+
 ## Requirements
 
 - Windows
@@ -310,6 +473,8 @@ This makes it easier to keep the DCDU overview readable during busy flights.
 - VATSIM account and CID
 - Hoppie ACARS logon code
 - Active internet connection
+- Optional: SimBrief Pilot ID for navlog/report-fix integration
+- Optional: Parallel 42 Flow Pro for MSFS cockpit shortcut integration
 
 > Note: the .NET Desktop Runtime may already be included in packaged builds, depending on the release.
 
@@ -341,6 +506,19 @@ This makes it easier to keep the DCDU overview readable during busy flights.
 
 ---
 
+## Short release changelog
+
+- Added modern Airbus/Boeing DCDU main layout with aligned status, callsign, route, and flight phase.
+- Added RLD FP workflow for VATSIM active flight plans, prefiles, new routes, and callsign changes.
+- Added callsign mismatch protection with red callsign, warning sound, automatic refresh, and manual refresh icon.
+- Added route display and orange route blink when a different route is loaded.
+- Added Quick Actions for departure/arrival METAR and ATIS requests.
+- Improved CLR/PDC/ATIS status badges, ATIS auto refresh, message filtering, and unread reminders.
+- Added Flow Pro URI support, tray show/hide behavior, and safer close confirmation.
+- Reduced noisy system messages during successful reload and auto-refresh operations.
+
+---
+
 ## Project status
 
 This is a community-maintained modernization fork. The main goals are:
@@ -349,6 +527,7 @@ This is a community-maintained modernization fork. The main goals are:
 - improving the user interface
 - making CPDLC more comfortable for day-to-day VATSIM flying
 - improving MSFS cockpit workflow with Flow Pro and tray integration
+- improving multi-leg and callsign-change workflows
 
 ---
 

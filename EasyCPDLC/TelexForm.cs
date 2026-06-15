@@ -54,6 +54,11 @@ namespace EasyCPDLC
         private readonly Font textFont;
         private readonly Font textFontBold;
         private readonly string recipient;
+        private const string WeatherStationTextBoxName = "weatherStationTextBox";
+        private const string WeatherStationAutoTag = "AUTO";
+        private const string WeatherStationManualTag = "MANUAL";
+        private bool suppressWeatherStationAutoMark = false;
+
         public TelexForm(MainForm _parent, string _recipient = null)
         {
             InitializeComponent();
@@ -356,6 +361,104 @@ namespace EasyCPDLC
             }
         }
 
+        private TextBox GetWeatherStationTextBox()
+        {
+            return GetTextBoxesRecursive(messageFormatPanel)
+                .FirstOrDefault(tb => string.Equals(tb.Name, WeatherStationTextBoxName, StringComparison.OrdinalIgnoreCase));
+        }
+
+        private static bool IsWeatherStationAuto(TextBox box)
+        {
+            return box == null ||
+                box.Tag == null ||
+                string.Equals(box.Tag.ToString(), WeatherStationAutoTag, StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void WeatherStationBox_TextChanged(object sender, EventArgs e)
+        {
+            if (suppressWeatherStationAutoMark)
+            {
+                return;
+            }
+
+            if (sender is TextBox box)
+            {
+                box.Tag = WeatherStationManualTag;
+            }
+
+            UpdateSendButtonState();
+        }
+
+        private string GetFreshWeatherStationForRequest()
+        {
+            string station = GetSuggestedStation();
+
+            return string.IsNullOrWhiteSpace(station)
+                ? string.Empty
+                : station.Trim().ToUpperInvariant();
+        }
+
+        public void RefreshWeatherRequestTargets()
+        {
+            TextBox box = GetWeatherStationTextBox();
+
+            if (box == null || box.IsDisposed)
+            {
+                return;
+            }
+
+            string freshStation = GetFreshWeatherStationForRequest();
+
+            if (string.IsNullOrWhiteSpace(freshStation))
+            {
+                return;
+            }
+
+            if (IsWeatherStationAuto(box) || string.IsNullOrWhiteSpace(box.Text))
+            {
+                suppressWeatherStationAutoMark = true;
+                try
+                {
+                    box.Text = freshStation;
+                    box.Tag = WeatherStationAutoTag;
+                }
+                finally
+                {
+                    suppressWeatherStationAutoMark = false;
+                }
+
+                UpdateSendButtonState();
+            }
+        }
+
+        private string GetWeatherStationForSend(string typedStation)
+        {
+            TextBox box = GetWeatherStationTextBox();
+
+            if (box != null && IsWeatherStationAuto(box))
+            {
+                string freshStation = GetFreshWeatherStationForRequest();
+
+                if (!string.IsNullOrWhiteSpace(freshStation))
+                {
+                    suppressWeatherStationAutoMark = true;
+                    try
+                    {
+                        box.Text = freshStation;
+                        box.Tag = WeatherStationAutoTag;
+                    }
+                    finally
+                    {
+                        suppressWeatherStationAutoMark = false;
+                    }
+
+                    return freshStation;
+                }
+            }
+
+            return (typedStation ?? string.Empty).Trim().ToUpperInvariant();
+        }
+
         private string ResolveWeatherStationForSend(string station)
         {
             try
@@ -564,6 +667,9 @@ namespace EasyCPDLC
             stationBox.BorderStyle = BorderStyle.None;
             stationBox.PlaceholderText = "ICAO";
             stationBox.TextAlign = HorizontalAlignment.Left;
+            stationBox.Name = WeatherStationTextBoxName;
+            stationBox.Tag = WeatherStationAutoTag;
+            stationBox.TextChanged += WeatherStationBox_TextChanged;
             stationBox.BringToFront();
 
             Label hint = new()
@@ -626,6 +732,9 @@ namespace EasyCPDLC
             stationBox.BorderStyle = BorderStyle.None;
             stationBox.PlaceholderText = "ICAO";
             stationBox.TextAlign = HorizontalAlignment.Left;
+            stationBox.Name = WeatherStationTextBoxName;
+            stationBox.Tag = WeatherStationAutoTag;
+            stationBox.TextChanged += WeatherStationBox_TextChanged;
             stationBox.BringToFront();
 
             int typeLabelX = fieldPanel.Right + (DcduStyleManager.IsBoeing ? 22 : 16);
@@ -879,13 +988,15 @@ namespace EasyCPDLC
                     break;
 
                 case "metarRadioButton":
-                    string metarRequestIdentifier = ResolveWeatherStationForSend(recipientText);
+                    string metarStation = GetWeatherStationForSend(recipientText);
+                    string metarRequestIdentifier = ResolveWeatherStationForSend(metarStation);
                     this.parent.WriteMessage("METAR REQUEST", "METAR", metarRequestIdentifier, true);
                     this.parent.ArtificialDelay("METAR " + metarRequestIdentifier, "INFOREQ", "REQUEST");
                     break;
 
                 case "atisRadioButton":
-                    string atisRequestIdentifier = GetSelectedAtisRequestIdentifier(ResolveWeatherStationForSend(recipientText));
+                    string atisStation = GetWeatherStationForSend(recipientText);
+                    string atisRequestIdentifier = GetSelectedAtisRequestIdentifier(ResolveWeatherStationForSend(atisStation));
                     bool autoRefreshAtis = IsAtisAutoRefreshSelected();
                     this.parent.SetAtisAutoRefresh(atisRequestIdentifier, autoRefreshAtis);
                     this.parent.WriteMessage("ATIS REQUEST", "ATIS", atisRequestIdentifier, true);
@@ -899,6 +1010,18 @@ namespace EasyCPDLC
             if (isReply)
             {
                 parent.ClearPreview();
+            }
+
+            // Closing the TELEX/METAR window must never hide the main DCDU.
+            // Queue the parent bring-to-front both before and after this child form closes.
+            parent.BringEasyCpdlcWindowToFront();
+            try
+            {
+                parent.BeginInvoke(new Action(parent.BringEasyCpdlcWindowToFront));
+            }
+            catch
+            {
+                // Parent may be closing; ignore.
             }
 
             this.Close();
@@ -1159,6 +1282,7 @@ namespace EasyCPDLC
 
             metarRadioButton.Checked = true;
             FinalizeMessagePanel();
+            RefreshWeatherRequestTargets();
         }
         private void AtisButton_Click(object sender, EventArgs e)
         {
@@ -1179,6 +1303,7 @@ namespace EasyCPDLC
 
             atisRadioButton.Checked = true;
             FinalizeMessagePanel();
+            RefreshWeatherRequestTargets();
         }
 
         private void TelexForm_FormClosing(object sender, FormClosingEventArgs e)
