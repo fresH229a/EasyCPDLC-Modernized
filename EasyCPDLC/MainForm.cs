@@ -529,6 +529,8 @@ namespace EasyCPDLC
 
             if (!enabled)
             {
+                lastCpdlcStationDetectedNotificationKey = string.Empty;
+                lastCpdlcStationDetectedNotificationUtc = DateTime.MinValue;
                 HideQuickWxPopup();
                 HideClearanceTimelinePopup();
                 HideAtisAvailabilityPopup();
@@ -1409,6 +1411,10 @@ namespace EasyCPDLC
         private System.Windows.Forms.Label cpdlcDiscoveryLabel;
         private System.Windows.Forms.Label pdcActionDebugLabel;
         private bool pdcQuickActionPinned = false;
+        private Panel pdcActionPopupPanel;
+        private string pdcDiscoverySource = string.Empty;
+        private bool pdcDiscoveryIsFallbackCandidate = false;
+        private bool pdcDiscoveryAllowReqClr = false;
         private System.Windows.Forms.Label cpdlcActionDebugLabel;
         private Panel cpdlcLogonPopupPanel;
         private bool cpdlcLogonPopupPinned = false;
@@ -1433,10 +1439,20 @@ namespace EasyCPDLC
         private string cpdlcDiscoveryHoverText = "CPDLC standby";
         private string cpdlcDiscoveryLogonCode = string.Empty;
         private string cpdlcDiscoveryController = string.Empty;
+        private string lastCpdlcStationDetectedNotificationKey = string.Empty;
+        private DateTime lastCpdlcStationDetectedNotificationUtc = DateTime.MinValue;
+        private static readonly TimeSpan cpdlcStationDetectedNotificationCooldown = TimeSpan.FromMinutes(10);
         private readonly string[] messageFilterOrder = { "ALL", "NEW", "ATIS", "METAR", "CPDLC", "TELEX", "SYSTEM" };
 
         private readonly System.Windows.Forms.Timer vatsimOnlineTimer = new();
         private DateTime lastVatsimOnlineRefreshUtc = DateTime.MinValue;
+        private readonly Dictionary<string, List<long>> vatsimTransceiverFrequencies = new(StringComparer.OrdinalIgnoreCase);
+        private DateTime vatsimTransceiversLoadedUtc = DateTime.MinValue;
+        private DateTime lastVatsimTransceiverRefreshAttemptUtc = DateTime.MinValue;
+        private bool vatsimTransceiverRefreshInProgress = false;
+        private static readonly TimeSpan vatsimTransceiverRefreshInterval = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan vatsimTransceiverValidLifetime = TimeSpan.FromSeconds(60);
+        private const string VatsimTransceiversDataUrl = "https://data.vatsim.net/v3/transceivers-data.json";
         private readonly HashSet<string> hoppieOnlineStations = new(StringComparer.OrdinalIgnoreCase);
         private bool hoppieOnlineStationsLoaded = false;
 
@@ -1623,6 +1639,49 @@ namespace EasyCPDLC
                 : DcduTheme.CyanWhite;
         }
 
+        private void PaintStyleAwarePopupPanel(Panel panel, PaintEventArgs e, Color accent, bool pinned)
+        {
+            if (panel == null)
+            {
+                return;
+            }
+
+            Rectangle bounds = new Rectangle(0, 0, Math.Max(1, panel.Width - 1), Math.Max(1, panel.Height - 1));
+
+            e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            using GraphicsPath path = RoundedButtonRect(bounds, DcduStyleManager.IsBoeing ? 4 : 6);
+
+            if (DcduStyleManager.IsBoeing)
+            {
+                // Boeing: neutral dark glass. Only the border carries the status color.
+                using LinearGradientBrush fill = new LinearGradientBrush(
+                    bounds,
+                    Color.FromArgb(238, 13, 24, 18),
+                    Color.FromArgb(238, 7, 14, 11),
+                    LinearGradientMode.Vertical);
+                using Pen border = new Pen(Color.FromArgb(pinned ? 210 : 165, accent), pinned ? 1.35f : 1.0f);
+
+                e.Graphics.FillPath(fill, path);
+                e.Graphics.DrawPath(border, path);
+                return;
+            }
+
+            // Airbus: neutral Airbus/DCDU panel fill. Only the border carries the status color.
+            using LinearGradientBrush fillAirbus = new LinearGradientBrush(
+                bounds,
+                Color.FromArgb(236, 8, 17, 28),
+                Color.FromArgb(236, 3, 8, 16),
+                LinearGradientMode.Vertical);
+            using Pen borderAirbus = new Pen(Color.FromArgb(pinned ? 210 : 150, accent), pinned ? 1.35f : 1.0f);
+            using Pen topLine = new Pen(Color.FromArgb(38, Color.White), 1.0f);
+
+            e.Graphics.FillPath(fillAirbus, path);
+            e.Graphics.DrawPath(borderAirbus, path);
+            e.Graphics.DrawLine(topLine, bounds.Left + 6, bounds.Top + 1, bounds.Right - 6, bounds.Top + 1);
+        }
+
         private void ApplyMainThemeColors()
         {
             controlFrontColor = MainPrimaryTextColor();
@@ -1723,9 +1782,14 @@ namespace EasyCPDLC
 
             // CLR logic:
             // white = standby / nothing yet / received-neutral
-            // amber = request sent, waiting for reply
-            // green = clearance received or accepted
+            // amber = request sent, waiting for reply or pilot acknowledged but ATC did not confirm
+            // green = ATC/network confirmed clearance
             // red = rejected
+            if (upper.Contains("ACK") && upper.Contains("AUTO"))
+            {
+                return DcduTheme.Amber;
+            }
+
             if (upper.Contains("ACCEPTED") || upper.Contains("ACC"))
             {
                 return DcduTheme.Green;
@@ -2675,7 +2739,9 @@ namespace EasyCPDLC
         {
             string upper = (clearanceStatusText ?? string.Empty).ToUpperInvariant();
 
-            if (upper.Contains("ACCEPTED") || upper.Contains("ACC"))
+            if ((upper.Contains("ACK") && upper.Contains("AUTO")) ||
+                upper.Contains("ACCEPTED") ||
+                upper.Contains("ACC"))
             {
                 return "CLR ✓";
             }
@@ -3384,6 +3450,7 @@ namespace EasyCPDLC
                 }
 
                 await EnsureFirBoundariesLoadedAsync(false);
+                await RefreshVatsimTransceiversAsync(false);
 
                 lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
                 UpdateOnlineStatusLabel();
@@ -3435,6 +3502,8 @@ namespace EasyCPDLC
                 {
                     ApplyLiveVatsimPilotUpdate(refreshedPilot);
                 }
+
+                await RefreshVatsimTransceiversAsync(false);
 
                 SafeUi(() =>
                 {
@@ -3870,6 +3939,9 @@ namespace EasyCPDLC
             pdcDiscoveryHoverText = pdcDiscovery.HoverText;
             pdcDiscoveryLogonCode = pdcDiscovery.LogonCode ?? string.Empty;
             pdcDiscoveryController = pdcDiscovery.Controller ?? string.Empty;
+            pdcDiscoverySource = pdcDiscovery.Source ?? string.Empty;
+            pdcDiscoveryIsFallbackCandidate = pdcDiscovery.IsFallbackCandidate;
+            pdcDiscoveryAllowReqClr = pdcDiscovery.AllowReqClr;
             UpdateCpdlcDiscoveryFromVatsim();
             atisStatusText = BuildDotBadgeText("ATIS");
             atisAvailabilityState = hasAnyAtis
@@ -3934,7 +4006,10 @@ namespace EasyCPDLC
             public string HoverText { get; set; } = "PDC not available";
             public string LogonCode { get; set; } = string.Empty;
             public string Controller { get; set; } = string.Empty;
+            public string Source { get; set; } = string.Empty;
             public bool IsAvailable { get; set; } = false;
+            public bool IsFallbackCandidate { get; set; } = false;
+            public bool AllowReqClr { get; set; } = false;
         }
 
         private sealed class CpdlcDiscoveryResult
@@ -3943,7 +4018,9 @@ namespace EasyCPDLC
             public string Controller { get; set; } = string.Empty;
             public string Reason { get; set; } = string.Empty;
             public string MatchReason { get; set; } = string.Empty;
+            public string FrequencyText { get; set; } = string.Empty;
             public bool Possible { get; set; } = false;
+            public bool IsTunedFrequencyMatch { get; set; } = false;
         }
 
         private sealed class GeoPoint
@@ -4001,13 +4078,15 @@ namespace EasyCPDLC
                 {
                     StatusText = "AVAIL",
                     IsAvailable = true,
+                    AllowReqClr = true,
                     LogonCode = station,
+                    Source = "HOPPIE STATION ONLINE",
                     HoverText = "PDC/DCL available\nLogon: " + station + "\nSource: Hoppie station online"
                 };
             }
 
-            Controller local = FindLocalDepartureController(station);
-            if (local != null)
+            List<Controller> localControllers = GetLocalPdcControllers(station).ToList();
+            foreach (Controller local in localControllers)
             {
                 string info = GetControllerInfoText(local);
                 string code = ExtractPdcDclLogonCode(info, station);
@@ -4018,31 +4097,38 @@ namespace EasyCPDLC
                     {
                         StatusText = "AVAIL",
                         IsAvailable = true,
+                        AllowReqClr = true,
                         LogonCode = code,
                         Controller = local.callsign ?? string.Empty,
+                        Source = "LOCAL MATCH",
                         HoverText = "PDC/DCL available\nController: " + local.callsign + "\nLogon: " + code + "\nHoppie station online"
                     };
                 }
+            }
 
+            if (localControllers.Count > 0)
+            {
+                string localNames = string.Join(", ", localControllers.Select(controller => controller.callsign).Where(value => !string.IsNullOrWhiteSpace(value)));
                 return new PdcDiscoveryResult
                 {
                     StatusText = "NONE",
-                    HoverText = string.IsNullOrWhiteSpace(code)
-                        ? "PDC not available\nController: " + local.callsign + "\nNo usable PDC/DCL logon found in controller info"
-                        : "PDC not available\nController: " + local.callsign + "\nLogon " + code + " not online on Hoppie"
+                    HoverText = "PDC not available\nLocal controller online: " + localNames + "\nNo usable online PDC/DCL logon found in local controller info"
                 };
             }
 
-            Controller center = FindPossiblePdcCenterController(station, out string centerCode);
+            Controller center = FindPossiblePdcCenterController(station, out string centerCode, out string centerReason);
             if (center != null && !string.IsNullOrWhiteSpace(centerCode) && IsHoppieLogonOnline(centerCode))
             {
                 return new PdcDiscoveryResult
                 {
                     StatusText = "MAYBE",
                     IsAvailable = true,
+                    IsFallbackCandidate = true,
+                    AllowReqClr = true,
                     LogonCode = centerCode,
                     Controller = center.callsign ?? string.Empty,
-                    HoverText = "Possible PDC/DCL available\nController: " + center.callsign + "\nLogon: " + centerCode + "\nPlease check with controller"
+                    Source = string.IsNullOrWhiteSpace(centerReason) ? "CTR/FSS GEO MATCH" : centerReason,
+                    HoverText = "PDC/DCL candidate\nController: " + center.callsign + "\nLogon: " + centerCode + "\nDouble check on VATSIM Radar"
                 };
             }
 
@@ -4053,62 +4139,107 @@ namespace EasyCPDLC
             };
         }
 
-        private Controller FindLocalDepartureController(string station)
+        private IEnumerable<Controller> GetLocalPdcControllers(string station)
         {
             if (vatsimData?.controllers == null || string.IsNullOrWhiteSpace(station))
             {
-                return null;
+                return Enumerable.Empty<Controller>();
             }
 
-            string[] suffixPriority = { "_DEL", "_GND", "_TWR", "_APP" };
+            string cleanStation = station.Trim().ToUpperInvariant();
 
-            foreach (string suffix in suffixPriority)
-            {
-                string callsign = station + suffix;
-                Controller controller = vatsimData.controllers.FirstOrDefault(item =>
-                    !string.IsNullOrWhiteSpace(item.callsign) &&
-                    string.Equals(item.callsign.Trim(), callsign, StringComparison.OrdinalIgnoreCase));
-
-                if (controller != null)
-                {
-                    return controller;
-                }
-            }
-
-            return null;
+            return vatsimData.controllers
+                .Where(controller => IsLocalPdcControllerCallsign(controller?.callsign, cleanStation))
+                .OrderBy(controller => GetLocalPdcControllerSortScore(controller?.callsign, cleanStation))
+                .ThenBy(controller => controller?.callsign ?? string.Empty);
         }
 
-        private Controller FindPossiblePdcCenterController(string station, out string code)
+        private static bool IsLocalPdcControllerCallsign(string callsign, string station)
+        {
+            string upper = (callsign ?? string.Empty).Trim().ToUpperInvariant();
+            string cleanStation = (station ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (cleanStation.Length != 4 || string.IsNullOrWhiteSpace(upper))
+            {
+                return false;
+            }
+
+            return upper == cleanStation + "_DEL" ||
+                   upper == cleanStation + "_GND" ||
+                   upper == cleanStation + "_TWR" ||
+                   upper == cleanStation + "_APP" ||
+                   Regex.IsMatch(upper, "^" + Regex.Escape(cleanStation) + @"_.+_APP$");
+        }
+
+        private static int GetLocalPdcControllerSortScore(string callsign, string station)
+        {
+            string upper = (callsign ?? string.Empty).Trim().ToUpperInvariant();
+            string cleanStation = (station ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (upper == cleanStation + "_DEL") return 0;
+            if (upper == cleanStation + "_GND") return 1;
+            if (upper == cleanStation + "_TWR") return 2;
+            if (upper == cleanStation + "_APP") return 3;
+            if (Regex.IsMatch(upper, "^" + Regex.Escape(cleanStation) + @"_.+_APP$")) return 4;
+            return 9;
+        }
+
+        private Controller FindPossiblePdcCenterController(string station, out string code, out string matchReason)
         {
             code = string.Empty;
+            matchReason = string.Empty;
 
             if (vatsimData?.controllers == null || string.IsNullOrWhiteSpace(station))
             {
                 return null;
             }
 
-            string stationPrefix = station.Length >= 2 ? station.Substring(0, 2) : station;
+            if (!AreFirBoundariesReady())
+            {
+                _ = EnsureFirBoundariesLoadedAsync(false);
+                matchReason = "FIR boundaries loading";
+                return null;
+            }
+
+            List<FirBoundaryFeature> currentFirs = GetCurrentFirBoundaryMatches();
+            if (currentFirs.Count == 0)
+            {
+                matchReason = "no FIR/nearby match for current position";
+                return null;
+            }
+
             foreach (Controller controller in vatsimData.controllers
-                .Where(IsCpdlcDiscoveryController)
+                .Where(IsCenterLikeController)
                 .OrderBy(controller => controller.callsign ?? string.Empty))
             {
                 string callsign = (controller.callsign ?? string.Empty).Trim().ToUpperInvariant();
                 string info = GetControllerInfoText(controller);
 
-                if (!ContainsCpdlcDiscoveryKeyword(info))
-                {
-                    continue;
-                }
-
-                if (!info.Contains(station) && !callsign.StartsWith(stationPrefix, StringComparison.OrdinalIgnoreCase))
+                if (!IsPdcDclInfoText(info))
                 {
                     continue;
                 }
 
                 string discoveredCode = ExtractPdcDclLogonCode(info, station);
-                if (!string.IsNullOrWhiteSpace(discoveredCode))
+                if (string.IsNullOrWhiteSpace(discoveredCode) || !IsHoppieLogonOnline(discoveredCode))
                 {
+                    continue;
+                }
+
+                foreach (FirBoundaryFeature fir in currentFirs)
+                {
+                    if (!ControllerMatchesFir(callsign, info, fir))
+                    {
+                        continue;
+                    }
+
                     code = discoveredCode;
+                    string firId = GetFirDisplayName(fir);
+                    matchReason = fir.IsNearbyCandidate
+                        ? "CTR/FSS GEO NEARBY"
+                        : "CTR/FSS GEO MATCH";
+
+                    Logger.Debug("PDC/DCL CTR/FSS fallback candidate " + callsign + " -> " + code + " (" + matchReason + " " + firId + ")");
                     return controller;
                 }
             }
@@ -4134,7 +4265,11 @@ namespace EasyCPDLC
                 cpdlcDiscoveryText = "possible";
                 cpdlcDiscoveryLogonCode = result.Code ?? string.Empty;
                 cpdlcDiscoveryController = result.Controller ?? string.Empty;
-                cpdlcDiscoveryHoverText = "Possible CPDLC available\n" + currentFirDebugText + "\nController: " + result.Controller + "\nLogon: " + result.Code + "\n" + result.MatchReason + "\nHoppie station online\nPlease check with controller";
+                cpdlcDiscoveryHoverText = result.IsTunedFrequencyMatch
+                    ? "CPDLC best match\nTuned frequency: " + result.FrequencyText + "\nController: " + result.Controller + "\nLogon: " + result.Code + "\nHoppie station online"
+                    : "Possible CPDLC available\n" + currentFirDebugText + "\nController: " + result.Controller + "\nLogon: " + result.Code + "\n" + result.MatchReason + "\nHoppie station online\nPlease check with controller";
+
+                MaybeWriteCpdlcStationDetectedMessage(result);
                 return;
             }
 
@@ -4145,6 +4280,137 @@ namespace EasyCPDLC
             cpdlcDiscoveryHoverText = string.IsNullOrWhiteSpace(result.Reason)
                 ? "CPDLC standby"
                 : result.Reason;
+        }
+
+        private void MaybeWriteCpdlcStationDetectedMessage(CpdlcDiscoveryResult result)
+        {
+            if (result == null ||
+                !result.Possible ||
+                !Connected ||
+                !IsAirborneNowForPhase() ||
+                !string.IsNullOrWhiteSpace(_currentATCUnit))
+            {
+                return;
+            }
+
+            string code = (result.Code ?? string.Empty).Trim().ToUpperInvariant();
+            string controller = (result.Controller ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(code) ||
+                string.IsNullOrWhiteSpace(controller) ||
+                !IsHoppieLogonOnline(code))
+            {
+                return;
+            }
+
+            string key = code + "|" + controller;
+            DateTime now = DateTime.UtcNow;
+
+            if (string.Equals(lastCpdlcStationDetectedNotificationKey, key, StringComparison.OrdinalIgnoreCase) &&
+                now - lastCpdlcStationDetectedNotificationUtc < cpdlcStationDetectedNotificationCooldown)
+            {
+                return;
+            }
+
+            lastCpdlcStationDetectedNotificationKey = key;
+            lastCpdlcStationDetectedNotificationUtc = now;
+
+            string match = string.IsNullOrWhiteSpace(result.MatchReason)
+                ? "CPDLC CANDIDATE"
+                : result.MatchReason.Trim().ToUpperInvariant();
+
+            string frequencyLine = result.IsTunedFrequencyMatch && !string.IsNullOrWhiteSpace(result.FrequencyText)
+                ? "\nFREQ: " + result.FrequencyText.Trim()
+                : string.Empty;
+
+            string text =
+                "POSSIBLE CPDLC STATION DETECTED\n\n" +
+                controller + frequencyLine + "\n" +
+                "LOGON: " + code + "\n" +
+                "MATCH: " + match + "\n\n" +
+                "OPEN MESSAGE AND SELECT LOGON TO " + code;
+
+            Logger.Debug("CPDLC station notification created for " + controller + " / " + code + ".");
+            WriteMessage(text, "SYSTEM", "CPDLC WATCH");
+        }
+
+        private static bool IsCpdlcStationDetectedText(string contents)
+        {
+            return (contents ?? string.Empty)
+                .Trim()
+                .StartsWith("POSSIBLE CPDLC STATION DETECTED", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private static string ExtractCpdlcStationDetectedLogonCode(string contents)
+        {
+            Match match = Regex.Match(contents ?? string.Empty, @"\bLOGON:\s*([A-Z0-9]{4})\b", RegexOptions.IgnoreCase);
+            return match.Success
+                ? match.Groups[1].Value.Trim().ToUpperInvariant()
+                : string.Empty;
+        }
+
+        private static string ExtractCpdlcStationDetectedController(string contents)
+        {
+            string normalized = (contents ?? string.Empty)
+                .Replace("\r\n", "\n")
+                .Replace("\r", "\n");
+
+            foreach (string line in normalized.Split('\n'))
+            {
+                string clean = line.Trim().ToUpperInvariant();
+
+                if (string.IsNullOrWhiteSpace(clean) ||
+                    clean.StartsWith("POSSIBLE CPDLC", StringComparison.Ordinal) ||
+                    clean.StartsWith("LOGON:", StringComparison.Ordinal) ||
+                    clean.StartsWith("MATCH:", StringComparison.Ordinal) ||
+                    clean.StartsWith("FREQ:", StringComparison.Ordinal) ||
+                    clean.StartsWith("OPEN MESSAGE", StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                string controller = clean.Split(' ', StringSplitOptions.RemoveEmptyEntries).FirstOrDefault() ?? string.Empty;
+                if (controller.Contains("_"))
+                {
+                    return controller;
+                }
+            }
+
+            return string.Empty;
+        }
+
+        private System.Windows.Forms.Label CreateCpdlcStationDetectedLogonLabel(CPDLCMessage message)
+        {
+            string code = ExtractCpdlcStationDetectedLogonCode(message?.message ?? string.Empty);
+            string controller = ExtractCpdlcStationDetectedController(message?.message ?? string.Empty);
+
+            if (string.IsNullOrWhiteSpace(code))
+            {
+                return null;
+            }
+
+            AccessibleLabel label = CreateSpecialLabel("> LOGON TO " + code, false);
+            smartStatusToolTip.SetToolTip(label,
+                "Send CPDLC LOGON request to " + code +
+                (string.IsNullOrWhiteSpace(controller) ? string.Empty : "\nController: " + controller));
+
+            label.Click += async (_, __) =>
+            {
+                ClearPreview();
+                await QuickCpdlcLogonAsync(code);
+            };
+
+            label.KeyDown += async (_, keyEvent) =>
+            {
+                if (keyEvent.KeyCode == Keys.Enter || keyEvent.KeyCode == Keys.Space)
+                {
+                    keyEvent.Handled = true;
+                    ClearPreview();
+                    await QuickCpdlcLogonAsync(code);
+                }
+            };
+
+            return label;
         }
 
         private void UpdateCpdlcDiscoveryLabel()
@@ -4187,28 +4453,36 @@ namespace EasyCPDLC
                 };
             }
 
-            if (!AreFirBoundariesReady())
+            if (IsVatsimTransceiverDataStale())
             {
-                _ = EnsureFirBoundariesLoadedAsync(false);
-                currentFirDebugText = "FIR boundaries loading";
-                return new CpdlcDiscoveryResult
-                {
-                    Reason = "CPDLC standby\nFIR boundaries loading"
-                };
+                _ = RefreshVatsimTransceiversAsync(false);
             }
 
             string departure = userVATSIMData?.flight_plan?.departure?.Trim().ToUpperInvariant() ?? string.Empty;
             string arrival = userVATSIMData?.flight_plan?.arrival?.Trim().ToUpperInvariant() ?? string.Empty;
             string activeStation = ShouldUseArrivalAtisForHover() ? arrival : departure;
 
-            List<FirBoundaryFeature> currentFirs = GetCurrentFirBoundaryMatches();
-            currentFirDebugText = currentFirs.Count == 0
-                ? "FIR: none/nearby not found for current position"
-                : "FIR/nearby: " + string.Join(", ", currentFirs.Select(GetFirDisplayName));
+            bool firReady = AreFirBoundariesReady();
+            if (!firReady)
+            {
+                _ = EnsureFirBoundariesLoadedAsync(false);
+            }
 
-            Logger.Debug("CPDLC FIR discovery " + currentFirDebugText +
+            List<FirBoundaryFeature> currentFirs = firReady
+                ? GetCurrentFirBoundaryMatches()
+                : new List<FirBoundaryFeature>();
+
+            currentFirDebugText = !firReady
+                ? "FIR boundaries loading"
+                : currentFirs.Count == 0
+                    ? "FIR: none/nearby not found for current position"
+                    : "FIR/nearby: " + string.Join(", ", currentFirs.Select(GetFirDisplayName));
+
+            Logger.Debug("CPDLC discovery " + currentFirDebugText +
                 " position=" + (userVATSIMData?.latitude.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "?") +
                 "," + (userVATSIMData?.longitude.ToString(System.Globalization.CultureInfo.InvariantCulture) ?? "?"));
+
+            AddTunedFrequencyCpdlcCandidates();
 
             foreach (Controller controller in vatsimData.controllers
                 .Where(IsCpdlcDiscoveryController)
@@ -4239,7 +4513,7 @@ namespace EasyCPDLC
                 string matchReason = GetCpdlcControllerMatchReason(callsign, info, activeStation, departure, arrival, currentFirs);
                 if (string.IsNullOrWhiteSpace(matchReason))
                 {
-                    Logger.Debug("CPDLC discovery skip " + callsign + " / " + code + ": not related to current FIR/DEP/ARR.");
+                    Logger.Debug("CPDLC discovery skip " + callsign + " / " + code + ": not related to current frequency/FIR/DEP/ARR.");
                     continue;
                 }
 
@@ -4264,8 +4538,234 @@ namespace EasyCPDLC
 
             return new CpdlcDiscoveryResult
             {
-                Reason = "CPDLC standby\n" + currentFirDebugText + "\nNo matching online CTR/FSS/APP with usable Hoppie logon found"
+                Reason = "CPDLC standby\n" + currentFirDebugText + "\nNo matching online APP/CTR/FSS with usable Hoppie logon found"
             };
+        }
+
+        private bool IsVatsimTransceiverDataStale()
+        {
+            return vatsimTransceiversLoadedUtc == DateTime.MinValue ||
+                   DateTime.UtcNow - vatsimTransceiversLoadedUtc > vatsimTransceiverValidLifetime;
+        }
+
+        private async Task RefreshVatsimTransceiversAsync(bool force)
+        {
+            if (vatsimTransceiverRefreshInProgress)
+            {
+                return;
+            }
+
+            if (!force &&
+                DateTime.UtcNow - lastVatsimTransceiverRefreshAttemptUtc < vatsimTransceiverRefreshInterval &&
+                !IsVatsimTransceiverDataStale())
+            {
+                return;
+            }
+
+            lastVatsimTransceiverRefreshAttemptUtc = DateTime.UtcNow;
+            vatsimTransceiverRefreshInProgress = true;
+
+            try
+            {
+                string data = await webclient.GetStringAsync(VatsimTransceiversDataUrl);
+                JToken root = JToken.Parse(data);
+                IEnumerable<JToken> clients;
+
+                if (root is JArray array)
+                {
+                    clients = array;
+                }
+                else
+                {
+                    clients = root["clients"] as JArray ??
+                              root["data"] as JArray ??
+                              root["transceivers"] as JArray ??
+                              Enumerable.Empty<JToken>();
+                }
+
+                Dictionary<string, List<long>> parsed = new(StringComparer.OrdinalIgnoreCase);
+
+                foreach (JToken client in clients)
+                {
+                    string clientCallsign = (client["callsign"]?.ToString() ?? string.Empty).Trim().ToUpperInvariant();
+                    if (string.IsNullOrWhiteSpace(clientCallsign))
+                    {
+                        continue;
+                    }
+
+                    List<long> freqs = new();
+
+                    JArray transceivers = client["transceivers"] as JArray ?? new JArray();
+                    foreach (JToken transceiver in transceivers)
+                    {
+                        if (TryParseLongFrequency(transceiver["frequency"], out long hz))
+                        {
+                            freqs.Add(hz);
+                        }
+                    }
+
+                    if (freqs.Count > 0)
+                    {
+                        parsed[clientCallsign] = freqs.Distinct().ToList();
+                    }
+                }
+
+                vatsimTransceiverFrequencies.Clear();
+                foreach (KeyValuePair<string, List<long>> item in parsed)
+                {
+                    vatsimTransceiverFrequencies[item.Key] = item.Value;
+                }
+
+                vatsimTransceiversLoadedUtc = DateTime.UtcNow;
+                Logger.Debug("Loaded VATSIM transceivers: " + vatsimTransceiverFrequencies.Count + " clients.");
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("VATSIM transceiver refresh failed: " + ex.Message);
+            }
+            finally
+            {
+                vatsimTransceiverRefreshInProgress = false;
+            }
+        }
+
+        private static bool TryParseLongFrequency(JToken token, out long hz)
+        {
+            hz = 0;
+
+            if (token == null)
+            {
+                return false;
+            }
+
+            if (token.Type == JTokenType.Integer || token.Type == JTokenType.Float)
+            {
+                double value = token.Value<double>();
+                if (value > 1000000)
+                {
+                    hz = Convert.ToInt64(Math.Round(value));
+                    return hz > 0;
+                }
+
+                if (value > 100)
+                {
+                    hz = Convert.ToInt64(Math.Round(value * 1000000.0));
+                    return hz > 0;
+                }
+            }
+
+            return TryParseControllerFrequencyHz(token.ToString(), out hz);
+        }
+
+        private static bool TryParseControllerFrequencyHz(string frequency, out long hz)
+        {
+            hz = 0;
+            string clean = (frequency ?? string.Empty).Trim().Replace(",", ".");
+
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return false;
+            }
+
+            if (!double.TryParse(clean, System.Globalization.NumberStyles.Float, System.Globalization.CultureInfo.InvariantCulture, out double mhz))
+            {
+                return false;
+            }
+
+            if (mhz > 1000000)
+            {
+                hz = Convert.ToInt64(Math.Round(mhz));
+            }
+            else
+            {
+                hz = Convert.ToInt64(Math.Round(mhz * 1000000.0));
+            }
+
+            return hz > 0;
+        }
+
+        private static string FormatFrequencyHz(long hz)
+        {
+            if (hz <= 0)
+            {
+                return string.Empty;
+            }
+
+            return (hz / 1000000.0).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private List<long> GetPilotTunedFrequencies()
+        {
+            string activeCallsign = GetConnectedPilotCallsign();
+
+            if (string.IsNullOrWhiteSpace(activeCallsign))
+            {
+                return new List<long>();
+            }
+
+            if (vatsimTransceiverFrequencies.TryGetValue(activeCallsign.Trim().ToUpperInvariant(), out List<long> freqs))
+            {
+                return freqs?.Distinct().ToList() ?? new List<long>();
+            }
+
+            return new List<long>();
+        }
+
+        private void AddTunedFrequencyCpdlcCandidates()
+        {
+            if (IsVatsimTransceiverDataStale() || vatsimData?.controllers == null)
+            {
+                return;
+            }
+
+            List<long> pilotFreqs = GetPilotTunedFrequencies();
+            if (pilotFreqs.Count == 0)
+            {
+                return;
+            }
+
+            foreach (Controller controller in vatsimData.controllers
+                .Where(IsCpdlcDiscoveryController)
+                .OrderBy(controller => controller.callsign ?? string.Empty))
+            {
+                string callsign = (controller.callsign ?? string.Empty).Trim().ToUpperInvariant();
+
+                if (!TryParseControllerFrequencyHz(controller.frequency, out long controllerHz))
+                {
+                    continue;
+                }
+
+                if (!pilotFreqs.Any(freq => Math.Abs(freq - controllerHz) <= 1000))
+                {
+                    continue;
+                }
+
+                string info = GetControllerInfoText(controller);
+                if (!ContainsCpdlcDiscoveryKeyword(info))
+                {
+                    Logger.Debug("CPDLC tuned-frequency match " + callsign + " ignored: no CPDLC/Hoppie keyword in controller info.");
+                    continue;
+                }
+
+                string code = ExtractCpdlcLogonCode(info, string.Empty);
+                if (string.IsNullOrWhiteSpace(code) || !IsHoppieLogonOnline(code))
+                {
+                    Logger.Debug("CPDLC tuned-frequency match " + callsign + " ignored: no online Hoppie logon code.");
+                    continue;
+                }
+
+                cpdlcDiscoveryCandidates.Add(new CpdlcDiscoveryResult
+                {
+                    Possible = true,
+                    Controller = callsign,
+                    Code = code,
+                    MatchReason = "TUNED FREQ MATCH",
+                    FrequencyText = FormatFrequencyHz(controllerHz),
+                    IsTunedFrequencyMatch = true
+                });
+
+                Logger.Debug("CPDLC tuned-frequency candidate " + callsign + " " + FormatFrequencyHz(controllerHz) + " -> " + code);
+            }
         }
 
         private string GetCpdlcControllerMatchReason(string callsign, string info, string activeStation, string departure, string arrival, List<FirBoundaryFeature> currentFirs)
@@ -4278,9 +4778,8 @@ namespace EasyCPDLC
 
             bool isApp = IsAppLikeControllerCallsign(callsign);
 
-            // APP handling: allow DEP/ARR ICAO with any weird APP suffix, e.g.
-            // XXXX_APP, XXXX_W_APP, XXXX_FINAL_APP. Still require a CPDLC/Hoppie logon
-            // in the controller info, which was already checked before this method.
+            // APP handling: VATSIM APP splits are not necessarily DEP/ARR named.
+            // Accept XXXX_APP, XXXX_*_APP and regional APP stations when airport/FIR context is plausible.
             if (isApp)
             {
                 if (AppCallsignMatchesAirport(callsign, activeStation))
@@ -4290,12 +4789,23 @@ namespace EasyCPDLC
 
                 if (AppCallsignMatchesAirport(callsign, departure) || (!string.IsNullOrWhiteSpace(departure) && info.Contains(departure)))
                 {
-                    return "APP matches DEP " + departure;
+                    return "APP matches airport " + departure;
                 }
 
                 if (AppCallsignMatchesAirport(callsign, arrival) || (!string.IsNullOrWhiteSpace(arrival) && info.Contains(arrival)))
                 {
-                    return "APP matches ARR " + arrival;
+                    return "APP matches airport " + arrival;
+                }
+
+                foreach (FirBoundaryFeature fir in currentFirs ?? Enumerable.Empty<FirBoundaryFeature>())
+                {
+                    if (ControllerMatchesFir(callsign, info, fir))
+                    {
+                        string firId = GetFirDisplayName(fir);
+                        return fir.IsNearbyCandidate
+                            ? "APP near FIR buffer " + firId + " (" + Math.Round(fir.DistanceNmFromAircraft) + " NM)"
+                            : "APP regional FIR match " + firId;
+                    }
                 }
 
                 return string.Empty;
@@ -5056,29 +5566,39 @@ namespace EasyCPDLC
 
         private static int GetCpdlcCandidateSortScore(CpdlcDiscoveryResult candidate)
         {
-            string reason = (candidate?.MatchReason ?? string.Empty).ToUpperInvariant();
-
-            if (reason.Contains("FIR POSITION MATCH"))
+            if (candidate?.IsTunedFrequencyMatch == true)
             {
                 return 0;
             }
 
-            if (reason.Contains("NEAR FIR BUFFER MATCH"))
+            string reason = (candidate?.MatchReason ?? string.Empty).ToUpperInvariant();
+
+            if (reason.Contains("APP STATION") || reason.Contains("APP MATCHES"))
             {
                 return 1;
             }
 
-            if (reason.Contains("INFO MENTIONS") || reason.Contains("APP MATCHES") || reason.Contains("APP STATION"))
+            if (reason.Contains("FIR POSITION MATCH") || reason.Contains("APP REGIONAL FIR MATCH"))
             {
-                return 1;
+                return 2;
             }
 
-            if (reason.Contains("PREFIX"))
+            if (reason.Contains("NEAR FIR BUFFER MATCH") || reason.Contains("APP NEAR FIR BUFFER"))
             {
                 return 3;
             }
 
-            return 2;
+            if (reason.Contains("INFO MENTIONS"))
+            {
+                return 4;
+            }
+
+            if (reason.Contains("PREFIX"))
+            {
+                return 5;
+            }
+
+            return 4;
         }
 
         private void ConfigureCpdlcLogonPopup()
@@ -5092,23 +5612,14 @@ namespace EasyCPDLC
             {
                 BackColor = Color.Transparent,
                 Visible = false,
-                Size = new Size(220, 24)
+                Size = new Size(300, 120)
             };
 
             cpdlcLogonPopupPanel.Paint += (_, e) =>
             {
-                Rectangle bounds = new Rectangle(0, 0, Math.Max(1, cpdlcLogonPopupPanel.Width - 1), Math.Max(1, cpdlcLogonPopupPanel.Height - 1));
-                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
-
-                using GraphicsPath path = RoundedButtonRect(bounds, 3);
-                using SolidBrush fill = new SolidBrush(Color.FromArgb(225, 16, 28, 20));
-                using Pen border = new Pen(Color.FromArgb(170, DcduTheme.Amber), 1.0f);
-
-                e.Graphics.FillPath(fill, path);
-                e.Graphics.DrawPath(border, path);
+                PaintStyleAwarePopupPanel(cpdlcLogonPopupPanel, e, DcduTheme.Amber, cpdlcLogonPopupPinned);
             };
 
-            // Click-only menu: do not hide just because the mouse leaves the popup.
             cpdlcLogonPopupPanel.MouseLeave += (_, __) => { };
             screenPanel.Controls.Add(cpdlcLogonPopupPanel);
             cpdlcLogonPopupPanel.BringToFront();
@@ -5133,6 +5644,71 @@ namespace EasyCPDLC
             ShowCpdlcLogonPopup();
         }
 
+        private void AddCpdlcPopupLabel(string text, int x, int y, int width, int height, Color color, Font font, ContentAlignment align = ContentAlignment.MiddleLeft)
+        {
+            if (cpdlcLogonPopupPanel == null)
+            {
+                return;
+            }
+
+            System.Windows.Forms.Label label = new System.Windows.Forms.Label
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = color,
+                Font = font,
+                Text = text,
+                TextAlign = align,
+                Location = new Point(x, y),
+                Size = new Size(width, height)
+            };
+
+            cpdlcLogonPopupPanel.Controls.Add(label);
+        }
+
+        private void AddCpdlcPopupAction(string caption, string code, string controller, string tooltip, int y)
+        {
+            if (cpdlcLogonPopupPanel == null)
+            {
+                return;
+            }
+
+            string normalCaption = caption;
+            System.Windows.Forms.Label label = new System.Windows.Forms.Label
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = MainPrimaryTextColor(),
+                Font = new Font(textFontBold.FontFamily, Math.Max(6.8f, textFontBold.Size - 2.1f), FontStyle.Bold),
+                Text = normalCaption,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(8, y),
+                Size = new Size(cpdlcLogonPopupPanel.Width - 14, 18),
+                Cursor = Cursors.Hand,
+                Tag = code
+            };
+
+            smartStatusToolTip.SetToolTip(label, tooltip);
+
+            label.MouseEnter += (_, __) =>
+            {
+                label.ForeColor = DcduTheme.Amber;
+                label.Text = normalCaption.StartsWith(">", StringComparison.Ordinal) ? normalCaption : "> " + normalCaption;
+            };
+            label.MouseLeave += (_, __) =>
+            {
+                label.ForeColor = MainPrimaryTextColor();
+                label.Text = normalCaption;
+            };
+            label.Click += async (_, __) =>
+            {
+                HideCpdlcLogonPopup();
+                await QuickCpdlcLogonAsync(code);
+            };
+
+            cpdlcLogonPopupPanel.Controls.Add(label);
+        }
+
         private void ShowCpdlcLogonPopup()
         {
             if (cpdlcLogonPopupPanel == null)
@@ -5154,10 +5730,10 @@ namespace EasyCPDLC
                                     !string.IsNullOrWhiteSpace(candidate.Code) &&
                                     IsHoppieLogonOnline(candidate.Code))
                 .GroupBy(candidate => candidate.Code.Trim().ToUpperInvariant() + "|" + (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant())
-                .Select(group => group.First())
-                .OrderBy(candidate => GetCpdlcCandidateSortScore(candidate))
+                .Select(group => group.OrderBy(GetCpdlcCandidateSortScore).First())
+                .OrderBy(GetCpdlcCandidateSortScore)
                 .ThenBy(candidate => candidate.Controller ?? string.Empty)
-                .Take(4)
+                .Take(5)
                 .ToList();
 
             if (candidates.Count == 0 && CanQuickCpdlcLogon())
@@ -5178,92 +5754,72 @@ namespace EasyCPDLC
                 return;
             }
 
-            int rowHeight = 20;
-            cpdlcLogonPopupPanel.Size = new Size(220, 4 + candidates.Count * rowHeight);
-            cpdlcLogonPopupPanel.Location = new Point(
-                Math.Max(4, Math.Min(cpdlcDiscoveryLabel.Left - 80, screenPanel.Width - cpdlcLogonPopupPanel.Width - 4)),
-                cpdlcDiscoveryLabel.Bottom + 2);
+            CpdlcDiscoveryResult tuned = candidates.FirstOrDefault(candidate => candidate.IsTunedFrequencyMatch);
+            List<CpdlcDiscoveryResult> others = candidates
+                .Where(candidate => tuned == null || !string.Equals(candidate.Code, tuned.Code, StringComparison.OrdinalIgnoreCase) || !string.Equals(candidate.Controller, tuned.Controller, StringComparison.OrdinalIgnoreCase))
+                .Take(tuned == null ? 4 : 3)
+                .ToList();
 
-            for (int index = 0; index < candidates.Count; index++)
+            int popupWidth = 300;
+            int y = 6;
+            Font headerFont = new Font(textFontBold.FontFamily, Math.Max(7.3f, textFontBold.Size - 1.8f), FontStyle.Bold);
+            Font rowFont = new Font(textFontBold.FontFamily, Math.Max(6.8f, textFontBold.Size - 2.1f), FontStyle.Bold);
+
+            AddCpdlcPopupLabel("CPDLC LOGON HELPER", 8, y, popupWidth - 16, 18, MainAccentColor(), headerFont);
+            y += 24;
+
+            if (tuned != null)
             {
-                CpdlcDiscoveryResult candidate = candidates[index];
-                string code = candidate.Code.Trim().ToUpperInvariant();
-                string controller = (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant();
-                string caption = "LOGON TO " + code;
+                string code = tuned.Code.Trim().ToUpperInvariant();
+                string controller = (tuned.Controller ?? string.Empty).Trim().ToUpperInvariant();
+                string frequency = string.IsNullOrWhiteSpace(tuned.FrequencyText) ? "ACTIVE FREQ" : tuned.FrequencyText;
 
-                if (!string.IsNullOrWhiteSpace(controller) && !string.Equals(controller, code, StringComparison.OrdinalIgnoreCase))
-                {
-                    caption += "  " + controller;
-                }
-
-                if ((candidate.MatchReason ?? string.Empty).ToUpperInvariant().Contains("MAY BE FAR"))
-                {
-                    caption += "  ?";
-                }
-
-                System.Windows.Forms.Label label = new System.Windows.Forms.Label
-                {
-                    AutoSize = false,
-                    BackColor = Color.Transparent,
-                    ForeColor = MainPrimaryTextColor(),
-                    Font = new Font(textFontBold.FontFamily, Math.Max(6.8f, textFontBold.Size - 2.1f), FontStyle.Bold),
-                    Text = caption,
-                    TextAlign = ContentAlignment.MiddleLeft,
-                    Location = new Point(8, 2 + index * rowHeight),
-                    Size = new Size(cpdlcLogonPopupPanel.Width - 14, rowHeight),
-                    Cursor = Cursors.Hand,
-                    Tag = code
-                };
-
-                smartStatusToolTip.SetToolTip(label,
-                    "Controller: " + (string.IsNullOrWhiteSpace(controller) ? "unknown" : controller) +
-                    "\nLogon: " + code +
-                    "\n" + (candidate.MatchReason ?? string.Empty));
-
-                label.MouseEnter += (_, __) =>
-                {
-                    label.ForeColor = DcduTheme.Amber;
-                    label.Text = "> " + caption;
-                };
-                label.MouseLeave += (_, __) =>
-                {
-                    label.ForeColor = MainPrimaryTextColor();
-                    label.Text = caption;
-                };
-                label.Click += async (_, __) =>
-                {
-                    HideCpdlcLogonPopup();
-                    await QuickCpdlcLogonAsync(code);
-                };
-
-                cpdlcLogonPopupPanel.Controls.Add(label);
+                AddCpdlcPopupLabel("TUNED FREQ MATCH", 8, y, popupWidth - 16, 16, MainAccentColor(), rowFont);
+                y += 17;
+                AddCpdlcPopupLabel((string.IsNullOrWhiteSpace(controller) ? "UNKNOWN" : controller) + "   " + frequency, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
+                y += 17;
+                AddCpdlcPopupLabel("LOGON: " + code, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
+                y += 22;
+                AddCpdlcPopupAction("> LOGON TO " + code, code, controller, "Tuned frequency match\nController: " + controller + "\nLogon: " + code, y);
+                y += 25;
             }
+
+            if (others.Count > 0)
+            {
+                if (tuned != null)
+                {
+                    AddCpdlcPopupLabel("──────────────────────────────", 8, y, popupWidth - 16, 16, Color.FromArgb(150, MainPrimaryTextColor()), rowFont);
+                    y += 17;
+                }
+
+                AddCpdlcPopupLabel("OTHER POSSIBLE ATC NEARBY", 8, y, popupWidth - 16, 16, MainAccentColor(), rowFont);
+                y += 19;
+
+                foreach (CpdlcDiscoveryResult candidate in others)
+                {
+                    string code = candidate.Code.Trim().ToUpperInvariant();
+                    string controller = (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant();
+                    string caption = "> LOGON TO " + code;
+
+                    if (!string.IsNullOrWhiteSpace(controller) && !string.Equals(controller, code, StringComparison.OrdinalIgnoreCase))
+                    {
+                        caption += "   " + controller;
+                    }
+
+                    AddCpdlcPopupAction(caption, code, controller, "Controller: " + controller + "\nLogon: " + code + "\n" + (candidate.MatchReason ?? string.Empty), y);
+                    y += 19;
+                }
+            }
+
+            cpdlcLogonPopupPanel.Size = new Size(popupWidth, Math.Max(58, y + 5));
+            cpdlcLogonPopupPanel.Location = new Point(
+                Math.Max(4, Math.Min(cpdlcDiscoveryLabel.Left - 120, screenPanel.Width - cpdlcLogonPopupPanel.Width - 4)),
+                cpdlcDiscoveryLabel.Bottom + 2);
 
             cpdlcLogonPopupPanel.ResumeLayout();
             cpdlcLogonPopupPanel.Visible = true;
             cpdlcLogonPopupPanel.BringToFront();
             cpdlcLogonPopupPanel.Invalidate();
-        }
-
-        private bool CanQuickRequestClearance()
-        {
-            if (!Connected ||
-                string.IsNullOrWhiteSpace(pdcDiscoveryLogonCode) ||
-                !datalinkStatusText.ToUpperInvariant().Contains("AVAIL") ||
-                !IsHoppieLogonOnline(pdcDiscoveryLogonCode))
-            {
-                return false;
-            }
-
-            // REQ CLR is a PDC-only quick action. It must only appear while the
-            // visible PDC badge is actually green. In airborne mode the PDC badge
-            // may be repurposed as a phase/aircraft indicator, so do not allow it there.
-            if (IsAirborneForStatusBadges())
-            {
-                return false;
-            }
-
-            return DatalinkStatusColor().ToArgb() == DcduTheme.Green.ToArgb();
         }
 
         private bool CanQuickCpdlcLogon()
@@ -5275,17 +5831,51 @@ namespace EasyCPDLC
                    IsHoppieLogonOnline(cpdlcDiscoveryLogonCode);
         }
 
+        private bool CanQuickRequestClearance()
+        {
+            if (!Connected ||
+                string.IsNullOrWhiteSpace(pdcDiscoveryLogonCode) ||
+                !pdcDiscoveryAllowReqClr ||
+                !IsHoppieLogonOnline(pdcDiscoveryLogonCode))
+            {
+                return false;
+            }
+
+            // REQ CLR is a ground/departure PDC/DCL action. Do not offer it once airborne.
+            if (IsAirborneForStatusBadges())
+            {
+                return false;
+            }
+
+            string status = (datalinkStatusText ?? string.Empty).ToUpperInvariant();
+            return status.Contains("AVAIL") || status.Contains("MAYBE");
+        }
+
+        private bool HasPdcPopupCandidate()
+        {
+            if (!Connected ||
+                string.IsNullOrWhiteSpace(pdcDiscoveryLogonCode) ||
+                !IsHoppieLogonOnline(pdcDiscoveryLogonCode) ||
+                IsAirborneForStatusBadges())
+            {
+                return false;
+            }
+
+            string status = (datalinkStatusText ?? string.Empty).ToUpperInvariant();
+            return status.Contains("AVAIL") || status.Contains("MAYBE");
+        }
+
         private void TogglePdcQuickActionButton()
         {
-            if (pdcActionDebugLabel != null && pdcActionDebugLabel.Visible && pdcQuickActionPinned)
+            if (pdcActionPopupPanel != null && pdcActionPopupPanel.Visible && pdcQuickActionPinned)
             {
                 HidePdcQuickActionButton();
                 return;
             }
 
-            if (!CanQuickRequestClearance())
+            if (!HasPdcPopupCandidate())
             {
-                Logger.Debug("PDC REQ CLR dropdown click ignored: PDC is not green/available.");
+                Logger.Debug("PDC popup click ignored: no green/amber PDC-DCL candidate.");
                 HidePdcQuickActionButton();
                 return;
             }
@@ -5294,26 +5884,147 @@ namespace EasyCPDLC
             ShowPdcQuickActionButton();
         }
 
-        private void ShowPdcQuickActionButton()
+        private void ConfigurePdcActionPopup()
         {
-            if (pdcActionDebugLabel == null)
+            if (screenPanel == null || pdcActionPopupPanel != null)
             {
                 return;
             }
 
-            // Kept as the renderer for the click-opened PDC action.
-            // It must not be called from hover paths.
-            if (!CanQuickRequestClearance())
+            pdcActionPopupPanel = new Panel
+            {
+                BackColor = Color.Transparent,
+                Visible = false,
+                Size = new Size(260, 105)
+            };
+
+            pdcActionPopupPanel.Paint += (_, e) =>
+            {
+                Color accent = pdcDiscoveryIsFallbackCandidate ? DcduTheme.Amber : DcduTheme.Green;
+                PaintStyleAwarePopupPanel(pdcActionPopupPanel, e, accent, pdcQuickActionPinned);
+            };
+
+            pdcActionPopupPanel.MouseLeave += (_, __) => { };
+            screenPanel.Controls.Add(pdcActionPopupPanel);
+            pdcActionPopupPanel.BringToFront();
+        }
+
+        private void AddPdcPopupLabel(string text, int x, int y, int width, int height, Color color, Font font)
+        {
+            if (pdcActionPopupPanel == null)
+            {
+                return;
+            }
+
+            pdcActionPopupPanel.Controls.Add(new System.Windows.Forms.Label
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = color,
+                Font = font,
+                Text = text,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(x, y),
+                Size = new Size(width, height)
+            });
+        }
+
+        private void AddPdcPopupAction(string code, int y)
+        {
+            if (pdcActionPopupPanel == null)
+            {
+                return;
+            }
+
+            string caption = "> REQ CLR TO " + code;
+            System.Windows.Forms.Label label = new System.Windows.Forms.Label
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = MainPrimaryTextColor(),
+                Font = new Font(textFontBold.FontFamily, Math.Max(6.9f, textFontBold.Size - 2.0f), FontStyle.Bold),
+                Text = caption,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Location = new Point(8, y),
+                Size = new Size(pdcActionPopupPanel.Width - 16, 18),
+                Cursor = Cursors.Hand
+            };
+
+            smartStatusToolTip.SetToolTip(label, "Send pre-departure clearance request to " + code);
+            label.MouseEnter += (_, __) => label.ForeColor = DcduTheme.Amber;
+            label.MouseLeave += (_, __) => label.ForeColor = MainPrimaryTextColor();
+            label.Click += async (_, __) => await QuickRequestPredepClearanceAsync();
+
+            pdcActionPopupPanel.Controls.Add(label);
+        }
+
+        private void ShowPdcQuickActionButton()
+        {
+            if (!HasPdcPopupCandidate())
             {
                 HidePdcQuickActionButton();
                 return;
             }
 
-            pdcActionDebugLabel.Visible = true;
-            pdcActionDebugLabel.ForeColor = DcduTheme.Amber;
-            pdcActionDebugLabel.BringToFront();
-            smartStatusToolTip.SetToolTip(pdcActionDebugLabel, "Send quick PDC request to " + pdcDiscoveryLogonCode);
-            pdcActionDebugLabel.Invalidate();
+            if (pdcActionPopupPanel == null)
+            {
+                ConfigurePdcActionPopup();
+            }
+
+            if (pdcActionPopupPanel == null)
+            {
+                return;
+            }
+
+            pdcActionPopupPanel.SuspendLayout();
+            pdcActionPopupPanel.Controls.Clear();
+
+            string code = pdcDiscoveryLogonCode.Trim().ToUpperInvariant();
+            string controller = (pdcDiscoveryController ?? string.Empty).Trim().ToUpperInvariant();
+            string source = string.IsNullOrWhiteSpace(pdcDiscoverySource)
+                ? (pdcDiscoveryIsFallbackCandidate ? "CTR/FSS GEO MATCH" : "LOCAL MATCH")
+                : pdcDiscoverySource.Trim().ToUpperInvariant();
+
+            bool amberCandidate = pdcDiscoveryIsFallbackCandidate || (datalinkStatusText ?? string.Empty).ToUpperInvariant().Contains("MAYBE");
+
+            int popupWidth = 274;
+            int y = 6;
+            Font headerFont = new Font(textFontBold.FontFamily, Math.Max(7.4f, textFontBold.Size - 1.7f), FontStyle.Bold);
+            Font rowFont = new Font(textFontBold.FontFamily, Math.Max(6.9f, textFontBold.Size - 2.0f), FontStyle.Bold);
+
+            AddPdcPopupLabel(amberCandidate ? "PDC / DCL CANDIDATE" : "PDC / DCL AVAILABLE", 8, y, popupWidth - 16, 18, MainAccentColor(), headerFont);
+            y += 24;
+
+            AddPdcPopupLabel(source, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
+            y += 17;
+
+            if (!string.IsNullOrWhiteSpace(controller))
+            {
+                AddPdcPopupLabel(controller, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
+                y += 17;
+            }
+
+            AddPdcPopupLabel("LOGON: " + code, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
+            y += 21;
+
+            if (amberCandidate)
+            {
+                AddPdcPopupLabel("DOUBLE CHECK ON VATSIM RADAR", 8, y, popupWidth - 16, 16, MainAccentColor(), rowFont);
+                y += 20;
+            }
+
+            AddPdcPopupAction(code, y);
+            y += 22;
+
+            pdcActionPopupPanel.Size = new Size(popupWidth, Math.Max(92, y + 5));
+            pdcActionPopupPanel.Location = new Point(
+                Math.Max(4, Math.Min(datalinkStatusLabel.Left - 64, screenPanel.Width - pdcActionPopupPanel.Width - 4)),
+                datalinkStatusLabel.Bottom + 2);
+
+            pdcActionPopupPanel.ResumeLayout();
+            pdcActionPopupPanel.Visible = true;
+            pdcActionPopupPanel.BringToFront();
+            pdcActionPopupPanel.Invalidate();
         }
 
         private void HidePdcQuickActionButton()
@@ -5323,6 +6034,11 @@ namespace EasyCPDLC
             if (pdcActionDebugLabel != null)
             {
                 pdcActionDebugLabel.Visible = false;
+            }
+
+            if (pdcActionPopupPanel != null)
+            {
+                pdcActionPopupPanel.Visible = false;
             }
         }
 
@@ -7161,20 +7877,20 @@ namespace EasyCPDLC
                 return;
             }
 
-            string autoText = "AUTO CONFIRMED AFTER 3 MIN WITHOUT CLRC CONFIRMED";
+            string autoText = "CONFIRMATION SEND BUT NOT CONFIRMED BY ATC";
             if (string.IsNullOrWhiteSpace(lastClearanceHoverText))
             {
                 lastClearanceHoverText = autoText;
             }
-            else if (!lastClearanceHoverText.ToUpperInvariant().Contains("AUTO CONFIRMED"))
+            else if (!lastClearanceHoverText.ToUpperInvariant().Contains("NOT CONFIRMED BY ATC"))
             {
                 lastClearanceHoverText = (lastClearanceHoverText.Trim() + "\n" + autoText).Trim();
             }
 
-            Logger.Debug("CLR auto-confirm applied after " + (string.IsNullOrWhiteSpace(clearanceAutoConfirmReason) ? "WILCO" : clearanceAutoConfirmReason) + ".");
+            Logger.Debug("CLR acknowledgement sent after " + (string.IsNullOrWhiteSpace(clearanceAutoConfirmReason) ? "WILCO" : clearanceAutoConfirmReason) + ", but no ATC confirmation received.");
             clearanceAutoConfirmReason = string.Empty;
 
-            SetClearanceStatus("CLR ACC AUTO");
+            SetClearanceStatus("CLR ACK AUTO");
         }
 
         private void ConfigureUnreadMessageReminder()
@@ -8631,6 +9347,11 @@ namespace EasyCPDLC
 
             if (normalizedType == "SYSTEM")
             {
+                if (IsCpdlcStationDetectedText(contents))
+                {
+                    return "CPDLC STATION DETECTED";
+                }
+
                 if (IsCallsignMismatchAlarmText(contents))
                 {
                     return "VATSIM CALLSIGN MISMATCH";
@@ -9363,7 +10084,12 @@ namespace EasyCPDLC
             _message.Font = textFont;
             _message.Text = listText;
 
-            if (IsCallsignMismatchAlarmText(_contents))
+            if (IsCpdlcStationDetectedText(_contents))
+            {
+                _message.ForeColor = DcduTheme.Amber;
+                _message.Font = textFontBold;
+            }
+            else if (IsCallsignMismatchAlarmText(_contents))
             {
                 _message.ForeColor = CallsignMismatchAlarmColor();
                 _message.Font = textFontBold;
@@ -9508,7 +10234,8 @@ namespace EasyCPDLC
             if (upper.Contains("ACCEPT") ||
                 upper.Contains("WILCO") ||
                 upper.Contains("ROGER") ||
-                upper.Contains("AFFIRM"))
+                upper.Contains("AFFIRM") ||
+                upper.Contains("LOGON"))
             {
                 return DcduTheme.Green;
             }
@@ -9955,9 +10682,9 @@ namespace EasyCPDLC
             }
 
             string status = (clearanceStatusText ?? string.Empty).ToUpperInvariant();
-            if (status.Contains("ACC") && status.Contains("AUTO"))
+            if (status.Contains("ACK") && status.Contains("AUTO"))
             {
-                return "AUTO CONFIRMED AFTER 3 MIN WITHOUT CLRC CONFIRMED";
+                return "CONFIRMATION SEND BUT NOT CONFIRMED BY ATC";
             }
 
             return BuildClearanceTimeline(previewMessage).Replace("CLR TIMELINE  ", string.Empty);
@@ -9977,6 +10704,11 @@ namespace EasyCPDLC
                 if (status.Contains("REJ"))
                 {
                     return Color.FromArgb(255, 86, 74);
+                }
+
+                if (status.Contains("ACK") && status.Contains("AUTO"))
+                {
+                    return DcduTheme.Amber;
                 }
 
                 if (status.Contains("ACC"))
@@ -10143,11 +10875,14 @@ namespace EasyCPDLC
         {
             string status = (clearanceStatusText ?? string.Empty).ToUpperInvariant();
 
+            if (status.Contains("ACK") && status.Contains("AUTO"))
+            {
+                return "CLR TIMELINE  REQ -> RX -> WILCO ✓ ATC PENDING";
+            }
+
             if (status.Contains("ACC"))
             {
-                return status.Contains("AUTO")
-                    ? "CLR TIMELINE  REQ -> RX -> WILCO ✓ AUTO"
-                    : "CLR TIMELINE  REQ -> RX -> WILCO ✓";
+                return "CLR TIMELINE  REQ -> RX -> WILCO ✓";
             }
 
             if (status.Contains("REJ"))
@@ -10172,6 +10907,11 @@ namespace EasyCPDLC
         private Color ClearanceTimelineColor(string timeline)
         {
             string upper = (timeline ?? string.Empty).ToUpperInvariant();
+
+            if (upper.Contains("ATC PENDING"))
+            {
+                return DcduTheme.Amber;
+            }
 
             if (upper.Contains("✓"))
             {
@@ -10294,6 +11034,15 @@ namespace EasyCPDLC
                 else if (_sender.type == "TELEX" && !_sender.outbound)
                 {
                     responses.Add(freeTextLabel);
+                }
+                else if (string.Equals(_sender.type, "SYSTEM", StringComparison.OrdinalIgnoreCase) &&
+                         IsCpdlcStationDetectedText(_sender.message))
+                {
+                    System.Windows.Forms.Label logonLabel = CreateCpdlcStationDetectedLogonLabel(_sender);
+                    if (logonLabel != null)
+                    {
+                        responses.Add(logonLabel);
+                    }
                 }
 
                 HideClearanceTimelinePopup();
@@ -10764,7 +11513,13 @@ namespace EasyCPDLC
             Logger.Debug("Writing message: " + _response);
 
             TimerLabel menuLabel = CreateTimerLabel(">>", true);
-            if (IsCallsignMismatchAlarmText(_response))
+            if (IsCpdlcStationDetectedText(_response))
+            {
+                menuLabel.Text = "NEW";
+                menuLabel.CanFlash = true;
+                menuLabel.ForeColor = DcduTheme.Amber;
+            }
+            else if (IsCallsignMismatchAlarmText(_response))
             {
                 menuLabel.Text = "NEW";
                 menuLabel.CanFlash = true;
