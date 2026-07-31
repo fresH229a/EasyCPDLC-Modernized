@@ -45,8 +45,8 @@ This fork updates EasyCPDLC for **.NET 10** and adds a cockpit-style DCDU interf
 
 ## Screenshots
 
-| Login | Airbus-style | Boeing-style |
-|---|---|---|
+| Login | Airbus-style | Boeing-style | Airbus-style
+|---|---|---|---|
 | ![EasyCPDLC login screen](assets/screenshots/login.png) | ![EasyCPDLC DCDU Airbus-style panel](assets/screenshots/dcdu-airbus1.png) | ![EasyCPDLC DCDU Boeing-style panel](assets/screenshots/dcdu-boeing1.png) | ![EasyCPDLC DCDU A220-style panel](assets/screenshots/a220style.png) |
 
 ---
