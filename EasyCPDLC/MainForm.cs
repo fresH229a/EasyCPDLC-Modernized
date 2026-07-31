@@ -24,6 +24,7 @@ using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Text;
 using System.IO;
+using System.IO.Compression;
 using System.Linq;
 using System.Media;
 using System.Net.Http;
@@ -71,6 +72,295 @@ namespace EasyCPDLC
             {
                 e.TextFormat = TextFormatFlags.Left | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding;
                 base.OnRenderItemText(e);
+            }
+        }
+
+        private sealed class A220PanelButton : Button
+        {
+            // Colors sampled from the supplied A220 cockpit screenshot.
+            private static readonly Color NormalFace = Color.FromArgb(112, 112, 112);   // #707070
+            private static readonly Color ActiveFace = Color.FromArgb(3, 91, 207);      // #035BCF
+            private static readonly Color NormalPressedFace = Color.FromArgb(91, 91, 91);
+            private static readonly Color ActivePressedFace = Color.FromArgb(2, 72, 166);
+            private static readonly Color DisabledFace = Color.FromArgb(72, 72, 72);
+            private static readonly Color OuterEdge = Color.FromArgb(10, 12, 15);
+            private static readonly Color NormalInnerEdge = Color.FromArgb(238, 238, 238);
+            private static readonly Color ActiveInnerEdge = Color.FromArgb(206, 232, 255);
+
+            private bool mouseOver;
+            private bool mousePressed;
+            private bool active;
+            private bool accentText;
+
+            public A220PanelButton()
+            {
+                SetStyle(
+                    ControlStyles.UserPaint |
+                    ControlStyles.AllPaintingInWmPaint |
+                    ControlStyles.OptimizedDoubleBuffer |
+                    ControlStyles.ResizeRedraw |
+                    ControlStyles.Opaque,
+                    true);
+
+                FlatStyle = FlatStyle.Flat;
+                FlatAppearance.BorderSize = 0;
+                UseVisualStyleBackColor = false;
+                TabStop = false;
+                Cursor = Cursors.Hand;
+                BackColor = OuterEdge;
+                ForeColor = Color.White;
+                DoubleBuffered = true;
+            }
+
+            public bool Active
+            {
+                get => active;
+                set
+                {
+                    if (active == value)
+                    {
+                        return;
+                    }
+
+                    active = value;
+                    Invalidate();
+                }
+            }
+
+            public bool AccentText
+            {
+                get => accentText;
+                set
+                {
+                    if (accentText == value)
+                    {
+                        return;
+                    }
+
+                    accentText = value;
+                    Invalidate();
+                }
+            }
+
+            protected override void OnMouseEnter(EventArgs e)
+            {
+                base.OnMouseEnter(e);
+                mouseOver = true;
+                Invalidate(true);
+            }
+
+            protected override void OnMouseLeave(EventArgs e)
+            {
+                base.OnMouseLeave(e);
+                mouseOver = false;
+                mousePressed = false;
+                Invalidate(true);
+            }
+
+            protected override void OnMouseDown(MouseEventArgs mevent)
+            {
+                if (mevent.Button == MouseButtons.Left)
+                {
+                    mousePressed = true;
+                    Invalidate(true);
+                }
+
+                base.OnMouseDown(mevent);
+            }
+
+            protected override void OnMouseUp(MouseEventArgs mevent)
+            {
+                mousePressed = false;
+                Invalidate(true);
+                base.OnMouseUp(mevent);
+            }
+
+            protected override void OnEnabledChanged(EventArgs e)
+            {
+                Invalidate();
+                base.OnEnabledChanged(e);
+            }
+
+            protected override void OnPaintBackground(PaintEventArgs pevent)
+            {
+                // Always erase the complete client area. The former transparent
+                // background left the last pixel row/column from an earlier hover
+                // state visible around the button edges.
+                pevent.Graphics.Clear(OuterEdge);
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                if (Width < 4 || Height < 4)
+                {
+                    return;
+                }
+
+                // The real A220 controls are crisp, almost square and deliberately
+                // non-glossy. Do not use rounded paths or a multi-stop gradient here.
+                e.Graphics.SmoothingMode = SmoothingMode.None;
+                e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+                e.Graphics.InterpolationMode = InterpolationMode.NearestNeighbor;
+
+                bool blueFace = Enabled && (Active || mouseOver);
+                Color faceColor;
+                if (!Enabled)
+                {
+                    faceColor = DisabledFace;
+                }
+                else if (blueFace)
+                {
+                    faceColor = mousePressed ? ActivePressedFace : ActiveFace;
+                }
+                else
+                {
+                    faceColor = mousePressed ? NormalPressedFace : NormalFace;
+                }
+
+                // Clear all pixels, including the final row and column. Drawing
+                // rectangles use Width - 1 / Height - 1 only for their outline.
+                e.Graphics.Clear(OuterEdge);
+
+                Rectangle outerFill = ClientRectangle;
+                Rectangle outerOutline = new(0, 0, Width - 1, Height - 1);
+                Rectangle innerEdge = Rectangle.Inflate(outerOutline, -1, -1);
+                Rectangle face = Rectangle.Inflate(innerEdge, -1, -1);
+
+                using (SolidBrush outerBrush = new(OuterEdge))
+                using (SolidBrush faceBrush = new(faceColor))
+                using (Pen outerPen = new(OuterEdge, 1.0f))
+                using (Pen innerPen = new(blueFace ? ActiveInnerEdge : NormalInnerEdge, 1.0f))
+                using (Pen lowerEdgePen = new(Color.FromArgb(58, 58, 58), 1.0f))
+                {
+                    e.Graphics.FillRectangle(outerBrush, outerFill);
+                    e.Graphics.DrawRectangle(outerPen, outerOutline);
+                    e.Graphics.FillRectangle(faceBrush, face);
+                    e.Graphics.DrawRectangle(innerPen, innerEdge);
+
+                    // One restrained lower edge is visible on the cockpit buttons;
+                    // it adds depth without creating the previous glossy appearance.
+                    int lowerY = Math.Max(face.Top, face.Bottom - 1);
+                    e.Graphics.DrawLine(lowerEdgePen, face.Left, lowerY, face.Right, lowerY);
+                }
+
+                // Very small top lift only. The main surface remains exactly #707070.
+                if (Enabled && !mousePressed)
+                {
+                    using Pen topLift = new(
+                        blueFace ? Color.FromArgb(62, 132, 224) : Color.FromArgb(132, 132, 132),
+                        1.0f);
+                    e.Graphics.DrawLine(topLift, face.Left, face.Top, face.Right, face.Top);
+                }
+
+                Color textColor;
+                if (!Enabled)
+                {
+                    textColor = Color.FromArgb(165, 165, 165);
+                }
+                else if (AccentText)
+                {
+                    textColor = Color.FromArgb(112, 255, 120);
+                }
+                else
+                {
+                    textColor = Color.White;
+                }
+
+                Rectangle textBounds = Rectangle.Inflate(face, -5, -2);
+                if (mousePressed)
+                {
+                    textBounds.Offset(0, 1);
+                }
+
+                TextFormatFlags flags = TextFormatFlags.HorizontalCenter |
+                                        TextFormatFlags.VerticalCenter |
+                                        TextFormatFlags.SingleLine |
+                                        TextFormatFlags.EndEllipsis |
+                                        TextFormatFlags.NoPrefix |
+                                        TextFormatFlags.NoPadding;
+
+                // The screenshot has a small dark text edge, not a large drop shadow.
+                Rectangle textEdge = textBounds;
+                textEdge.Offset(1, 1);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    Text ?? string.Empty,
+                    Font,
+                    textEdge,
+                    Color.FromArgb(130, 0, 0, 0),
+                    flags);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    Text ?? string.Empty,
+                    Font,
+                    textBounds,
+                    textColor,
+                    flags);
+            }
+        }
+
+        private sealed class A220SelectorDropDownRenderer : ToolStripRenderer
+        {
+            private static readonly Color DropBackground = Color.FromArgb(18, 20, 23);
+            private static readonly Color ItemBackground = Color.FromArgb(62, 64, 66);
+            private static readonly Color SelectedBackground = Color.FromArgb(3, 91, 207);
+            private static readonly Color BorderLight = Color.FromArgb(218, 218, 218);
+            private static readonly Color BorderDark = Color.FromArgb(12, 14, 17);
+
+            protected override void OnRenderToolStripBackground(ToolStripRenderEventArgs e)
+            {
+                using SolidBrush brush = new(DropBackground);
+                e.Graphics.FillRectangle(brush, e.AffectedBounds);
+            }
+
+            protected override void OnRenderToolStripBorder(ToolStripRenderEventArgs e)
+            {
+                Rectangle bounds = new(0, 0, Math.Max(1, e.ToolStrip.Width - 1), Math.Max(1, e.ToolStrip.Height - 1));
+                using Pen outerPen = new(BorderDark, 1.0f);
+                using Pen innerPen = new(Color.FromArgb(150, 150, 150), 1.0f);
+                e.Graphics.DrawRectangle(outerPen, bounds);
+                if (bounds.Width > 3 && bounds.Height > 3)
+                {
+                    e.Graphics.DrawRectangle(innerPen, Rectangle.Inflate(bounds, -1, -1));
+                }
+            }
+
+            protected override void OnRenderMenuItemBackground(ToolStripItemRenderEventArgs e)
+            {
+                bool checkedItem = e.Item is ToolStripMenuItem menuItem && menuItem.Checked;
+                bool active = e.Item.Selected || checkedItem;
+                Rectangle bounds = new(1, 0, Math.Max(1, e.Item.Width - 2), Math.Max(1, e.Item.Height - 1));
+
+                using SolidBrush faceBrush = new(active ? SelectedBackground : ItemBackground);
+                e.Graphics.FillRectangle(faceBrush, bounds);
+
+                using Pen topPen = new(active ? Color.FromArgb(190, 220, 255) : BorderLight, 1.0f);
+                using Pen bottomPen = new(active ? Color.FromArgb(0, 45, 112) : Color.FromArgb(38, 38, 38), 1.0f);
+                e.Graphics.DrawLine(topPen, bounds.Left, bounds.Top, bounds.Right, bounds.Top);
+                e.Graphics.DrawLine(bottomPen, bounds.Left, bounds.Bottom, bounds.Right, bounds.Bottom);
+            }
+
+            protected override void OnRenderItemText(ToolStripItemTextRenderEventArgs e)
+            {
+                e.TextColor = e.Item.Enabled ? Color.White : Color.FromArgb(155, 155, 155);
+                e.TextFormat = TextFormatFlags.Left |
+                               TextFormatFlags.VerticalCenter |
+                               TextFormatFlags.SingleLine |
+                               TextFormatFlags.NoPrefix |
+                               TextFormatFlags.NoPadding;
+                base.OnRenderItemText(e);
+            }
+
+            protected override void OnRenderItemCheck(ToolStripItemImageRenderEventArgs e)
+            {
+                // The currently selected item is shown by its blue background.
+            }
+
+            protected override void OnRenderSeparator(ToolStripSeparatorRenderEventArgs e)
+            {
+                using Pen pen = new(Color.FromArgb(95, 95, 95), 1.0f);
+                int y = e.Item.Height / 2;
+                e.Graphics.DrawLine(pen, 3, y, Math.Max(3, e.Item.Width - 4), y);
             }
         }
 
@@ -892,6 +1182,7 @@ private TelexForm tForm;
         private const string AutoDeleteRequestSecondsSettingName = "AutoDeleteRequestSeconds";
         private const string WindowScalePercentSettingName = "WindowScalePercent";
         private const string MessagePreviewTextTag = "EASYCPDLC_MESSAGE_PREVIEW_TEXT";
+        private const string A220PhysicalLayoutTag = "EASYCPDLC_A220_PHYSICAL_LAYOUT";
 
         public static int WindowScalePercent
         {
@@ -1002,8 +1293,39 @@ private TelexForm tForm;
             return baseHeight > 0 ? baseHeight : (parent?.ClientSize.Height ?? 0);
         }
 
+        private bool IsA220PhysicalLayout(Control parent)
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                return false;
+            }
+
+            Control current = parent;
+            while (current != null)
+            {
+                if (string.Equals(
+                    current.Tag as string,
+                    A220PhysicalLayoutTag,
+                    StringComparison.Ordinal))
+                {
+                    return true;
+                }
+
+                current = current.Parent;
+            }
+
+            return false;
+        }
+
         private int ScaleChildX(Control parent, int x)
         {
+            // A220 pages are composed with already-scaled physical coordinates.
+            // Scaling those values a second time caused every form to drift at
+            // 110/120 percent. Airbus/Boeing continue using logical coordinates.
+            if (IsA220PhysicalLayout(parent))
+            {
+                return Math.Max(0, x);
+            }
             int parentWidth = parent?.ClientSize.Width ?? 0;
             int baseWidth = BaseLogicalWidth(parent);
 
@@ -1020,6 +1342,11 @@ private TelexForm tForm;
 
         private int ScaleChildX(Control parent, int x, int width)
         {
+            if (IsA220PhysicalLayout(parent))
+            {
+                return Math.Max(0, x);
+            }
+
             int parentWidth = parent?.ClientSize.Width ?? 0;
             int baseWidth = BaseLogicalWidth(parent);
 
@@ -1036,6 +1363,11 @@ private TelexForm tForm;
 
         private int ScaleChildY(Control parent, int y)
         {
+            if (IsA220PhysicalLayout(parent))
+            {
+                return Math.Max(0, y);
+            }
+
             int parentHeight = parent?.ClientSize.Height ?? 0;
             int baseHeight = BaseLogicalHeight(parent);
 
@@ -1049,6 +1381,11 @@ private TelexForm tForm;
 
         private int ScaleChildY(Control parent, int y, int height)
         {
+            if (IsA220PhysicalLayout(parent))
+            {
+                return Math.Max(0, y);
+            }
+
             int parentHeight = parent?.ClientSize.Height ?? 0;
             int baseHeight = BaseLogicalHeight(parent);
 
@@ -1062,6 +1399,17 @@ private TelexForm tForm;
 
         private int ScaleChildWidth(Control parent, int x, int width)
         {
+            if (IsA220PhysicalLayout(parent))
+            {
+                int parentWidthPhysical = parent?.ClientSize.Width ?? 0;
+                if (parentWidthPhysical > 0)
+                {
+                    return Math.Max(1, Math.Min(width, parentWidthPhysical - Math.Max(0, x)));
+                }
+
+                return Math.Max(1, width);
+            }
+
             int parentWidth = parent?.ClientSize.Width ?? 0;
             int baseWidth = BaseLogicalWidth(parent);
             int scaledX = ScaleChildX(parent, x, width);
@@ -1081,6 +1429,17 @@ private TelexForm tForm;
 
         private int ScaleChildHeight(Control parent, int y, int height)
         {
+            if (IsA220PhysicalLayout(parent))
+            {
+                int parentHeightPhysical = parent?.ClientSize.Height ?? 0;
+                if (parentHeightPhysical > 0)
+                {
+                    return Math.Max(1, Math.Min(height, parentHeightPhysical - Math.Max(0, y)));
+                }
+
+                return Math.Max(1, height);
+            }
+
             int parentHeight = parent?.ClientSize.Height ?? 0;
             int baseHeight = BaseLogicalHeight(parent);
             int scaledY = ScaleChildY(parent, y, height);
@@ -1659,6 +2018,8 @@ private TelexForm tForm;
                 cpdlcDiscoveryLabel.Visible = true;
             }
 
+            SyncA220NavigationAvailability();
+
             if (!interactiveEnabled)
             {
                 HideQuickWxPopup();
@@ -1701,6 +2062,12 @@ private TelexForm tForm;
                 }
 
                 _currentATCUnit = newUnit;
+
+                if (!string.IsNullOrWhiteSpace(newUnit))
+                {
+                    cpdlcSessionEstablished = true;
+                    RemoveObsoleteCpdlcWatchMessages();
+                }
 
                 UpdateCurrentAtcUnitDisplay();
                 UpdateOnlineStatusLabel();
@@ -1977,6 +2344,17 @@ private TelexForm tForm;
             return NormalizeAtcUnitCallsign(fallbackSender);
         }
 
+        private static bool IsCpdlcConnectionEstablishedText(string message)
+        {
+            string clean = Regex.Replace((message ?? string.Empty).Trim(), @"\s+", " ").ToUpperInvariant();
+
+            return clean.StartsWith("LOGON ACCEPTED", StringComparison.Ordinal) ||
+                   clean.StartsWith("LOGON CONFIRMED", StringComparison.Ordinal) ||
+                   clean.StartsWith("LOGON ESTABLISHED", StringComparison.Ordinal) ||
+                   clean.StartsWith("CONNECTED TO", StringComparison.Ordinal) ||
+                   clean.StartsWith("CPDLC CONNECTED TO", StringComparison.Ordinal);
+        }
+
         private static string BuildFlightPlanSignature(Pilot pilot)
         {
             if (pilot == null)
@@ -2225,6 +2603,7 @@ private TelexForm tForm;
                     lastVatsimCallsignMismatchWarningUtc = DateTime.MinValue;
 
                     pendingLogon = null;
+                    cpdlcSessionEstablished = false;
                     CurrentATCUnit = null;
 
 
@@ -3230,6 +3609,10 @@ private TelexForm tForm;
         private string cpdlcDiscoveryText = "standby";
         private string cpdlcDiscoveryHoverText = "CPDLC standby";
         private bool cpdlcHelperEnabled = true;
+        // Independent fail-safe session flag. CurrentATCUnit is still the display value,
+        // but this flag keeps suggestions suppressed even if a controller uses a
+        // connection-confirmation wording that does not carry a parseable unit.
+        private bool cpdlcSessionEstablished = false;
         private static readonly bool CpdlcHelperPopupDebugPreview = false;
 #if DEBUG
         private static readonly bool DebugUiPreviewMode = true;
@@ -3259,6 +3642,9 @@ private TelexForm tForm;
         private bool vatsimOnlineRefreshInProgress = false;
         private static readonly TimeSpan vatsimOnlineRefreshInterval = TimeSpan.FromSeconds(60);
         private readonly Dictionary<string, List<long>> vatsimTransceiverFrequencies = new(StringComparer.OrdinalIgnoreCase);
+        // AFV transceiver id 0 is the primary pilot radio (VHF1/COM1).
+        // Keep it separately so array ordering can never make VHF2 look like VHF1.
+        private readonly Dictionary<string, long> vatsimPrimaryVhf1Frequencies = new(StringComparer.OrdinalIgnoreCase);
         private DateTime vatsimTransceiversLoadedUtc = DateTime.MinValue;
         private DateTime lastVatsimTransceiverRefreshAttemptUtc = DateTime.MinValue;
         private bool vatsimTransceiverRefreshInProgress = false;
@@ -3267,6 +3653,17 @@ private TelexForm tForm;
         private const string VatsimTransceiversDataUrl = "https://data.vatsim.net/v3/transceivers-data.json";
         private readonly HashSet<string> hoppieOnlineStations = new(StringComparer.OrdinalIgnoreCase);
         private bool hoppieOnlineStationsLoaded = false;
+        private DateTime hoppieOnlineStationsLoadedUtc = DateTime.MinValue;
+        private readonly Dictionary<string, DateTime> cpdlcLogonNotOnlineNoticeUtc = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan cpdlcLogonNotOnlineNoticeCooldown = TimeSpan.FromSeconds(60);
+        private static readonly TimeSpan cpdlcManualLogonFailureDelay = TimeSpan.FromSeconds(10);
+
+        private enum CpdlcLogonStationAvailability
+        {
+            Online,
+            NotOnline,
+            Unknown
+        }
 
         private sealed class WeatherCacheItem
         {
@@ -3388,6 +3785,18 @@ private TelexForm tForm;
         private ContextMenuStrip trayMenu;
         private readonly DcduHotspotButton mainMinimizeButton = new();
         private readonly DcduHotspotButton mainReloadFlightPlanButton = new();
+
+        // Code-drawn A220-style touch navigation. It deliberately has no DCDU
+        // hardware frame or line-select keys.
+        private Panel a220NavigationPanel;
+        private readonly Dictionary<string, Button> a220NavigationButtons =
+            new(StringComparer.OrdinalIgnoreCase);
+        private Button a220MinimizeButton;
+        private Button a220CloseButton;
+        private Panel a220InteriorBackdrop;
+        private Panel a220BlackScreenSurface;
+        private readonly HashSet<Control> a220BlackGradientSurfaces = new();
+        private string a220ActiveNavigationKey = "CONN";
         private bool arrivalReloadReminderShown = false;
         private DateTime arrivalReloadReminderStartUtc = DateTime.MinValue;
         private string arrivalReloadReminderSignature = string.Empty;
@@ -3450,7 +3859,8 @@ private TelexForm tForm;
             WxRequest,
             AtisRequest,
             FreeTextRequest,
-            AtcRequest
+            AtcRequest,
+            ManualLogon
         }
 
         private enum BoeingTelexPage
@@ -3480,7 +3890,8 @@ private TelexForm tForm;
             Atis,
             PreDepClearance,
             OceanicClearance,
-            AtcRequest
+            AtcRequest,
+            ManualLogon
         }
 
         private enum EmbeddedSetupPage
@@ -3549,6 +3960,7 @@ private TelexForm tForm;
         private readonly Dictionary<string, TextBox> airbusAocInputs = new(StringComparer.OrdinalIgnoreCase);
         private readonly Dictionary<string, string> airbusAocFormValues = new(StringComparer.OrdinalIgnoreCase);
 private System.Windows.Forms.Label airbusAocSendLabel;
+        private Button airbusAocSendButton;
         private bool airbusAocSendReady;
         private const string AirbusAocInputGate = "gate";
         private const string AirbusAocInputAtis = "atis";
@@ -3584,6 +3996,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             LogManager.Configuration = config;
             Logger.Info("Logging initialised, beginning setup");
             Logger.Debug("Log file path: " + easyCpdlcLogFilePath);
+            CleanupStaleUpdateTemporaryDirectories();
 
             if (TryForwardProtocolLaunchToExistingInstance())
             {
@@ -3620,6 +4033,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             this.AutoScaleMode = AutoScaleMode.None;
             this.Font = controlFont;
             this.Icon = LoadTrayIcon();
+
+            // A persisted A220 style is applied during construction, before MainForm_Load.
+            // Its layout needs the dynamically created status and filter controls already
+            // to exist, otherwise startup can fail with a NullReferenceException.
+            ConfigureSmartWidgets();
             ApplyDisplayStyle();
             this.ShowInTaskbar = false;
             ConfigureTrayIcon();
@@ -3629,6 +4047,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             this.DoubleBuffered = true;
             this.SetStyle(ControlStyles.ResizeRedraw, true);
             ApplyMainWindowBounds(DcduStyleManager.IsBoeing);
+            cpdlcSessionEstablished = false;
             CurrentATCUnit = null;
             ClearNextAtcUnitDisplay();
             ConfigureMsfsClickGuard();
@@ -3898,6 +4317,31 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            if (DcduStyleManager.IsA220)
+            {
+                // A220 overview action menus use the same flat, recessed visual
+                // language as the cockpit push/select controls.
+                e.Graphics.SmoothingMode = SmoothingMode.None;
+                e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+
+                using SolidBrush shadowBrush = new(Color.FromArgb(5, 7, 10));
+                using SolidBrush faceBrush = new(Color.FromArgb(16, 20, 25));
+                using Pen outerBorder = new(Color.FromArgb(20, 27, 34), 1.0f);
+                using Pen innerBorder = new(Color.FromArgb(119, 132, 143), 1.0f);
+                using Pen topEdge = new(Color.FromArgb(48, 60, 70), 1.0f);
+
+                e.Graphics.FillRectangle(shadowBrush, bounds);
+                Rectangle face = Rectangle.Inflate(bounds, -1, -1);
+                e.Graphics.FillRectangle(faceBrush, face);
+                e.Graphics.DrawRectangle(outerBorder, bounds);
+                if (face.Width > 2 && face.Height > 2)
+                {
+                    e.Graphics.DrawRectangle(innerBorder, face);
+                    e.Graphics.DrawLine(topEdge, face.Left + S(3), face.Top + S(1), face.Right - S(3), face.Top + S(1));
+                }
+                return;
+            }
 
             using GraphicsPath path = RoundedButtonRect(bounds, S(DcduStyleManager.IsBoeing ? 4 : 6));
 
@@ -4290,21 +4734,35 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         public void ApplyDisplayStyle()
         {
             bool isBoeing = DcduStyleManager.IsBoeing;
+            bool isA220 = DcduStyleManager.IsA220;
             ApplyMainWindowBounds(isBoeing);
             if (dcduFrame != null)
             {
-                dcduFrame.AssetFileName = DcduStyleManager.AssetFile("DCDU_Main_V15.png");
+                // A220 is intentionally code-drawn: only a blue-grey bezel and
+                // the touchscreen UI, never the Airbus/Boeing DCDU artwork.
+                dcduFrame.DrawA220Bezel = isA220;
+                dcduFrame.AssetFileName = isA220
+                    ? string.Empty
+                    : DcduStyleManager.AssetFile("DCDU_Main_V15.png");
                 dcduFrame.HighlightRectangle = Rectangle.Empty;
                 dcduFrame.HighlightPressed = false;
                 dcduFrame.Invalidate();
             }
 
+            ConfigureA220InteriorBackdrop();
+            ConfigureA220Navigation();
             ApplyMainScreenLayout(isBoeing);
             ApplyMainButtonLayout(isBoeing);
             ConfigureInboundMessageSound();
             ApplyMainThemeColors();
             ConfigureTransparentScrollDoubleBuffer();
             ConfigureMsfsClickGuard();
+            if (DcduStyleManager.IsA220)
+            {
+                a220InteriorBackdrop?.SendToBack();
+                screenPanel?.BringToFront();
+                a220NavigationPanel?.BringToFront();
+            }
             Invalidate(true);
         }
 
@@ -4793,15 +5251,22 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         private void ApplyTopInfoFonts()
         {
             bool isBoeing = DcduStyleManager.IsBoeing;
-            Font captionFont = isBoeing
+            bool isA220 = DcduStyleManager.IsA220;
+            Font captionFont = isA220
+                ? CreateDpiStablePointFont("Consolas", 11.0f, FontStyle.Regular)
+                : isBoeing
                 ? CreateDpiStablePointFont("Segoe UI Semibold", 10.2f, FontStyle.Regular)
                 : textFontBold;
-            Font valueFont = isBoeing
-                ? CreateDpiStablePointFont("Segoe UI Semibold", 10.2f, FontStyle.Regular)
-                : textFontBold;
-            Font headerFont = isBoeing
-                ? CreateDpiStablePointFont("Segoe UI Semibold", 10.4f, FontStyle.Regular)
-                : textFontBold;
+            Font valueFont = isA220
+                ? CreateDpiStablePointFont("Consolas", 11.2f, FontStyle.Bold)
+                : isBoeing
+                    ? CreateDpiStablePointFont("Segoe UI Semibold", 10.2f, FontStyle.Regular)
+                    : textFontBold;
+            Font headerFont = isA220
+                ? CreateDpiStablePointFont("Consolas", 11.5f, FontStyle.Bold)
+                : isBoeing
+                    ? CreateDpiStablePointFont("Segoe UI Semibold", 10.4f, FontStyle.Regular)
+                    : textFontBold;
 
             if (statusCaptionLabel != null)
             {
@@ -4910,6 +5375,20 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         {
             ApplyTopInfoFonts();
             ConfigureSmartWidgets();
+
+            if (DcduStyleManager.IsA220)
+            {
+                ApplyA220MainScreenLayout();
+                return;
+            }
+
+            foreach (string guideName in new[] { "a220TopSectionDivider", "a220StatusAtsDivider", "a220MessagesDivider" })
+            {
+                if (screenPanel?.Controls.Find(guideName, false).FirstOrDefault() is Control guide)
+                {
+                    guide.Visible = false;
+                }
+            }
 
             if (messageFilterLabel == null || clearanceStatusLabel == null || datalinkStatusLabel == null || atisStatusLabel == null || atisAutoStatusLabel == null || quickWxStatusLabel == null || cpdlcDiscoveryLabel == null || pdcActionDebugLabel == null || cpdlcActionDebugLabel == null)
             {
@@ -6421,6 +6900,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
 
             hoppieOnlineStationsLoaded = true;
+            hoppieOnlineStationsLoadedUtc = DateTime.UtcNow;
         }
 
         private static bool IsUsefulHoppieStationToken(string token)
@@ -7282,7 +7762,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             // Only real CPDLC connection/logon/handover states suppress the helper.
             // Being tuned to a normal voice ATC frequency without CPDLC must NOT suppress
             // nearby/upcoming CPDLC suggestions.
-            return !string.IsNullOrWhiteSpace(_currentATCUnit) ||
+            return cpdlcSessionEstablished ||
+                   !string.IsNullOrWhiteSpace(_currentATCUnit) ||
                    !string.IsNullOrWhiteSpace(pendingLogon) ||
                    !string.IsNullOrWhiteSpace(nextAtcUnitText) ||
                    !string.IsNullOrWhiteSpace(cpdlcHandoverTargetCode);
@@ -7327,29 +7808,33 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
-            if (!string.IsNullOrWhiteSpace(_currentATCUnit))
+            if (cpdlcSessionEstablished || !string.IsNullOrWhiteSpace(_currentATCUnit))
             {
+                string connectedUnit = (_currentATCUnit ?? string.Empty).Trim().ToUpperInvariant();
                 cpdlcDiscoveryText = "connected";
-                cpdlcDiscoveryLogonCode = _currentATCUnit;
-                cpdlcDiscoveryController = _currentATCUnit;
+                cpdlcDiscoveryLogonCode = connectedUnit;
+                cpdlcDiscoveryController = connectedUnit;
 
-                if (IsCpdlcHandoverFrequencyPending())
+                if (!string.IsNullOrWhiteSpace(connectedUnit) && IsCpdlcHandoverFrequencyPending())
                 {
                     cpdlcDiscoveryHoverText =
-                        "CPDLC connected\nCurrent ATS Unit: " + _currentATCUnit +
+                        "CPDLC connected\nCurrent ATS Unit: " + connectedUnit +
                         "\nFrequency handover pending\nTune/select the new ATC frequency for verified CPDLC.";
                 }
                 else
                 {
-                    if (!string.IsNullOrWhiteSpace(cpdlcHandoverTargetCode) &&
-                        IsCpdlcUnitVerifiedOnActiveFrequency(_currentATCUnit))
+                    if (!string.IsNullOrWhiteSpace(connectedUnit) &&
+                        !string.IsNullOrWhiteSpace(cpdlcHandoverTargetCode) &&
+                        IsCpdlcUnitVerifiedOnActiveFrequency(connectedUnit))
                     {
                         cpdlcHandoverTargetCode = string.Empty;
                         cpdlcHandoverStartedUtc = DateTime.MinValue;
                         cpdlcHandoverBlinkTimer.Stop();
                     }
 
-                    cpdlcDiscoveryHoverText = "CPDLC connected\nCurrent ATS Unit: " + _currentATCUnit;
+                    cpdlcDiscoveryHoverText = string.IsNullOrWhiteSpace(connectedUnit)
+                        ? "CPDLC connected\nCurrent ATS Unit was not reported by the station.\nCPDLC suggestions remain disabled."
+                        : "CPDLC connected\nCurrent ATS Unit: " + connectedUnit;
                 }
 
                 return;
@@ -7520,12 +8005,20 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 otherCandidates + "\n\n" +
                 "OPEN MESSAGE AND SELECT LOGON TO " + code;
 
+            // Re-check immediately before creating the message. A LOGON ACCEPTED packet may
+            // have arrived while the candidate list was being evaluated.
+            if (IsCpdlcHelperSuppressedByConnection())
+            {
+                Logger.Debug("CPDLC station notification cancelled because a CPDLC session became active.");
+                return;
+            }
+
             Logger.Debug("CPDLC station notification created for " + controller + " / " + code + " (" + candidates.Count + " candidate(s)).");
 
             // CPDLC WATCH messages are SYSTEM messages, therefore WriteMessage() deliberately
             // does not play the normal inbound CPDLC/TELEX sound for them.
             // A detected CPDLC logon candidate should still alert like a normal CPDLC message,
-            // using the currently selected Airbus/Boeing notification sound.
+            // using the currently selected Airbus/Boeing/A220 notification sound.
             if (PlaySound)
             {
                 PlayInboundMessageSound();
@@ -7541,6 +8034,37 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return text.StartsWith("POSSIBLE CPDLC STATION DETECTED", StringComparison.OrdinalIgnoreCase) ||
                    text.StartsWith("ACTIVE FREQUENCY CPDLC LOGON DETECTED", StringComparison.OrdinalIgnoreCase) ||
                    text.StartsWith("VERIFIED ACTIVE FREQUENCY CPDLC LOGON", StringComparison.OrdinalIgnoreCase);
+        }
+
+        private void RemoveObsoleteCpdlcWatchMessages()
+        {
+            SafeUi(() =>
+            {
+                if (outputTable == null || outputTable.IsDisposed)
+                {
+                    return;
+                }
+
+                List<CPDLCMessage> obsolete = outputTable.Controls
+                    .OfType<CPDLCMessage>()
+                    .Where(message =>
+                        message != null &&
+                        !message.IsDisposed &&
+                        string.Equals(message.type, "SYSTEM", StringComparison.OrdinalIgnoreCase) &&
+                        IsCpdlcStationDetectedText(message.message))
+                    .OrderByDescending(message => outputTable.GetPositionFromControl(message).Row)
+                    .ToList();
+
+                foreach (CPDLCMessage message in obsolete)
+                {
+                    DeleteMessageRow(message);
+                }
+
+                if (obsolete.Count > 0)
+                {
+                    Logger.Debug("Removed " + obsolete.Count + " obsolete CPDLC WATCH suggestion(s) after connection establishment.");
+                }
+            });
         }
 
         private static string ExtractCpdlcStationDetectedLogonCode(string contents)
@@ -7904,6 +8428,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 }
 
                 Dictionary<string, List<long>> parsed = new(StringComparer.OrdinalIgnoreCase);
+                Dictionary<string, long> parsedPrimaryVhf1 = new(StringComparer.OrdinalIgnoreCase);
 
                 foreach (JToken client in clients)
                 {
@@ -7914,13 +8439,33 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     }
 
                     List<long> freqs = new();
+                    long primaryVhf1 = 0;
+                    bool primaryVhf1Ambiguous = false;
 
                     JArray transceivers = client["transceivers"] as JArray ?? new JArray();
                     foreach (JToken transceiver in transceivers)
                     {
-                        if (TryParseLongFrequency(transceiver["frequency"], out long hz))
+                        if (!TryParseLongFrequency(transceiver["frequency"], out long hz))
                         {
-                            freqs.Add(hz);
+                            continue;
+                        }
+
+                        freqs.Add(hz);
+
+                        // VATSIM's AFV data identifies radios by transceiver id.
+                        // id 0 is VHF1/COM1; id 1 and higher are secondary radios.
+                        // Never infer VHF1 from JSON array order.
+                        int? transceiverId = transceiver["id"]?.Value<int?>();
+                        if (transceiverId == 0)
+                        {
+                            if (primaryVhf1 == 0)
+                            {
+                                primaryVhf1 = hz;
+                            }
+                            else if (Math.Abs(primaryVhf1 - hz) > 8000L)
+                            {
+                                primaryVhf1Ambiguous = true;
+                            }
                         }
                     }
 
@@ -7928,12 +8473,25 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     {
                         parsed[clientCallsign] = freqs.Distinct().ToList();
                     }
+
+                    // Fail closed: if id 0 is missing or contradictory, do not perform
+                    // active-frequency CPDLC verification for this pilot at all.
+                    if (primaryVhf1 > 0 && !primaryVhf1Ambiguous)
+                    {
+                        parsedPrimaryVhf1[clientCallsign] = primaryVhf1;
+                    }
                 }
 
                 vatsimTransceiverFrequencies.Clear();
                 foreach (KeyValuePair<string, List<long>> item in parsed)
                 {
                     vatsimTransceiverFrequencies[item.Key] = item.Value;
+                }
+
+                vatsimPrimaryVhf1Frequencies.Clear();
+                foreach (KeyValuePair<string, long> item in parsedPrimaryVhf1)
+                {
+                    vatsimPrimaryVhf1Frequencies[item.Key] = item.Value;
                 }
 
                 vatsimTransceiversLoadedUtc = DateTime.UtcNow;
@@ -8014,6 +8572,24 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return (hz / 1000000.0).ToString("0.000", System.Globalization.CultureInfo.InvariantCulture);
         }
 
+        private static bool IsCpdlcVerificationBlockedVoiceFrequencyHz(long hz)
+        {
+            if (hz <= 0)
+            {
+                return false;
+            }
+
+            // 121.500 MHz is the international emergency/guard voice frequency.
+            // 122.800 MHz is VATSIM UNICOM / advisory voice.
+            // Neither may ever verify or display as an active CPDLC ATC frequency.
+            return Math.Abs(hz - 121500000L) <= 8000L ||
+                   Math.Abs(hz - 122800000L) <= 8000L;
+        }
+
+
+        
+
+
         private List<long> GetPilotTunedFrequencies()
         {
             string activeCallsign = GetConnectedPilotCallsign();
@@ -8023,9 +8599,17 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return new List<long>();
             }
 
-            if (vatsimTransceiverFrequencies.TryGetValue(activeCallsign.Trim().ToUpperInvariant(), out List<long> freqs))
+            string normalizedCallsign = activeCallsign.Trim().ToUpperInvariant();
+            if (vatsimPrimaryVhf1Frequencies.TryGetValue(normalizedCallsign, out long primaryVhf1))
             {
-                return freqs?.Distinct().ToList() ?? new List<long>();
+                // Only AFV transceiver id 0 is accepted here. Never fall back to the
+                // first array element: the feed may list VHF2/COM2 before VHF1/COM1.
+                if (primaryVhf1 <= 0 || IsCpdlcVerificationBlockedVoiceFrequencyHz(primaryVhf1))
+                {
+                    return new List<long>();
+                }
+
+                return new List<long> { primaryVhf1 };
             }
 
             return new List<long>();
@@ -8058,7 +8642,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private string GetControllerDisplayFrequencyText(Controller controller)
         {
-            List<long> freqs = GetControllerTunedFrequencies(controller);
+            List<long> freqs = GetControllerTunedFrequencies(controller)
+                .Where(freq => !IsCpdlcVerificationBlockedVoiceFrequencyHz(freq))
+                .Distinct()
+                .ToList();
+
             if (freqs.Count > 0)
             {
                 return FormatFrequencyHz(freqs[0]);
@@ -8076,14 +8664,18 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return false;
             }
 
-            List<long> controllerFreqs = GetControllerTunedFrequencies(controller);
+            List<long> controllerFreqs = GetControllerTunedFrequencies(controller)
+                .Where(freq => !IsCpdlcVerificationBlockedVoiceFrequencyHz(freq))
+                .Distinct()
+                .ToList();
+
             if (controllerFreqs.Count == 0)
             {
                 return false;
             }
 
-            // Prefer comparing actual VATSIM audio transceiver frequencies in Hz.
-            // Fall back to controller.frequency only if no controller transceiver entry exists.
+            // IMPORTANT: pilotFreqs is already VHF1-only via GetPilotTunedFrequencies().
+            // Do not match against VHF2/COM2 or any secondary radio.
             foreach (long controllerHz in controllerFreqs)
             {
                 if (pilotFreqs.Any(freq => Math.Abs(freq - controllerHz) <= 8000))
@@ -10312,6 +10904,156 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             });
         }
 
+        private bool WasHoppieOnlineStationListFreshlyVerified(DateTime startedUtc)
+        {
+            return hoppieOnlineStationsLoaded &&
+                   hoppieOnlineStationsLoadedUtc >= startedUtc &&
+                   DateTime.UtcNow - hoppieOnlineStationsLoadedUtc < TimeSpan.FromSeconds(30);
+        }
+
+        private void WriteCpdlcLogonNotOnlineMessage(string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (cpdlcLogonNotOnlineNoticeUtc.TryGetValue(clean, out DateTime lastNotice) &&
+                now - lastNotice < cpdlcLogonNotOnlineNoticeCooldown)
+            {
+                return;
+            }
+
+            cpdlcLogonNotOnlineNoticeUtc[clean] = now;
+
+            WriteMessage(
+                "CPDLC LOGON FAILED\nSTATION " + clean + " NOT ONLINE ON HOPPIE",
+                "CPDLC",
+                "CPDLC LOGON");
+        }
+
+        private void WriteCpdlcLogonStatusUnknownMessage(string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return;
+            }
+
+            DateTime now = DateTime.UtcNow;
+            if (cpdlcLogonNotOnlineNoticeUtc.TryGetValue("UNKNOWN_" + clean, out DateTime lastNotice) &&
+                now - lastNotice < cpdlcLogonNotOnlineNoticeCooldown)
+            {
+                return;
+            }
+
+            cpdlcLogonNotOnlineNoticeUtc["UNKNOWN_" + clean] = now;
+
+            WriteMessage(
+                "CPDLC LOGON STATUS UNKNOWN\nCOULD NOT VERIFY HOPPIE STATION " + clean + "\nTRY AGAIN SHORTLY",
+                "CPDLC",
+                "CPDLC LOGON");
+        }
+
+        private async Task<CpdlcLogonStationAvailability> CheckCpdlcLogonStationAvailabilityAsync(string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (DebugUiPreviewMode)
+            {
+                return !string.IsNullOrWhiteSpace(clean) && IsPossibleHoppieLogonCode(clean)
+                    ? CpdlcLogonStationAvailability.Online
+                    : CpdlcLogonStationAvailability.NotOnline;
+            }
+
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return CpdlcLogonStationAvailability.NotOnline;
+            }
+
+            if (IsHoppieLogonOnline(clean))
+            {
+                return CpdlcLogonStationAvailability.Online;
+            }
+
+            DateTime refreshStartedUtc = DateTime.UtcNow;
+
+            try
+            {
+                await RefreshHoppieOnlineStationsAsync();
+                UpdateOnlineStatusLabel();
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("CPDLC logon station online verification refresh failed for " + clean + ": " + ex.Message);
+            }
+
+            if (IsHoppieLogonOnline(clean))
+            {
+                return CpdlcLogonStationAvailability.Online;
+            }
+
+            if (!WasHoppieOnlineStationListFreshlyVerified(refreshStartedUtc))
+            {
+                return CpdlcLogonStationAvailability.Unknown;
+            }
+
+            return CpdlcLogonStationAvailability.NotOnline;
+        }
+
+        private async Task<bool> VerifyCpdlcLogonStationOnlineBeforeSendAsync(string station, bool requireHoppieOnline)
+        {
+            if (!requireHoppieOnline)
+            {
+                return true;
+            }
+
+            CpdlcLogonStationAvailability availability = await CheckCpdlcLogonStationAvailabilityAsync(station);
+
+            if (availability == CpdlcLogonStationAvailability.Online)
+            {
+                return true;
+            }
+
+            if (availability == CpdlcLogonStationAvailability.Unknown)
+            {
+                WriteCpdlcLogonStatusUnknownMessage(station);
+            }
+            else
+            {
+                WriteCpdlcLogonNotOnlineMessage(station);
+            }
+
+            return false;
+        }
+
+        private async Task DelayedCpdlcLogonUnavailableNoticeAsync(string station, CpdlcLogonStationAvailability availability)
+        {
+            try
+            {
+                await Task.Delay(cpdlcManualLogonFailureDelay);
+
+                if (availability == CpdlcLogonStationAvailability.Unknown)
+                {
+                    WriteCpdlcLogonStatusUnknownMessage(station);
+                }
+                else
+                {
+                    WriteCpdlcLogonNotOnlineMessage(station);
+                }
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug("Delayed CPDLC logon failed notice failed: " + ex.Message);
+            }
+        }
+
+
+
 
 
 
@@ -11762,6 +12504,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             await SendCPDLCMessage(target, "CPDLC", packet.Trim());
 
+            cpdlcSessionEstablished = false;
             CurrentATCUnit = null;
             pendingLogon = null;
             ClearNextAtcUnitDisplay();
@@ -11815,9 +12558,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
-            if (requireHoppieOnline && !IsHoppieLogonOnline(recipient))
+            if (!await VerifyCpdlcLogonStationOnlineBeforeSendAsync(recipient, true))
             {
-                WriteMessage("CPDLC LOGON NOT AVAILABLE: " + recipient + " NOT ONLINE", "SYSTEM", "SYSTEM");
                 HideQuickActionButtons();
                 return;
             }
@@ -11830,11 +12572,144 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             await SendCPDLCMessage(recipient, "CPDLC", packet.Trim());
         }
 
+        private void ShowManualCpdlcLogonStatus(string statusText, string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+            string title = "ATC LOGON REQUEST";
+            string preview = string.IsNullOrWhiteSpace(clean)
+                ? "REQUEST LOGON"
+                : "REQUEST LOGON TO " + clean;
+
+            if (DcduStyleManager.IsBoeing)
+            {
+                ShowBoeingTelexInlineSendStatus(statusText);
+            }
+            else
+            {
+                ShowAirbusAocSendStatusPage(statusText, clean, title, preview);
+            }
+        }
+
+        private void CloseManualCpdlcLogonPages()
+        {
+            if (DcduStyleManager.IsBoeing)
+            {
+                CloseBoeingTelexPages();
+            }
+            else
+            {
+                CloseAirbusAocPages();
+            }
+        }
+
+        private async Task SendManualCpdlcLogonRequestAsync(string logonCode)
+        {
+            string recipient = (logonCode ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (recipient.Length < 3)
+            {
+                WriteMessage("CPDLC LOGON NOT READY: ENTER STATION CODE", "SYSTEM", "SYSTEM");
+                HideQuickActionButtons();
+                return;
+            }
+
+            ShowManualCpdlcLogonStatus("SENDING....", recipient);
+            await Task.Delay(DcduStyleManager.IsBoeing ? 1600 : 1200);
+
+            CpdlcLogonStationAvailability availability = await CheckCpdlcLogonStationAvailabilityAsync(recipient);
+
+            if (availability == CpdlcLogonStationAvailability.Online)
+            {
+                try
+                {
+                    string packet = string.Format("/data2/{0}//Y/REQUEST LOGON", messageOutCounter);
+                    messageOutCounter += 1;
+                    pendingLogon = recipient;
+
+                    HideQuickActionButtons();
+                    await SendCPDLCMessage(recipient, "CPDLC", packet.Trim());
+
+                    ShowManualCpdlcLogonStatus("SENT", recipient);
+                    await Task.Delay(DcduStyleManager.IsBoeing ? 1700 : 1800);
+                    CloseManualCpdlcLogonPages();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug("Manual CPDLC LOGON send failed: " + ex.Message);
+                    ShowManualCpdlcLogonStatus("SEND FAILED", recipient);
+                    await Task.Delay(2200);
+                    CloseManualCpdlcLogonPages();
+                    return;
+                }
+            }
+
+            // Do not send a real Hoppie LOGON if the station is verified offline.
+            // Keep the cockpit UX consistent with other requests, then report the
+            // failed connection attempt after a realistic delay.
+            ShowManualCpdlcLogonStatus("SENT", recipient);
+            await Task.Delay(DcduStyleManager.IsBoeing ? 1700 : 1800);
+            CloseManualCpdlcLogonPages();
+
+            _ = DelayedCpdlcLogonUnavailableNoticeAsync(recipient, availability);
+        }
+
+        private async Task CompleteManualCpdlcLogonAfterConfirmAsync(string logonCode)
+        {
+            string recipient = (logonCode ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (recipient.Length < 3)
+            {
+                WriteMessage("CPDLC LOGON NOT READY: ENTER STATION CODE", "SYSTEM", "SYSTEM");
+                CloseManualCpdlcLogonPages();
+                return;
+            }
+
+            CpdlcLogonStationAvailability availability = await CheckCpdlcLogonStationAvailabilityAsync(recipient);
+
+            if (availability == CpdlcLogonStationAvailability.Online)
+            {
+                try
+                {
+                    string packet = string.Format("/data2/{0}//Y/REQUEST LOGON", messageOutCounter);
+                    messageOutCounter += 1;
+                    pendingLogon = recipient;
+
+                    HideQuickActionButtons();
+                    await SendCPDLCMessage(recipient, "CPDLC", packet.Trim());
+
+                    ShowManualCpdlcLogonStatus("SENT", recipient);
+                    await Task.Delay(DcduStyleManager.IsBoeing ? 1700 : 1800);
+                    CloseManualCpdlcLogonPages();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    Logger.Debug("Manual CPDLC LOGON send failed: " + ex.Message);
+                    ShowManualCpdlcLogonStatus("SEND FAILED", recipient);
+                    await Task.Delay(2200);
+                    CloseManualCpdlcLogonPages();
+                    return;
+                }
+            }
+
+            // Do not send a real Hoppie LOGON if the station is verified offline.
+            // The user already confirmed SEND, so finish the cockpit send-flow and
+            // then raise the local CPDLC-like failed message after the short delay.
+            ShowManualCpdlcLogonStatus("SENT", recipient);
+            await Task.Delay(DcduStyleManager.IsBoeing ? 1700 : 1800);
+            CloseManualCpdlcLogonPages();
+
+            _ = DelayedCpdlcLogonUnavailableNoticeAsync(recipient, availability);
+        }
+
+
+
         private async Task QuickCpdlcLogonAsync(string logonCode)
         {
             string recipient = (logonCode ?? string.Empty).Trim().ToUpperInvariant();
 
-            if (!CanQuickCpdlcLogon() || string.IsNullOrWhiteSpace(recipient) || !IsHoppieLogonOnline(recipient))
+            if (!CanQuickCpdlcLogon() || string.IsNullOrWhiteSpace(recipient))
             {
                 WriteMessage("QUICK LOGON NOT AVAILABLE", "SYSTEM", "SYSTEM");
                 HideQuickActionButtons();
@@ -12593,6 +13468,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             atisAvailabilityPopupPinned = pin || atisAvailabilityPopupPinned;
             UpdateAtisAvailabilityPopupText();
+            PositionAtisAvailabilityPopup();
             atisAvailabilityPopupPanel.Visible = true;
             atisAvailabilityPopupPanel.BringToFront();
         }
@@ -12795,6 +13671,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             atisAutoPopupPinned = pin || atisAutoPopupPinned;
             UpdateAtisAutoPopupText();
+            PositionAtisAutoPopup();
             atisAutoPopupPanel.Visible = true;
             atisAutoPopupPanel.BringToFront();
         }
@@ -12879,6 +13756,89 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             quickWxPopupPanel.SuspendLayout();
             quickWxPopupPanel.Controls.Clear();
+            quickWxPopupPanel.BackColor = DcduStyleManager.IsA220
+                ? Color.FromArgb(4, 8, 12)
+                : Color.Transparent;
+
+            if (DcduStyleManager.IsA220)
+            {
+                System.Windows.Forms.Label a220HeaderLabel = new()
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    Font = CreateDpiStablePointFont("Consolas", 9.4f, FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Location = SP(new Point(10, 7)),
+                    Size = SS(new Size(188, 18)),
+                    Text = "QUICK ACTIONS",
+                    ForeColor = DcduTheme.Cyan,
+                    UseCompatibleTextRendering = false,
+                    Padding = SPad(new Padding(0))
+                };
+                quickWxPopupPanel.Controls.Add(a220HeaderLabel);
+
+                int buttonX = S(10);
+                int buttonWidth = S(188);
+                int buttonHeight = S(24);
+                int gap = S(6);
+                int firstY = S(32);
+
+                AddA220AocButton(
+                    quickWxPopupPanel,
+                    "REQ METAR DEP",
+                    buttonX,
+                    firstY,
+                    buttonWidth,
+                    buttonHeight,
+                    () =>
+                    {
+                        SendQuickWeatherRequest(false, false);
+                        HideQuickWxPopup();
+                    });
+
+                AddA220AocButton(
+                    quickWxPopupPanel,
+                    "REQ METAR ARR",
+                    buttonX,
+                    firstY + buttonHeight + gap,
+                    buttonWidth,
+                    buttonHeight,
+                    () =>
+                    {
+                        SendQuickWeatherRequest(false, true);
+                        HideQuickWxPopup();
+                    });
+
+                AddA220AocButton(
+                    quickWxPopupPanel,
+                    "REQ ATIS DEP",
+                    buttonX,
+                    firstY + ((buttonHeight + gap) * 2),
+                    buttonWidth,
+                    buttonHeight,
+                    () =>
+                    {
+                        SendQuickWeatherRequest(true, false);
+                        HideQuickWxPopup();
+                    });
+
+                AddA220AocButton(
+                    quickWxPopupPanel,
+                    "REQ ATIS ARR",
+                    buttonX,
+                    firstY + ((buttonHeight + gap) * 3),
+                    buttonWidth,
+                    buttonHeight,
+                    () =>
+                    {
+                        SendQuickWeatherRequest(true, true);
+                        HideQuickWxPopup();
+                    });
+
+                quickWxPopupPanel.ResumeLayout(false);
+                PositionQuickWxPopup();
+                return;
+            }
 
             System.Windows.Forms.Label headerLabel = new System.Windows.Forms.Label
             {
@@ -12911,8 +13871,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
-            int popupWidth = S(196);
-            int popupHeight = S(108);
+            int popupWidth = DcduStyleManager.IsA220 ? S(208) : S(196);
+            int popupHeight = DcduStyleManager.IsA220 ? S(158) : S(108);
             quickWxPopupPanel.Size = new Size(popupWidth, popupHeight);
 
             int x;
@@ -12945,6 +13905,32 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             Rectangle bounds = new Rectangle(0, 0, Math.Max(1, panel.Width - 1), Math.Max(1, panel.Height - 1));
             Color accent = MainPrimaryTextColor();
+
+            if (DcduStyleManager.IsA220)
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.None;
+                e.Graphics.Clear(Color.FromArgb(4, 8, 12));
+
+                using Pen outerBorder = new(Color.FromArgb(138, 144, 150), 1.0f);
+                using Pen innerBorder = new(Color.FromArgb(34, 45, 55), 1.0f);
+                using Pen a220DividerPen = new(Color.FromArgb(102, 122, 132, 142), 1.0f);
+
+                e.Graphics.DrawRectangle(outerBorder, bounds);
+                if (bounds.Width > 4 && bounds.Height > 4)
+                {
+                    e.Graphics.DrawRectangle(
+                        innerBorder,
+                        new Rectangle(2, 2, bounds.Width - 4, bounds.Height - 4));
+                }
+
+                e.Graphics.DrawLine(
+                    a220DividerPen,
+                    S(10),
+                    S(27),
+                    Math.Max(S(10), bounds.Width - S(10)),
+                    S(27));
+                return;
+            }
 
             if (DcduStyleManager.IsBoeing)
             {
@@ -13007,7 +13993,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             PositionQuickWxPopup();
             quickWxPopupPanel.Visible = true;
             quickWxPopupPanel.BringToFront();
-            quickWxPopupPanel.Invalidate();
+            foreach (Control control in quickWxPopupPanel.Controls)
+            {
+                control.BringToFront();
+            }
+            quickWxPopupPanel.Invalidate(true);
         }
 
         private void HideQuickWxPopup()
@@ -13631,13 +14621,33 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             HidePdcQuickActionButton();
 
             SetAirbusAocChromeVisible(false);
+            if (DcduStyleManager.IsA220)
+            {
+                SetA220MainGuideLinesVisible(false);
+            }
+
             messageFormatPanel.SuspendLayout();
             messageFormatPanel.Controls.Clear();
             messageFormatPanel.Visible = true;
             messageFormatPanel.Enabled = true;
             messageFormatPanel.BringToFront();
-            messageFormatPanel.Location = SP(new Point(12, 10));
-            messageFormatPanel.Size = new Size(Math.Max(1, screenPanel.Width - S(24)), Math.Max(1, screenPanel.Height - S(20)));
+
+            if (DcduStyleManager.IsA220)
+            {
+                messageFormatPanel.Location = Point.Empty;
+                messageFormatPanel.Size = screenPanel.ClientSize;
+                messageFormatPanel.BackColor = Color.Black;
+                ApplyA220BlackGradient(messageFormatPanel);
+            }
+            else
+            {
+                messageFormatPanel.Location = SP(new Point(12, 10));
+                messageFormatPanel.Size = new Size(
+                    Math.Max(1, screenPanel.Width - S(24)),
+                    Math.Max(1, screenPanel.Height - S(20)));
+                messageFormatPanel.BackColor = Color.Transparent;
+            }
+
             messageFormatPanel.Padding = SPad(new Padding(0));
             messageFormatPanel.Margin = SPad(new Padding(0));
             messageFormatPanel.AutoScroll = false;
@@ -13650,10 +14660,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         {
             Panel canvas = new()
             {
-                BackColor = Color.Transparent,
+                BackColor = DcduStyleManager.IsA220
+                    ? Color.Black
+                    : Color.Transparent,
                 Margin = new Padding(0),
                 Padding = new Padding(0),
-                Size = messageFormatPanel.ClientSize
+                Size = messageFormatPanel.ClientSize,
+                Tag = DcduStyleManager.IsA220 ? A220PhysicalLayoutTag : null
             };
             messageFormatPanel.Controls.Add(canvas);
             canvas.BringToFront();
@@ -14118,18 +15131,26 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             UpdateBoeingTelexSendState();
         }
 
-        private async Task SendBoeingAtcLogonRequestAsync()
+        private Task SendBoeingAtcLogonRequestAsync()
         {
             string station = GetBoeingTelexInput(BoeingTelexInputStation);
 
             if (station.Length < 3)
             {
                 WriteMessage("CPDLC LOGON NOT READY: ENTER STATION CODE", "SYSTEM", "SYSTEM");
-                return;
+                return Task.CompletedTask;
             }
 
-            CloseBoeingTelexPages();
-            await SendCpdlcLogonRequestAsync(station, false);
+            boeingTelexConfirmReturnPage = BoeingTelexPage.AtcLogonRequest;
+            boeingTelexPendingSendKind = BoeingTelexPendingSendKind.ManualLogon;
+            boeingTelexPendingRecipient = station;
+            boeingTelexPendingMessage = "REQUEST LOGON";
+            boeingTelexPendingTitle = "ATC LOGON REQUEST";
+            boeingTelexPendingPreview = "REQUEST LOGON TO " + station;
+            boeingTelexPendingAutoRefresh = false;
+            ShowBoeingTelexSendConfirmPage();
+
+            return Task.CompletedTask;
         }
 
 
@@ -14793,6 +15814,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     ShowBoeingAtcWhenCanWeRequest();
                     break;
 
+                case BoeingTelexPage.AtcLogonRequest:
+                    ShowBoeingAtcLogonRequest();
+                    break;
+
                 default:
                     if (pendingKind == BoeingTelexPendingSendKind.FreeText)
                     {
@@ -14820,7 +15845,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             string recipient = boeingTelexPendingRecipient;
             string message = boeingTelexPendingMessage;
             string title = boeingTelexPendingTitle;
-            string preview = boeingTelexPendingPreview;
+            string previewText = boeingTelexPendingPreview;
             bool autoRefresh = boeingTelexPendingAutoRefresh;
 
             if (kind == BoeingTelexPendingSendKind.None || string.IsNullOrWhiteSpace(recipient))
@@ -14858,7 +15883,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         break;
 
                     case BoeingTelexPendingSendKind.PreDepClearance:
-                        WriteMessage("PRE DEP CLEARANCE REQUEST", "TELEX", recipient, true);
+                        // The full outbound request is written once by SendCPDLCMessage after Hoppie accepts it.
                         await SendCPDLCMessage(recipient, "TELEX", message.Trim());
                         ClearStoredBoeingTelexPage(BoeingTelexPage.AtcPreDepClearance);
                         break;
@@ -14868,6 +15893,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         await SendCPDLCMessage(recipient, "CPDLC", message.Trim());
                         ClearStoredBoeingTelexPage(BoeingTelexPage.AtcOceanicClearance);
                         break;
+
+                    case BoeingTelexPendingSendKind.ManualLogon:
+                        await CompleteManualCpdlcLogonAfterConfirmAsync(recipient);
+                        return;
 
                     case BoeingTelexPendingSendKind.AtcRequest:
                         string atcPacket = (message ?? string.Empty).Trim();
@@ -14941,6 +15970,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             ApplyMainScreenLayout(DcduStyleManager.IsBoeing);
             ApplyMainButtonLayout(DcduStyleManager.IsBoeing);
             SetAirbusAocChromeVisible(true);
+            if (DcduStyleManager.IsA220)
+            {
+                SetA220MainGuideLinesVisible(true);
+            }
             // Do not call SetSmartWidgetsVisible(true) here: that forces all top badges/actions on,
             // which differs from the normal startup main screen. Restore via normal status updates below.
 
@@ -15048,6 +16081,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             airbusAocPage = page;
             airbusAocInputs.Clear();
 airbusAocSendLabel = null;
+            airbusAocSendButton = null;
             airbusAocSendReady = false;
 
             HideQuickWxPopup();
@@ -15059,15 +16093,36 @@ airbusAocSendLabel = null;
             HidePdcQuickActionButton();
 
             SetAirbusAocChromeVisible(false);
+            if (DcduStyleManager.IsA220)
+            {
+                SetA220MainGuideLinesVisible(false);
+            }
+
             messageFormatPanel.SuspendLayout();
             messageFormatPanel.Controls.Clear();
             messageFormatPanel.Visible = true;
             messageFormatPanel.Enabled = true;
             messageFormatPanel.BringToFront();
-            // Use the Airbus LCD area with a small bezel-safe inset.
-            // Text too close to the mask gets clipped on the left/top edges.
-            messageFormatPanel.Location = SP(new Point(12, 10));
-            messageFormatPanel.Size = new Size(Math.Max(1, screenPanel.Width - S(24)), Math.Max(1, screenPanel.Height - S(20)));
+
+            if (DcduStyleManager.IsA220)
+            {
+                // A220 pages replace the complete main LCD content. An opaque,
+                // full-size host prevents status text and guide lines from showing
+                // through behind AOC, ATC or SETUP pages.
+                messageFormatPanel.Location = Point.Empty;
+                messageFormatPanel.Size = screenPanel.ClientSize;
+                messageFormatPanel.BackColor = Color.Black;
+            }
+            else
+            {
+                // Physical Airbus LCD area with a small bezel-safe inset.
+                messageFormatPanel.Location = SP(new Point(12, 10));
+                messageFormatPanel.Size = new Size(
+                    Math.Max(1, screenPanel.Width - S(24)),
+                    Math.Max(1, screenPanel.Height - S(20)));
+                messageFormatPanel.BackColor = Color.Transparent;
+            }
+
             messageFormatPanel.Padding = SPad(new Padding(0));
             messageFormatPanel.Margin = SPad(new Padding(0));
             messageFormatPanel.AutoScroll = false;
@@ -15121,12 +16176,17 @@ airbusAocSendLabel = null;
         {
             Panel canvas = new()
             {
-                BackColor = Color.Transparent,
+                BackColor = DcduStyleManager.IsA220 ? Color.Black : Color.Transparent,
                 Margin = new Padding(0),
                 Padding = new Padding(0),
-                Size = messageFormatPanel.ClientSize
+                Size = messageFormatPanel.ClientSize,
+                Tag = DcduStyleManager.IsA220 ? A220PhysicalLayoutTag : null
             };
             messageFormatPanel.Controls.Add(canvas);
+            if (DcduStyleManager.IsA220)
+            {
+                ApplyA220BlackGradient(canvas);
+            }
             canvas.BringToFront();
             return canvas;
         }
@@ -15160,26 +16220,39 @@ airbusAocSendLabel = null;
 
         private Font AirbusAocTitleFont()
         {
-            return CreateDpiStablePointFont("Consolas", 11.9f, FontStyle.Bold);
+            return DcduStyleManager.IsA220
+                ? CreateDpiStablePointFont("Consolas", 11.2f, FontStyle.Regular)
+                : CreateDpiStablePointFont("Consolas", 11.9f, FontStyle.Bold);
         }
 
         private Font AirbusAocMenuFont()
         {
-            return CreateDpiStablePointFont("Consolas", 12.3f, FontStyle.Bold);
+            return DcduStyleManager.IsA220
+                ? CreateDpiStablePointFont("Consolas", 10.8f, FontStyle.Regular)
+                : CreateDpiStablePointFont("Consolas", 12.3f, FontStyle.Bold);
         }
 
         private Font AirbusAocCaptionFont()
         {
-            return CreateDpiStablePointFont("Consolas", 9.9f, FontStyle.Bold);
+            return DcduStyleManager.IsA220
+                ? CreateDpiStablePointFont("Consolas", 9.5f, FontStyle.Regular)
+                : CreateDpiStablePointFont("Consolas", 9.9f, FontStyle.Bold);
         }
 
         private Font AirbusAocValueFont()
         {
-            return CreateDpiStablePointFont("Consolas", 10.8f, FontStyle.Bold);
+            return DcduStyleManager.IsA220
+                ? CreateDpiStablePointFont("Consolas", 10.5f, FontStyle.Regular)
+                : CreateDpiStablePointFont("Consolas", 10.8f, FontStyle.Bold);
         }
 
         private Font AirbusAocInputFont(bool multiline = false)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                return CreateDpiStablePointFont("Consolas", multiline ? 10.0f : 10.4f, FontStyle.Regular);
+            }
+
             // Unified Airbus embedded-page input typography.
             // Empty compact fields show amber slots; filled values are painted as cyan text only.
             return CreateDpiStablePointFont("Consolas", multiline ? 9.7f : 11.1f, FontStyle.Bold);
@@ -15275,6 +16348,11 @@ airbusAocSendLabel = null;
 
         private TextBox AddAirbusAocTextBox(Control parent, string key, string text, int x, int y, int width, int maxLength, bool multiline = false, int heightOverride = 0)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                return AddA220AocTextBox(parent, key, text, x, y, width, maxLength, multiline, heightOverride);
+            }
+
             int height = heightOverride > 0 ? heightOverride : (multiline ? 38 : 20);
             if (!multiline)
             {
@@ -15496,6 +16574,88 @@ airbusAocSendLabel = null;
             return box;
         }
 
+        private TextBox AddA220AocTextBox(Control parent, string key, string text, int x, int y, int width, int maxLength, bool multiline, int heightOverride)
+        {
+            int logicalHeight = heightOverride > 0
+                ? heightOverride
+                : (multiline ? 72 : 30);
+            int logicalWidth = Math.Max(38, width);
+
+            Panel frame = new()
+            {
+                BackColor = Color.FromArgb(64, 68, 73),
+                Location = new Point(ScaleChildX(parent, x, logicalWidth), ScaleChildY(parent, y, logicalHeight)),
+                Size = new Size(ScaleChildWidth(parent, x, logicalWidth), ScaleChildHeight(parent, y, logicalHeight)),
+                Margin = SPad(new Padding(0)),
+                Padding = SPad(new Padding(0)),
+                Cursor = Cursors.IBeam,
+                TabStop = false
+            };
+
+            TextBox box = new()
+            {
+                Name = "airbusAoc_" + key,
+                BackColor = Color.FromArgb(52, 56, 61),
+                ForeColor = DcduTheme.Cyan,
+                BorderStyle = BorderStyle.None,
+                CharacterCasing = CharacterCasing.Upper,
+                Font = AirbusAocInputFont(multiline),
+                Location = SP(new Point(8, multiline ? 6 : 5)),
+                Size = new Size(
+                    Math.Max(1, frame.Width - S(16)),
+                    Math.Max(1, frame.Height - S(multiline ? 12 : 10))),
+                MaxLength = maxLength,
+                Text = text ?? string.Empty,
+                Multiline = multiline,
+                WordWrap = true,
+                AcceptsReturn = multiline,
+                AcceptsTab = false,
+                ScrollBars = multiline ? ScrollBars.Vertical : ScrollBars.None,
+                TextAlign = HorizontalAlignment.Left,
+                ShortcutsEnabled = true,
+                TabStop = true
+            };
+
+            bool focused = false;
+            frame.Paint += (_, e) =>
+            {
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                Rectangle bounds = new Rectangle(0, 0, Math.Max(1, frame.Width - 1), Math.Max(1, frame.Height - 1));
+                Color borderColor = focused
+                    ? Color.FromArgb(82, 158, 228)
+                    : Color.FromArgb(164, 168, 172);
+                using Pen border = new Pen(borderColor, focused ? 1.5f : 1.0f);
+                e.Graphics.DrawRectangle(border, bounds);
+            };
+
+            void SetFocusState(bool value)
+            {
+                focused = value;
+                Color background = value
+                    ? Color.FromArgb(63, 69, 75)
+                    : Color.FromArgb(52, 56, 61);
+                frame.BackColor = background;
+                box.BackColor = background;
+                frame.Invalidate();
+            }
+
+            box.TextChanged += (_, __) =>
+            {
+                SetStoredAirbusAocInput(airbusAocPage, key, box.Text ?? string.Empty);
+                UpdateAirbusAocSendState();
+            };
+            box.GotFocus += (_, __) => SetFocusState(true);
+            box.LostFocus += (_, __) => SetFocusState(false);
+            frame.Click += (_, __) => box.Focus();
+
+            frame.Controls.Add(box);
+            parent.Controls.Add(frame);
+            frame.BringToFront();
+            airbusAocInputs[key] = box;
+            SetStoredAirbusAocInput(airbusAocPage, key, box.Text ?? string.Empty);
+            return box;
+        }
+
         private string GetAirbusAocInput(string key)
         {
             return airbusAocInputs.TryGetValue(key, out TextBox box)
@@ -15561,6 +16721,11 @@ airbusAocSendLabel = null;
 
                 private System.Windows.Forms.Label AddAirbusAocCycleBox(Control parent, AirbusAocPage pageKey, string key, string[] items, string selectedItem, int x, int y, int width)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                return AddA220AocCycleBox(parent, pageKey, key, items, selectedItem, x, y, width);
+            }
+
             if (items == null || items.Length == 0)
             {
                 items = new[] { string.Empty };
@@ -15637,8 +16802,801 @@ airbusAocSendLabel = null;
             return valueLabel;
         }
 
+        private System.Windows.Forms.Label AddA220AocCycleBox(
+            Control parent,
+            AirbusAocPage pageKey,
+            string key,
+            string[] items,
+            string selectedItem,
+            int x,
+            int y,
+            int width)
+        {
+            items = items == null || items.Length == 0
+                ? new[] { string.Empty }
+                : items;
+
+            string currentValue = items.FirstOrDefault(
+                item => string.Equals(item, selectedItem, StringComparison.OrdinalIgnoreCase))
+                ?? items[0];
+
+            SetStoredAirbusAocInput(pageKey, key, currentValue);
+
+            int logicalHeight = 25;
+            int physicalX = ScaleChildX(parent, x, width);
+            int physicalY = ScaleChildY(parent, y, logicalHeight);
+            int physicalWidth = ScaleChildWidth(parent, x, width);
+            int physicalHeight = ScaleChildHeight(parent, y, logicalHeight);
+
+            Panel frame = new()
+            {
+                // Match the page background exactly so no black rectangle remains
+                // visible behind compact fields such as DUE TO.
+                BackColor = Color.FromArgb(2, 5, 8),
+                Location = new Point(physicalX, physicalY),
+                Size = new Size(Math.Max(S(58), physicalWidth), Math.Max(S(22), physicalHeight)),
+                Margin = SPad(new Padding(0)),
+                Padding = SPad(new Padding(0)),
+                Cursor = Cursors.Hand,
+                TabStop = true
+            };
+
+            System.Windows.Forms.Label valueLabel = new()
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = Color.White,
+                Font = CreateDpiStablePointFont("Consolas", 9.4f, FontStyle.Bold),
+                Text = currentValue,
+                TextAlign = ContentAlignment.MiddleLeft,
+                Dock = DockStyle.Fill,
+                Padding = SPad(new Padding(7, 0, 27, 0)),
+                Margin = Padding.Empty,
+                Cursor = Cursors.Hand,
+                UseCompatibleTextRendering = false,
+                AccessibleName = currentValue
+            };
+
+            // ToolStripDropDown overflow scrolling can throw in .NET 10. This
+            // selector uses an owned borderless window instead, so the list is
+            // never clipped by the A220 page and mouse-wheel scrolling stays
+            // fully under our control.
+            Form dropDownWindow = null;
+            Panel dropDownContent = null;
+            int firstVisibleIndex = 0;
+            int activeIndex = Math.Max(0, Array.FindIndex(
+                items,
+                item => string.Equals(item, currentValue, StringComparison.OrdinalIgnoreCase)));
+            int visibleRows = Math.Min(6, Math.Max(1, items.Length));
+            int rowHeight = Math.Max(S(24), frame.Height);
+            int scrollIndicatorHeight = items.Length > visibleRows
+                ? Math.Max(S(15), rowHeight / 2)
+                : 0;
+            bool hover = false;
+            bool pressed = false;
+            bool menuOpen = false;
+            Size lastRenderedDropDownSize = Size.Empty;
+
+            void UpdateVisualState()
+            {
+                if (frame.IsDisposed || valueLabel.IsDisposed)
+                {
+                    return;
+                }
+
+                valueLabel.Text = currentValue ?? string.Empty;
+                valueLabel.AccessibleName = currentValue;
+                valueLabel.Padding = SPad(new Padding(7, pressed ? 1 : 0, 27, 0));
+                frame.Invalidate();
+                valueLabel.Invalidate();
+            }
+
+            void ApplySelectedValue(int selectedIndex)
+            {
+                if (selectedIndex < 0 || selectedIndex >= items.Length)
+                {
+                    return;
+                }
+
+                currentValue = items[selectedIndex];
+                activeIndex = selectedIndex;
+                SetStoredAirbusAocInput(pageKey, key, currentValue);
+                UpdateAirbusAocSendState();
+                UpdateVisualState();
+
+                if (pageKey == AirbusAocPage.AtcWhenCanWeRequest &&
+                    string.Equals(key, AirbusAocInputWcwType, StringComparison.OrdinalIgnoreCase))
+                {
+                    BeginInvoke(
+                        (System.Windows.Forms.MethodInvoker)(() => ShowAirbusAtcWhenCanWeRequest()));
+                }
+            }
+
+            void CloseDropDown()
+            {
+                Form window = dropDownWindow;
+                dropDownWindow = null;
+                dropDownContent = null;
+                menuOpen = false;
+                pressed = false;
+
+                if (!frame.IsDisposed)
+                {
+                    hover = frame.ClientRectangle.Contains(frame.PointToClient(Cursor.Position));
+                    UpdateVisualState();
+                }
+
+                if (window != null && !window.IsDisposed)
+                {
+                    try
+                    {
+                        window.Close();
+                    }
+                    catch
+                    {
+                        // The popup can already be closing after deactivation.
+                    }
+
+                    window.Dispose();
+                }
+            }
+
+            void EnsureActiveIndexVisible()
+            {
+                int maxFirst = Math.Max(0, items.Length - visibleRows);
+                if (activeIndex < firstVisibleIndex)
+                {
+                    firstVisibleIndex = activeIndex;
+                }
+                else if (activeIndex >= firstVisibleIndex + visibleRows)
+                {
+                    firstVisibleIndex = activeIndex - visibleRows + 1;
+                }
+
+                firstVisibleIndex = Math.Max(0, Math.Min(firstVisibleIndex, maxFirst));
+            }
+
+            void ScrollDropDown(int direction, int steps)
+            {
+                if (!menuOpen || dropDownWindow == null || dropDownWindow.IsDisposed)
+                {
+                    return;
+                }
+
+                int maxFirst = Math.Max(0, items.Length - visibleRows);
+                int oldFirst = firstVisibleIndex;
+                firstVisibleIndex = Math.Max(
+                    0,
+                    Math.Min(maxFirst, firstVisibleIndex + (direction * Math.Max(1, steps))));
+
+                if (firstVisibleIndex != oldFirst)
+                {
+                    RenderDropDownRows();
+                }
+            }
+
+            void HandleDropDownWheel(MouseEventArgs args)
+            {
+                if (args == null || args.Delta == 0)
+                {
+                    return;
+                }
+
+                int steps = Math.Max(
+                    1,
+                    Math.Abs(args.Delta) / Math.Max(1, SystemInformation.MouseWheelScrollDelta));
+                ScrollDropDown(args.Delta < 0 ? 1 : -1, steps);
+            }
+
+            void MoveActiveSelection(int direction)
+            {
+                if (items.Length == 0)
+                {
+                    return;
+                }
+
+                activeIndex = Math.Max(0, Math.Min(items.Length - 1, activeIndex + direction));
+                EnsureActiveIndexVisible();
+                RenderDropDownRows();
+            }
+
+            void RenderDropDownRows()
+            {
+                if (dropDownContent == null || dropDownContent.IsDisposed)
+                {
+                    return;
+                }
+
+                dropDownContent.SuspendLayout();
+                dropDownContent.Controls.Clear();
+                lastRenderedDropDownSize = dropDownContent.ClientSize;
+
+                bool canScrollUp = firstVisibleIndex > 0;
+                bool canScrollDown = firstVisibleIndex + visibleRows < items.Length;
+                int rowsTop = scrollIndicatorHeight > 0 ? scrollIndicatorHeight : S(1);
+
+                if (scrollIndicatorHeight > 0)
+                {
+                    System.Windows.Forms.Label upIndicator = new()
+                    {
+                        AutoSize = false,
+                        BackColor = Color.FromArgb(29, 32, 36),
+                        ForeColor = canScrollUp ? Color.White : Color.FromArgb(90, 94, 98),
+                        Font = CreateDpiStablePointFont("Consolas", 8.5f, FontStyle.Bold),
+                        Text = canScrollUp ? "▲  MORE" : "",
+                        TextAlign = ContentAlignment.MiddleCenter,
+                        Location = new Point(S(1), S(1)),
+                        Size = new Size(
+                            Math.Max(S(56), dropDownContent.ClientSize.Width - S(2)),
+                            scrollIndicatorHeight - S(1)),
+                        Cursor = canScrollUp ? Cursors.Hand : Cursors.Default,
+                        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                        Margin = Padding.Empty,
+                        Padding = Padding.Empty,
+                        TabStop = false
+                    };
+                    upIndicator.Paint += (_, e) =>
+                    {
+                        int y = Math.Max(0, upIndicator.Height - 1);
+                        using Pen line = new(Color.FromArgb(96, 100, 104), 1.0f);
+                        e.Graphics.DrawLine(line, 0, y, Math.Max(0, upIndicator.Width - 1), y);
+                    };
+                    upIndicator.Click += (_, __) =>
+                    {
+                        if (canScrollUp)
+                        {
+                            ScrollDropDown(-1, 1);
+                        }
+                    };
+                    upIndicator.MouseWheel += (_, args) => HandleDropDownWheel(args);
+                    dropDownContent.Controls.Add(upIndicator);
+                }
+
+                int endIndex = Math.Min(items.Length, firstVisibleIndex + visibleRows);
+                int visualRow = 0;
+                for (int itemIndex = firstVisibleIndex; itemIndex < endIndex; itemIndex++, visualRow++)
+                {
+                    int capturedIndex = itemIndex;
+                    bool rowHover = false;
+                    bool rowPressed = false;
+
+                    System.Windows.Forms.Label row = new()
+                    {
+                        AutoSize = false,
+                        BackColor = Color.Transparent,
+                        ForeColor = Color.White,
+                        Font = CreateDpiStablePointFont("Consolas", 9.4f, FontStyle.Bold),
+                        Text = string.Empty,
+                        TextAlign = ContentAlignment.MiddleLeft,
+                        Location = new Point(S(1), rowsTop + (visualRow * rowHeight)),
+                        Size = new Size(
+                            Math.Max(S(56), dropDownContent.ClientSize.Width - S(2)),
+                            rowHeight),
+                        Padding = Padding.Empty,
+                        Margin = Padding.Empty,
+                        Cursor = Cursors.Hand,
+                        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                        TabStop = true,
+                        AccessibleName = items[capturedIndex]
+                    };
+
+                    row.Paint += (_, e) =>
+                    {
+                        e.Graphics.SmoothingMode = SmoothingMode.None;
+                        e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+
+                        bool selected = capturedIndex == activeIndex;
+                        Color rowFace = selected || rowHover
+                            ? (rowPressed ? Color.FromArgb(2, 72, 166) : Color.FromArgb(3, 91, 207))
+                            : (rowPressed ? Color.FromArgb(82, 82, 82) : Color.FromArgb(64, 66, 68));
+
+                        Rectangle bounds = new(0, 0, Math.Max(1, row.Width - 1), Math.Max(1, row.Height - 1));
+                        using SolidBrush faceBrush = new(rowFace);
+                        using Pen topPen = new(selected || rowHover
+                            ? Color.FromArgb(198, 222, 255)
+                            : Color.FromArgb(174, 176, 178), 1.0f);
+                        using Pen bottomPen = new(selected || rowHover
+                            ? Color.FromArgb(0, 43, 106)
+                            : Color.FromArgb(28, 30, 32), 1.0f);
+
+                        e.Graphics.FillRectangle(faceBrush, bounds);
+                        e.Graphics.DrawLine(topPen, bounds.Left, bounds.Top, bounds.Right, bounds.Top);
+                        e.Graphics.DrawLine(bottomPen, bounds.Left, bounds.Bottom, bounds.Right, bounds.Bottom);
+
+                        Rectangle textBounds = new(
+                            S(7),
+                            rowPressed ? S(1) : 0,
+                            Math.Max(1, row.Width - S(14)),
+                            row.Height);
+
+                        TextRenderer.DrawText(
+                            e.Graphics,
+                            items[capturedIndex] ?? string.Empty,
+                            row.Font,
+                            textBounds,
+                            Color.White,
+                            TextFormatFlags.Left |
+                            TextFormatFlags.VerticalCenter |
+                            TextFormatFlags.SingleLine |
+                            TextFormatFlags.EndEllipsis |
+                            TextFormatFlags.NoPrefix |
+                            TextFormatFlags.NoPadding);
+                    };
+
+                    row.MouseEnter += (_, __) =>
+                    {
+                        rowHover = true;
+                        row.Invalidate();
+                    };
+                    row.MouseLeave += (_, __) =>
+                    {
+                        rowHover = false;
+                        rowPressed = false;
+                        row.Invalidate();
+                    };
+                    row.MouseDown += (_, args) =>
+                    {
+                        if (args.Button == MouseButtons.Left)
+                        {
+                            rowPressed = true;
+                            activeIndex = capturedIndex;
+                            row.Invalidate();
+                        }
+                    };
+                    row.MouseUp += (_, args) =>
+                    {
+                        if (args.Button != MouseButtons.Left)
+                        {
+                            return;
+                        }
+
+                        bool activate = row.ClientRectangle.Contains(args.Location);
+                        rowPressed = false;
+                        row.Invalidate();
+                        if (activate)
+                        {
+                            ApplySelectedValue(capturedIndex);
+                            CloseDropDown();
+                        }
+                    };
+                    row.MouseWheel += (_, args) => HandleDropDownWheel(args);
+                    row.KeyDown += (_, args) =>
+                    {
+                        if (args.KeyCode == Keys.Enter || args.KeyCode == Keys.Space)
+                        {
+                            ApplySelectedValue(capturedIndex);
+                            CloseDropDown();
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                        }
+                    };
+
+                    dropDownContent.Controls.Add(row);
+                }
+
+                if (scrollIndicatorHeight > 0)
+                {
+                    int bottomY = rowsTop + (visibleRows * rowHeight);
+                    System.Windows.Forms.Label downIndicator = new()
+                    {
+                        AutoSize = false,
+                        BackColor = Color.FromArgb(29, 32, 36),
+                        ForeColor = canScrollDown ? Color.White : Color.FromArgb(90, 94, 98),
+                        Font = CreateDpiStablePointFont("Consolas", 8.5f, FontStyle.Bold),
+                        Text = canScrollDown ? "▼  MORE" : "",
+                        TextAlign = ContentAlignment.MiddleCenter,
+                        Location = new Point(S(1), bottomY),
+                        Size = new Size(
+                            Math.Max(S(56), dropDownContent.ClientSize.Width - S(2)),
+                            scrollIndicatorHeight - S(1)),
+                        Cursor = canScrollDown ? Cursors.Hand : Cursors.Default,
+                        Anchor = AnchorStyles.Top | AnchorStyles.Left | AnchorStyles.Right,
+                        Margin = Padding.Empty,
+                        Padding = Padding.Empty,
+                        TabStop = false
+                    };
+                    downIndicator.Paint += (_, e) =>
+                    {
+                        using Pen line = new(Color.FromArgb(96, 100, 104), 1.0f);
+                        e.Graphics.DrawLine(line, 0, 0, Math.Max(0, downIndicator.Width - 1), 0);
+                    };
+                    downIndicator.Click += (_, __) =>
+                    {
+                        if (canScrollDown)
+                        {
+                            ScrollDropDown(1, 1);
+                        }
+                    };
+                    downIndicator.MouseWheel += (_, args) => HandleDropDownWheel(args);
+                    dropDownContent.Controls.Add(downIndicator);
+                }
+
+                dropDownContent.ResumeLayout(false);
+                dropDownContent.Invalidate();
+            }
+
+            void OpenDropDown()
+            {
+                if (!frame.Enabled)
+                {
+                    return;
+                }
+
+                if (dropDownWindow != null && !dropDownWindow.IsDisposed)
+                {
+                    CloseDropDown();
+                    return;
+                }
+
+                activeIndex = Array.FindIndex(
+                    items,
+                    item => string.Equals(item, currentValue, StringComparison.OrdinalIgnoreCase));
+                if (activeIndex < 0)
+                {
+                    activeIndex = 0;
+                }
+
+                firstVisibleIndex = Math.Max(0, activeIndex - (visibleRows / 2));
+                EnsureActiveIndexVisible();
+
+                Point frameScreenLeft = frame.PointToScreen(Point.Empty);
+                Point frameScreenRight = frame.PointToScreen(new Point(frame.ClientSize.Width, 0));
+                int actualFrameWidth = Math.Max(1, frameScreenRight.X - frameScreenLeft.X);
+                int menuWidth = Math.Max(S(84), actualFrameWidth);
+                int menuHeight = Math.Max(
+                    rowHeight + S(2),
+                    (rowHeight * visibleRows) +
+                    (scrollIndicatorHeight > 0 ? scrollIndicatorHeight * 2 : 0) +
+                    S(2));
+
+                dropDownWindow = new Form
+                {
+                    AutoScaleMode = AutoScaleMode.None,
+                    BackColor = Color.FromArgb(15, 18, 22),
+                    ClientSize = new Size(menuWidth, menuHeight),
+                    FormBorderStyle = FormBorderStyle.None,
+                    KeyPreview = true,
+                    MaximizeBox = false,
+                    MinimizeBox = false,
+                    ShowIcon = false,
+                    ShowInTaskbar = false,
+                    SizeGripStyle = SizeGripStyle.Hide,
+                    StartPosition = FormStartPosition.Manual,
+                    TopMost = this.TopMost
+                };
+
+                dropDownContent = new Panel
+                {
+                    BackColor = Color.FromArgb(15, 18, 22),
+                    Dock = DockStyle.Fill,
+                    Margin = Padding.Empty,
+                    Padding = Padding.Empty,
+                    TabStop = true
+                };
+                dropDownContent.Paint += (_, e) =>
+                {
+                    Rectangle border = new(
+                        0,
+                        0,
+                        Math.Max(1, dropDownContent.Width - 1),
+                        Math.Max(1, dropDownContent.Height - 1));
+                    using Pen outerPen = new(Color.FromArgb(7, 9, 12), 1.0f);
+                    using Pen innerPen = new(Color.FromArgb(205, 205, 205), 1.0f);
+                    e.Graphics.DrawRectangle(outerPen, border);
+                    Rectangle inner = Rectangle.Inflate(border, -1, -1);
+                    if (inner.Width > 0 && inner.Height > 0)
+                    {
+                        e.Graphics.DrawRectangle(innerPen, inner);
+                    }
+                };
+                dropDownContent.MouseWheel += (_, args) => HandleDropDownWheel(args);
+                dropDownWindow.MouseWheel += (_, args) => HandleDropDownWheel(args);
+                dropDownWindow.Controls.Add(dropDownContent);
+
+                dropDownContent.SizeChanged += (_, __) =>
+                {
+                    if (!menuOpen || dropDownContent == null || dropDownContent.IsDisposed ||
+                        dropDownContent.ClientSize == lastRenderedDropDownSize)
+                    {
+                        return;
+                    }
+
+                    lastRenderedDropDownSize = dropDownContent.ClientSize;
+                    dropDownContent.BeginInvoke((System.Windows.Forms.MethodInvoker)(() =>
+                    {
+                        if (menuOpen && dropDownContent != null && !dropDownContent.IsDisposed)
+                        {
+                            RenderDropDownRows();
+                        }
+                    }));
+                };
+
+                dropDownWindow.KeyDown += (_, args) =>
+                {
+                    switch (args.KeyCode)
+                    {
+                        case Keys.Up:
+                            MoveActiveSelection(-1);
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+
+                        case Keys.Down:
+                            MoveActiveSelection(1);
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+
+                        case Keys.PageUp:
+                            MoveActiveSelection(-visibleRows);
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+
+                        case Keys.PageDown:
+                            MoveActiveSelection(visibleRows);
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+
+                        case Keys.Enter:
+                        case Keys.Space:
+                            ApplySelectedValue(activeIndex);
+                            CloseDropDown();
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+
+                        case Keys.Escape:
+                            CloseDropDown();
+                            args.Handled = true;
+                            args.SuppressKeyPress = true;
+                            break;
+                    }
+                };
+
+                dropDownWindow.Deactivate += (_, __) =>
+                {
+                    if (dropDownWindow != null && !dropDownWindow.IsDisposed)
+                    {
+                        CloseDropDown();
+                    }
+                };
+                dropDownWindow.FormClosed += (_, __) =>
+                {
+                    menuOpen = false;
+                    pressed = false;
+                    UpdateVisualState();
+                };
+
+                Point belowPoint = frame.PointToScreen(new Point(0, Math.Max(0, frame.Height - S(1))));
+                Point abovePoint = frame.PointToScreen(new Point(0, 0));
+                Rectangle workingArea = Screen.FromControl(frame).WorkingArea;
+
+                int popupX = Math.Max(
+                    workingArea.Left,
+                    Math.Min(belowPoint.X, workingArea.Right - menuWidth));
+                int popupY = belowPoint.Y + menuHeight <= workingArea.Bottom
+                    ? belowPoint.Y
+                    : abovePoint.Y - menuHeight + S(1);
+                popupY = Math.Max(
+                    workingArea.Top,
+                    Math.Min(popupY, workingArea.Bottom - menuHeight));
+
+                dropDownWindow.Location = new Point(popupX, popupY);
+                menuOpen = true;
+                pressed = false;
+                UpdateVisualState();
+
+                dropDownWindow.Show(this);
+
+                // Force the final native client area after the popup handle has
+                // been created. This prevents a DPI-scaled blank strip to the
+                // right of short lists such as DUE TO.
+                dropDownWindow.ClientSize = new Size(menuWidth, menuHeight);
+                dropDownContent.PerformLayout();
+
+                Rectangle finalWorkingArea = Screen.FromPoint(dropDownWindow.Location).WorkingArea;
+                int finalX = Math.Max(
+                    finalWorkingArea.Left,
+                    Math.Min(popupX, finalWorkingArea.Right - dropDownWindow.Width));
+                int finalY = Math.Max(
+                    finalWorkingArea.Top,
+                    Math.Min(popupY, finalWorkingArea.Bottom - dropDownWindow.Height));
+                dropDownWindow.Location = new Point(finalX, finalY);
+
+                RenderDropDownRows();
+                dropDownWindow.Activate();
+                dropDownContent.Focus();
+            }
+
+            frame.Paint += (_, e) =>
+            {
+                if (frame.Width < S(48) || frame.Height < S(18))
+                {
+                    return;
+                }
+
+                e.Graphics.SmoothingMode = SmoothingMode.None;
+                e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+
+                int arrowWidth = Math.Max(S(20), Math.Min(S(26), frame.Width / 4));
+                int arrowLeft = Math.Max(S(24), frame.Width - arrowWidth);
+                int down = pressed ? S(1) : 0;
+
+                Color face = !frame.Enabled
+                    ? Color.FromArgb(78, 78, 78)
+                    : (hover || menuOpen)
+                        ? (pressed ? Color.FromArgb(2, 72, 166) : Color.FromArgb(3, 91, 207))
+                        : (pressed ? Color.FromArgb(101, 101, 101) : Color.FromArgb(112, 112, 112));
+
+                Color arrowFace = !frame.Enabled
+                    ? Color.FromArgb(68, 68, 68)
+                    : (hover || menuOpen)
+                        ? (pressed ? Color.FromArgb(1, 60, 142) : Color.FromArgb(2, 77, 180))
+                        : (pressed ? Color.FromArgb(82, 82, 82) : Color.FromArgb(94, 94, 94));
+
+                e.Graphics.Clear(Color.Black);
+
+                Rectangle faceRect = new(
+                    0,
+                    down,
+                    Math.Max(1, frame.Width - 1),
+                    Math.Max(1, frame.Height - down - 1));
+
+                using (SolidBrush faceBrush = new(face))
+                using (SolidBrush arrowBrush = new(arrowFace))
+                {
+                    e.Graphics.FillRectangle(faceBrush, faceRect);
+
+                    Rectangle arrowRect = new(
+                        arrowLeft,
+                        down + S(1),
+                        Math.Max(1, faceRect.Right - arrowLeft),
+                        Math.Max(1, faceRect.Height - S(1)));
+                    e.Graphics.FillRectangle(arrowBrush, arrowRect);
+                }
+
+                Color light = (hover || menuOpen)
+                    ? Color.FromArgb(195, 220, 255)
+                    : Color.FromArgb(214, 214, 214);
+                Color middle = (hover || menuOpen)
+                    ? Color.FromArgb(74, 143, 224)
+                    : Color.FromArgb(142, 142, 142);
+                Color dark = (hover || menuOpen)
+                    ? Color.FromArgb(0, 43, 106)
+                    : Color.FromArgb(35, 35, 35);
+
+                using (Pen lightPen = new(light, 1.0f))
+                using (Pen middlePen = new(middle, 1.0f))
+                using (Pen darkPen = new(dark, 1.0f))
+                {
+                    int topY = down;
+                    int bottomY = Math.Max(topY, faceRect.Bottom - 1);
+                    int rightX = Math.Max(0, faceRect.Right - 1);
+
+                    e.Graphics.DrawLine(lightPen, 0, topY, rightX, topY);
+                    e.Graphics.DrawLine(lightPen, 0, topY, 0, bottomY);
+                    e.Graphics.DrawLine(darkPen, 0, bottomY, rightX, bottomY);
+                    e.Graphics.DrawLine(darkPen, rightX, topY, rightX, bottomY);
+                    e.Graphics.DrawLine(
+                        middlePen,
+                        arrowLeft,
+                        topY + S(2),
+                        arrowLeft,
+                        Math.Max(topY + S(2), bottomY - S(2)));
+                }
+
+                int arrowCenterX = arrowLeft + Math.Max(S(6), (faceRect.Right - arrowLeft) / 2);
+                int arrowCenterY = down + (faceRect.Height / 2);
+                Point[] triangle = menuOpen
+                    ? new[]
+                    {
+                        new Point(arrowCenterX - S(4), arrowCenterY + S(2)),
+                        new Point(arrowCenterX + S(4), arrowCenterY + S(2)),
+                        new Point(arrowCenterX, arrowCenterY - S(3))
+                    }
+                    : new[]
+                    {
+                        new Point(arrowCenterX - S(4), arrowCenterY - S(2)),
+                        new Point(arrowCenterX + S(4), arrowCenterY - S(2)),
+                        new Point(arrowCenterX, arrowCenterY + S(3))
+                    };
+
+                using SolidBrush triangleBrush = new(
+                    frame.Enabled ? Color.White : Color.FromArgb(160, 160, 160));
+                e.Graphics.FillPolygon(triangleBrush, triangle);
+            };
+
+            void SetHover(bool value)
+            {
+                hover = value;
+                if (!value && !menuOpen)
+                {
+                    pressed = false;
+                }
+
+                UpdateVisualState();
+            }
+
+            frame.MouseEnter += (_, __) => SetHover(true);
+            frame.MouseLeave += (_, __) => SetHover(false);
+            valueLabel.MouseEnter += (_, __) => SetHover(true);
+            valueLabel.MouseLeave += (_, __) => SetHover(false);
+
+            void SetPressed(bool value)
+            {
+                pressed = value;
+                UpdateVisualState();
+            }
+
+            frame.MouseDown += (_, args) =>
+            {
+                if (args.Button == MouseButtons.Left)
+                {
+                    SetPressed(true);
+                }
+            };
+            valueLabel.MouseDown += (_, args) =>
+            {
+                if (args.Button == MouseButtons.Left)
+                {
+                    SetPressed(true);
+                }
+            };
+
+            void FinishClick(MouseEventArgs args, Control sourceControl)
+            {
+                if (args.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                bool activate = sourceControl.ClientRectangle.Contains(args.Location);
+                SetPressed(false);
+                if (activate)
+                {
+                    OpenDropDown();
+                }
+            }
+
+            frame.MouseUp += (_, args) => FinishClick(args, frame);
+            valueLabel.MouseUp += (_, args) => FinishClick(args, valueLabel);
+            frame.MouseWheel += (_, args) => HandleDropDownWheel(args);
+            valueLabel.MouseWheel += (_, args) => HandleDropDownWheel(args);
+
+            frame.KeyDown += (_, args) =>
+            {
+                if (args.KeyCode == Keys.Enter ||
+                    args.KeyCode == Keys.Space ||
+                    args.KeyCode == Keys.Down)
+                {
+                    OpenDropDown();
+                    args.Handled = true;
+                    args.SuppressKeyPress = true;
+                }
+            };
+
+            frame.Disposed += (_, __) => CloseDropDown();
+            frame.Controls.Add(valueLabel);
+            parent.Controls.Add(frame);
+            frame.BringToFront();
+            return valueLabel;
+        }
+
         private void AddAirbusAocSendPrompt(Control parent, bool includeSend)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                int footerY = Math.Max(1, parent.Height - S(58));
+                AddA220AocButton(parent, "RETURN", S(18), footerY, S(168), S(36), () => HandleAirbusAocLineSelect(false, 5));
+                if (includeSend)
+                {
+                    airbusAocSendButton = AddA220AocButton(parent, "SEND", Math.Max(S(18), parent.Width - S(186)), footerY, S(168), S(36), () => HandleAirbusAocLineSelect(true, 5), true);
+                }
+                return;
+            }
+
             int actionY = AirbusAocActionY(parent);
             Font actionFont = AirbusAocMenuFont();
             AddAirbusAocLabel(parent, "<RETURN", 14, actionY, 190, 30, ContentAlignment.MiddleLeft, MainPrimaryTextColor(), actionFont);
@@ -15646,6 +17604,48 @@ airbusAocSendLabel = null;
             {
                 airbusAocSendLabel = AddAirbusAocLabel(parent, "SEND", parent.Width - 108, actionY, 96, 30, ContentAlignment.MiddleRight, DcduTheme.Cyan, actionFont);
             }
+        }
+
+        private void AddA220AocHeader(Control parent, params string[] parts)
+        {
+            string[] clean = (parts ?? Array.Empty<string>())
+                .Where(part => !string.IsNullOrWhiteSpace(part))
+                .Select(part => part.Trim())
+                .ToArray();
+
+            string text = string.Join("  >  ", clean);
+            int margin = S(18);
+            int headerWidth = Math.Max(S(40), parent.ClientSize.Width - (margin * 2));
+
+            AddAirbusAocLabel(
+                parent,
+                text,
+                margin,
+                S(10),
+                headerWidth,
+                S(24),
+                ContentAlignment.MiddleLeft,
+                DcduTheme.Cyan,
+                AirbusAocTitleFont());
+
+            AddAirbusAocRule(parent, S(38), margin, headerWidth);
+        }
+
+        private Button AddA220AocButton(Control parent, string text, int x, int y, int width, int height, Action onClick, bool accent = false)
+        {
+            A220PanelButton button = new()
+            {
+                Text = text ?? string.Empty,
+                Font = CreateDpiStablePointFont("Consolas", 10.2f, FontStyle.Regular),
+                Location = new Point(x, y),
+                Size = new Size(Math.Max(1, width), Math.Max(1, height)),
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                AccentText = accent
+            };
+            button.Click += (_, __) => onClick?.Invoke();
+            parent.Controls.Add(button);
+            return button;
         }
 
         private string AirbusAocFlightPlanValue(Func<Flight_Plan, string> selector)
@@ -15731,13 +17731,30 @@ airbusAocSendLabel = null;
         {
             PrepareAirbusAocPage(AirbusAocPage.AtcMainMenu);
             Panel page = CreateAirbusAocCanvas();
+
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU");
+                int margin = S(18);
+                int gap = S(14);
+                int top = S(54);
+                int h = S(44);
+                int w = Math.Max(S(150), (page.Width - (margin * 2) - gap) / 2);
+                int rightX = margin + w + gap;
+                AddA220AocButton(page, "DIRECT REQUEST", margin, top, w, h, ShowAirbusAtcDirectRequest);
+                AddA220AocButton(page, "LEVEL REQUEST", rightX, top, w, h, ShowAirbusAtcLevelRequest);
+                AddA220AocButton(page, "WHEN CAN WE", margin, top + h + gap, w, h, ShowAirbusAtcWhenCanWeRequest);
+                AddA220AocButton(page, "SPEED REQUEST", rightX, top + h + gap, w, h, ShowAirbusAtcSpeedRequest);
+                AddA220AocButton(page, "CONNECTIONS", margin, top + ((h + gap) * 2), w, h, ShowAirbusAtcConnectionMenu);
+                AddA220AocButton(page, "RETURN", rightX, top + ((h + gap) * 2), w, h, CloseAirbusAocPages);
+                return;
+            }
+
             Font titleFont = AirbusAocTitleFont();
             Font menuFont = AirbusAocMenuFont();
             Color labelColor = MainPrimaryTextColor();
-
             int leftMenuX = 8;
             int rightMenuX = page.Width - 214;
-
             AddAirbusAocLabel(page, "ATC MENU", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAocLabel(page, "<LAT REQ", leftMenuX, AirbusAocLskTextY(page, 1), 210, 32, ContentAlignment.MiddleLeft, labelColor, menuFont);
             AddAirbusAocLabel(page, "VERT REQ>", rightMenuX, AirbusAocRightLskTextY(page, 1), 202, 32, ContentAlignment.MiddleRight, labelColor, menuFont);
@@ -15810,6 +17827,17 @@ airbusAocSendLabel = null;
 
         private void AddAirbusAtcBottomActions(Panel page, string returnText = "<ATC MENU")
         {
+            if (DcduStyleManager.IsA220)
+            {
+                int margin = S(18);
+                int footerY = Math.Max(S(210), page.Height - S(58));
+                int width = Math.Max(S(210), (page.Width - (margin * 3)) / 2);
+                string cleanReturn = (returnText ?? "ATC MENU").Replace("<", string.Empty).Trim();
+                AddA220AocButton(page, "RETURN / " + cleanReturn, margin, footerY, width, S(38), () => HandleAirbusAocLineSelect(false, 5));
+                airbusAocSendButton = AddA220AocButton(page, "SEND", page.Width - margin - width, footerY, width, S(38), () => HandleAirbusAocLineSelect(true, 5), true);
+                return;
+            }
+
             Font actionFont = AirbusAocMenuFont();
             int actionY = AirbusAocActionY(page);
             Color labelColor = MainPrimaryTextColor();
@@ -15822,7 +17850,9 @@ airbusAocSendLabel = null;
             Font captionFont = AirbusAocCaptionFont();
             Color labelColor = MainPrimaryTextColor();
             AddAirbusAocLabel(page, "RECIPIENT", x, y, 120, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
-            AddAirbusAocTextBox(page, AirbusAocInputStation, GetStoredAirbusAocInput(pageKey, AirbusAocInputStation, GetAirbusAtcDefaultRecipient()), x, y + 18, 34, 4);
+            AddAirbusAocTextBox(page, AirbusAocInputStation,
+                GetStoredAirbusAocInput(pageKey, AirbusAocInputStation, GetAirbusAtcDefaultRecipient()),
+                x, y + 18, DcduStyleManager.IsA220 ? 150 : 34, 8);
         }
 
         private void AddAirbusAtcRemarksField(Panel page, AirbusAocPage pageKey, int x, int y, int width, int height)
@@ -15843,6 +17873,42 @@ airbusAocSendLabel = null;
             int leftMenuX = 8;
             string currentUnit = (CurrentATCUnit ?? string.Empty).Trim().ToUpperInvariant();
             string detectedCode = (cpdlcDiscoveryLogonCode ?? string.Empty).Trim().ToUpperInvariant();
+
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "CONNECTIONS");
+                int margin = S(18);
+                int top = S(58);
+                int footerY = Math.Max(S(238), page.Height - S(58));
+                int buttonWidth = Math.Max(S(210), (page.Width - (margin * 3)) / 2);
+                int rightX = page.Width - margin - buttonWidth;
+
+                string statusText = string.IsNullOrWhiteSpace(currentUnit)
+                    ? (string.IsNullOrWhiteSpace(detectedCode) ? "NO ACTIVE CPDLC CONNECTION" : "READY FOR LOGON")
+                    : "CONNECTED";
+                string stationText = string.IsNullOrWhiteSpace(currentUnit) ? detectedCode : currentUnit;
+
+                AddAirbusAocLabel(page, "STATUS", margin, top, S(160), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocLabel(page, statusText, margin, top + S(20), S(260), S(24), ContentAlignment.MiddleLeft,
+                    string.IsNullOrWhiteSpace(currentUnit) ? DcduTheme.Amber : DcduTheme.Green, AirbusAocValueFont());
+                AddAirbusAocRule(page, top + S(50), margin, page.Width - (margin * 2));
+                AddAirbusAocLabel(page, "CURRENT ATS UNIT", margin, top + S(66), S(220), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocLabel(page, string.IsNullOrWhiteSpace(stationText) ? "----" : stationText, margin, top + S(86), S(220), S(24), ContentAlignment.MiddleLeft, DcduTheme.Cyan, AirbusAocValueFont());
+                AddAirbusAocLabel(page, "LOGON CANDIDATE", margin, top + S(126), S(220), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocLabel(page, string.IsNullOrWhiteSpace(detectedCode) ? "NONE" : detectedCode, margin, top + S(146), S(220), S(24), ContentAlignment.MiddleLeft,
+                    string.IsNullOrWhiteSpace(detectedCode) ? DcduTheme.Amber : DcduTheme.Cyan, AirbusAocValueFont());
+
+                if (!string.IsNullOrWhiteSpace(currentUnit))
+                {
+                    AddA220AocButton(page, "LOGOFF " + currentUnit, margin, footerY, buttonWidth, S(38), () => _ = ExecuteCpdlcLogoffFromEmbeddedMenuAsync());
+                }
+                else
+                {
+                    AddA220AocButton(page, "LOGON", margin, footerY, buttonWidth, S(38), ShowAirbusAtcLogonRequest);
+                }
+                AddA220AocButton(page, "RETURN / ATC MENU", rightX, footerY, buttonWidth, S(38), ShowAirbusAtcMainMenu);
+                return;
+            }
 
             AddAirbusAocLabel(page, "ATC CONNECTIONS", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
 
@@ -15895,6 +17961,29 @@ airbusAocSendLabel = null;
             int rightEdge = page.Width - 22;
             string suggestedCode = GetStoredAirbusAocInput(AirbusAocPage.AtcLogonRequest, AirbusAocInputStation, GetSuggestedCpdlcLogonCode());
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "CONNECTIONS", "LOGON");
+                int top = S(58);
+                int footerY = Math.Max(S(238), page.Height - S(58));
+                int buttonWidth = Math.Max(S(210), (page.Width - (S(18) * 3)) / 2);
+                int rightX = page.Width - S(18) - buttonWidth;
+                AddAirbusAocLabel(page, "STATION CODE", leftX, top, S(180), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputStation, suggestedCode, leftX, top + S(22), S(170), 8);
+                AddAirbusAocRule(page, top + S(62), leftX, rightEdge - leftX);
+                AddAirbusAocLabel(page, "ENTER OR EDIT CPDLC LOGON CODE", leftX, top + S(76), rightEdge - leftX, S(18), ContentAlignment.MiddleLeft, Color.FromArgb(165, labelColor), hintFont);
+                string detectedA220 = (cpdlcDiscoveryLogonCode ?? string.Empty).Trim().ToUpperInvariant();
+                if (!string.IsNullOrWhiteSpace(detectedA220))
+                {
+                    AddAirbusAocLabel(page, "DETECTED " + detectedA220, leftX, top + S(102), rightEdge - leftX, S(18), ContentAlignment.MiddleLeft, DcduTheme.Green, hintFont);
+                }
+                AddA220AocButton(page, "RETURN / CONNECTIONS", S(18), footerY, buttonWidth, S(38), ShowAirbusAtcConnectionMenu);
+                airbusAocSendButton = AddA220AocButton(page, "SEND", rightX, footerY, buttonWidth, S(38), () => _ = SendAirbusAtcLogonRequestAsync(), true);
+                UpdateAirbusAocSendState();
+                FocusFirstAirbusAocInput();
+                return;
+            }
+
             AddAirbusAocLabel(page, "ATC LOGON", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAocLabel(page, "STATION CODE", leftX, 44, 180, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocTextBox(page, AirbusAocInputStation, suggestedCode, leftX, 64, 76, 8);
@@ -15910,18 +17999,27 @@ airbusAocSendLabel = null;
             UpdateAirbusAocSendState();
         }
 
-        private async Task SendAirbusAtcLogonRequestAsync()
+        private Task SendAirbusAtcLogonRequestAsync()
         {
             string station = GetAirbusAocInput(AirbusAocInputStation);
 
             if (station.Length < 3)
             {
                 WriteMessage("CPDLC LOGON NOT READY: ENTER STATION CODE", "SYSTEM", "SYSTEM");
-                return;
+                return Task.CompletedTask;
             }
 
-            CloseAirbusAocPages();
-            await SendCpdlcLogonRequestAsync(station, false);
+            airbusAocConfirmReturnPage = AirbusAocPage.AtcLogonRequest;
+            airbusAocPendingSendKind = AirbusAocPendingSendKind.ManualLogon;
+            airbusAocPendingRecipient = station;
+            airbusAocPendingMessage = "REQUEST LOGON";
+            airbusAocPendingTitle = "ATC LOGON REQUEST";
+            airbusAocPendingInfo = "TO " + station;
+            airbusAocPendingPreview = "REQUEST LOGON TO " + station;
+            airbusAocPendingAutoRefresh = false;
+            ShowAirbusAocSendConfirmPage();
+
+            return Task.CompletedTask;
         }
 
         private void ShowAirbusAtcDirectRequest()
@@ -15934,16 +18032,44 @@ airbusAocSendLabel = null;
             int leftX = 22;
             int rightEdge = page.Width - 22;
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "DIRECT REQUEST");
+                int margin = S(18);
+                int top = S(58);
+                int footerY = Math.Max(S(242), page.Height - S(58));
+                int dividerX = Math.Max(S(430), (int)Math.Round(page.Width * 0.58));
+                int leftWidth = dividerX - margin - S(18);
+                int rightX = dividerX + S(22);
+                int rightWidth = page.Width - rightX - margin;
+
+                AddAirbusAocVerticalRule(page, dividerX, top, Math.Max(S(146), footerY - top - S(12)));
+                AddAirbusAocLabel(page, "RECIPIENT", margin, top, leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputStation, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputStation, GetAirbusAtcDefaultRecipient()), margin, top + S(22), Math.Min(leftWidth, S(190)), 8);
+                AddAirbusAocRule(page, top + S(62), margin, leftWidth);
+                AddAirbusAocLabel(page, "DUE TO", margin, top + S(76), leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, AirbusAocPage.AtcDirectRequest, AirbusAocInputDueReason, new[] { "NONE", "WX", "A/C" }, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputDueReason, "NONE"), margin, top + S(98), S(96));
+                AddAirbusAocLabel(page, "NONE / WX / A/C PERF", margin + S(112), top + S(102), leftWidth - S(112), S(18), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+                AddAirbusAocRule(page, top + S(138), margin, leftWidth);
+                AddAirbusAocLabel(page, "DIRECT TO", rightX, top, rightWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputDirectTo, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputDirectTo, string.Empty), rightX, top + S(22), Math.Min(rightWidth, S(170)), 7);
+                int remarksY = top + S(158);
+                AddAirbusAocLabel(page, "REMARKS", margin, remarksY, page.Width - (margin * 2), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputRemarks, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputRemarks, string.Empty), margin, remarksY + S(22), page.Width - (margin * 2), 160, true, Math.Max(S(68), footerY - remarksY - S(40)));
+                AddA220AocButton(page, "RETURN / ATC MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcMainMenu);
+                airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcRequestConfirm, true);
+                UpdateAirbusAocSendState();
+                FocusFirstAirbusAocInput();
+                return;
+            }
+
             AddAirbusAocLabel(page, "DIRECT REQUEST", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAtcRecipientField(page, AirbusAocPage.AtcDirectRequest, leftX, 38);
-
             AddAirbusAocLabel(page, "DIRECT TO", leftX + 150, 38, 120, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
-            AddAirbusAocTextBox(page, AirbusAocInputDirectTo, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputDirectTo, string.Empty), leftX + 150, 60, 58, 7);
-
+            AddAirbusAocTextBox(page, AirbusAocInputDirectTo, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputDirectTo, string.Empty), leftX + 150, 60, DcduStyleManager.IsA220 ? 160 : 58, 7);
             AddAirbusAocLabel(page, "DUE TO", leftX, 88, 90, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocCycleBox(page, AirbusAocPage.AtcDirectRequest, AirbusAocInputDueReason, new[] { "NONE", "WX", "A/C" }, GetStoredAirbusAocInput(AirbusAocPage.AtcDirectRequest, AirbusAocInputDueReason, "NONE"), leftX, 110, 48);
             AddAirbusAocLabel(page, "NONE / WX / A/C PERF", leftX + 82, 110, 280, 18, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
-
             AddAirbusAtcRemarksField(page, AirbusAocPage.AtcDirectRequest, leftX, 134, rightEdge - leftX, Math.Max(34, AirbusAocActionY(page) - 156));
             AddAirbusAtcBottomActions(page);
             UpdateAirbusAocSendState();
@@ -15960,16 +18086,183 @@ airbusAocSendLabel = null;
             int leftX = 22;
             int rightEdge = page.Width - 22;
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "LEVEL REQUEST");
+
+                int a220Margin = S(16);
+                int a220Top = S(50);
+                int a220FooterHeight = S(34);
+                int a220FooterY = Math.Max(S(304), page.Height - a220FooterHeight - S(6));
+                int a220TopBottom = S(186);
+                int a220DividerX = Math.Max(S(410), (int)Math.Round(page.Width * 0.59));
+                int a220LeftWidth = Math.Max(S(260), a220DividerX - a220Margin - S(18));
+                int a220RightX = a220DividerX + S(20);
+                int a220RightWidth = Math.Max(S(170), page.Width - a220RightX - a220Margin);
+
+                // The vertical separator belongs only to the two-column header
+                // block. Remarks then use the full width beneath it.
+                AddAirbusAocVerticalRule(
+                    page,
+                    a220DividerX,
+                    a220Top,
+                    Math.Max(S(90), a220TopBottom - a220Top));
+
+                AddAirbusAocLabel(
+                    page, "RECIPIENT",
+                    a220Margin, a220Top,
+                    a220LeftWidth, S(18),
+                    ContentAlignment.MiddleLeft,
+                    labelColor, captionFont);
+
+                AddAirbusAocTextBox(
+                    page,
+                    AirbusAocInputStation,
+                    GetStoredAirbusAocInput(
+                        AirbusAocPage.AtcLevelRequest,
+                        AirbusAocInputStation,
+                        GetAirbusAtcDefaultRecipient()),
+                    a220Margin,
+                    a220Top + S(20),
+                    Math.Min(a220LeftWidth, S(190)),
+                    8);
+
+                AddAirbusAocRule(
+                    page,
+                    a220Top + S(58),
+                    a220Margin,
+                    a220LeftWidth);
+
+                int a220DueY = a220Top + S(70);
+                AddAirbusAocLabel(
+                    page, "DUE TO",
+                    a220Margin, a220DueY,
+                    S(100), S(18),
+                    ContentAlignment.MiddleLeft,
+                    labelColor, captionFont);
+
+                AddAirbusAocCycleBox(
+                    page,
+                    AirbusAocPage.AtcLevelRequest,
+                    AirbusAocInputDueReason,
+                    new[] { "NONE", "WX", "A/C" },
+                    GetStoredAirbusAocInput(
+                        AirbusAocPage.AtcLevelRequest,
+                        AirbusAocInputDueReason,
+                        "NONE"),
+                    a220Margin,
+                    a220DueY + S(20),
+                    S(104));
+
+                AddAirbusAocLabel(
+                    page,
+                    "NONE / WX / A/C PERF",
+                    a220Margin + S(120),
+                    a220DueY + S(22),
+                    Math.Max(S(130), a220LeftWidth - S(120)),
+                    S(18),
+                    ContentAlignment.MiddleLeft,
+                    DcduTheme.Amber,
+                    captionFont);
+
+                AddAirbusAocRule(
+                    page,
+                    a220DueY + S(56),
+                    a220Margin,
+                    a220LeftWidth);
+
+                AddAirbusAocLabel(
+                    page, "REQUESTED FL",
+                    a220RightX, a220Top,
+                    a220RightWidth, S(18),
+                    ContentAlignment.MiddleLeft,
+                    labelColor, captionFont);
+
+                AddAirbusAocTextBox(
+                    page,
+                    AirbusAocInputRequestedFlightLevel,
+                    GetStoredAirbusAocInput(
+                        AirbusAocPage.AtcLevelRequest,
+                        AirbusAocInputRequestedFlightLevel,
+                        string.Empty),
+                    a220RightX,
+                    a220Top + S(20),
+                    Math.Min(a220RightWidth, S(132)),
+                    3);
+
+                AddAirbusAocLabel(
+                    page,
+                    "ENTER FLIGHT LEVEL",
+                    a220RightX,
+                    a220Top + S(58),
+                    a220RightWidth,
+                    S(18),
+                    ContentAlignment.MiddleLeft,
+                    Color.FromArgb(165, labelColor),
+                    captionFont);
+
+                int a220RemarksY = a220TopBottom + S(8);
+                int a220RemarksBoxY = a220RemarksY + S(20);
+                int a220RemarksHeight = Math.Max(
+                    S(62),
+                    a220FooterY - a220RemarksBoxY - S(12));
+
+                AddAirbusAocLabel(
+                    page, "REMARKS",
+                    a220Margin, a220RemarksY,
+                    page.Width - (a220Margin * 2), S(18),
+                    ContentAlignment.MiddleLeft,
+                    labelColor, captionFont);
+
+                AddAirbusAocTextBox(
+                    page,
+                    AirbusAocInputRemarks,
+                    GetStoredAirbusAocInput(
+                        AirbusAocPage.AtcLevelRequest,
+                        AirbusAocInputRemarks,
+                        string.Empty),
+                    a220Margin,
+                    a220RemarksBoxY,
+                    page.Width - (a220Margin * 2),
+                    160,
+                    true,
+                    a220RemarksHeight);
+
+                int a220ButtonWidth = Math.Max(
+                    S(190),
+                    (page.Width - (a220Margin * 3)) / 2);
+
+                AddA220AocButton(
+                    page,
+                    "RETURN / ATC MENU",
+                    a220Margin,
+                    a220FooterY,
+                    a220ButtonWidth,
+                    a220FooterHeight,
+                    ShowAirbusAtcMainMenu);
+
+                airbusAocSendButton = AddA220AocButton(
+                    page,
+                    "SEND",
+                    page.Width - a220Margin - a220ButtonWidth,
+                    a220FooterY,
+                    a220ButtonWidth,
+                    a220FooterHeight,
+                    ShowAirbusAtcRequestConfirm,
+                    true);
+
+                UpdateAirbusAocSendState();
+                FocusFirstAirbusAocInput();
+                return;
+            }
+
             AddAirbusAocLabel(page, "LEVEL REQUEST", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAtcRecipientField(page, AirbusAocPage.AtcLevelRequest, leftX, 38);
-
             AddAirbusAocLabel(page, "REQUESTED FL", leftX + 150, 38, 140, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocTextBox(page, AirbusAocInputRequestedFlightLevel, GetStoredAirbusAocInput(AirbusAocPage.AtcLevelRequest, AirbusAocInputRequestedFlightLevel, string.Empty), leftX + 150, 60, 26, 3);
-
             AddAirbusAocLabel(page, "DUE TO", leftX, 88, 90, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocCycleBox(page, AirbusAocPage.AtcLevelRequest, AirbusAocInputDueReason, new[] { "NONE", "WX", "A/C" }, GetStoredAirbusAocInput(AirbusAocPage.AtcLevelRequest, AirbusAocInputDueReason, "NONE"), leftX, 110, 48);
             AddAirbusAocLabel(page, "NONE / WX / A/C PERF", leftX + 82, 110, 280, 18, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
-
             AddAirbusAtcRemarksField(page, AirbusAocPage.AtcLevelRequest, leftX, 134, rightEdge - leftX, Math.Max(34, AirbusAocActionY(page) - 156));
             AddAirbusAtcBottomActions(page);
             UpdateAirbusAocSendState();
@@ -15986,18 +18279,48 @@ airbusAocSendLabel = null;
             int leftX = 22;
             int rightEdge = page.Width - 22;
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "SPEED REQUEST");
+                int margin = S(18);
+                int top = S(58);
+                int footerY = Math.Max(S(242), page.Height - S(58));
+                int dividerX = Math.Max(S(430), (int)Math.Round(page.Width * 0.58));
+                int leftWidth = dividerX - margin - S(18);
+                int rightX = dividerX + S(22);
+                int rightWidth = page.Width - rightX - margin;
+
+                AddAirbusAocVerticalRule(page, dividerX, top, Math.Max(S(146), footerY - top - S(12)));
+                AddAirbusAocLabel(page, "RECIPIENT", margin, top, leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputStation, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputStation, GetAirbusAtcDefaultRecipient()), margin, top + S(22), Math.Min(leftWidth, S(190)), 8);
+                AddAirbusAocRule(page, top + S(62), margin, leftWidth);
+                AddAirbusAocLabel(page, "DUE TO", margin, top + S(76), leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, AirbusAocPage.AtcSpeedRequest, AirbusAocInputDueReason, new[] { "NONE", "WX", "A/C" }, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputDueReason, "NONE"), margin, top + S(98), S(96));
+                AddAirbusAocLabel(page, "NONE / WX / A/C PERF", margin + S(112), top + S(102), leftWidth - S(112), S(18), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+                AddAirbusAocRule(page, top + S(138), margin, leftWidth);
+                AddAirbusAocLabel(page, "MODE", rightX, top, S(90), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedMode, new[] { "MACH", "SPEED" }, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedMode, "SPEED"), rightX, top + S(22), S(130));
+                AddAirbusAocLabel(page, "VALUE", rightX, top + S(66), S(90), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputSpeedValue, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedValue, string.Empty), rightX, top + S(88), Math.Min(rightWidth, S(130)), 3);
+                int remarksY = top + S(158);
+                AddAirbusAocLabel(page, "REMARKS", margin, remarksY, page.Width - (margin * 2), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputRemarks, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputRemarks, string.Empty), margin, remarksY + S(22), page.Width - (margin * 2), 160, true, Math.Max(S(68), footerY - remarksY - S(40)));
+                AddA220AocButton(page, "RETURN / ATC MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcMainMenu);
+                airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcRequestConfirm, true);
+                UpdateAirbusAocSendState();
+                FocusFirstAirbusAocInput();
+                return;
+            }
+
             AddAirbusAocLabel(page, "SPEED REQUEST", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAtcRecipientField(page, AirbusAocPage.AtcSpeedRequest, leftX, 38);
-
             AddAirbusAocLabel(page, "MODE", leftX + 150, 38, 70, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocCycleBox(page, AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedMode, new[] { "MACH", "SPEED" }, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedMode, "SPEED"), leftX + 150, 60, 58);
             AddAirbusAocLabel(page, "VALUE", leftX + 230, 38, 70, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
-            AddAirbusAocTextBox(page, AirbusAocInputSpeedValue, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedValue, string.Empty), leftX + 230, 60, 30, 3);
-
+            AddAirbusAocTextBox(page, AirbusAocInputSpeedValue, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputSpeedValue, string.Empty), leftX + 230, 60, DcduStyleManager.IsA220 ? 120 : 30, 3);
             AddAirbusAocLabel(page, "DUE TO", leftX, 88, 90, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocCycleBox(page, AirbusAocPage.AtcSpeedRequest, AirbusAocInputDueReason, new[] { "NONE", "WX", "A/C" }, GetStoredAirbusAocInput(AirbusAocPage.AtcSpeedRequest, AirbusAocInputDueReason, "NONE"), leftX, 110, 48);
             AddAirbusAocLabel(page, "NONE / WX / A/C PERF", leftX + 82, 110, 280, 18, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
-
             AddAirbusAtcRemarksField(page, AirbusAocPage.AtcSpeedRequest, leftX, 134, rightEdge - leftX, Math.Max(34, AirbusAocActionY(page) - 156));
             AddAirbusAtcBottomActions(page);
             UpdateAirbusAocSendState();
@@ -16014,31 +18337,63 @@ airbusAocSendLabel = null;
             int leftX = 22;
             int rightEdge = page.Width - 22;
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "ATC MENU", "WHEN CAN WE");
+                int margin = S(18);
+                int top = S(58);
+                int footerY = Math.Max(S(242), page.Height - S(58));
+                int dividerX = Math.Max(S(430), (int)Math.Round(page.Width * 0.58));
+                int leftWidth = dividerX - margin - S(18);
+                int rightX = dividerX + S(22);
+                int rightWidth = page.Width - rightX - margin;
+                string a220SelectedWcwType = GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwType, "HIGHER");
+                bool a220WcwNeedsValue = AirbusAtcWhenCanWeNeedsValue(a220SelectedWcwType);
+
+                AddAirbusAocVerticalRule(page, dividerX, top, Math.Max(S(146), footerY - top - S(12)));
+                AddAirbusAocLabel(page, "RECIPIENT", margin, top, leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputStation, GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputStation, GetAirbusAtcDefaultRecipient()), margin, top + S(22), Math.Min(leftWidth, S(190)), 8);
+                AddAirbusAocRule(page, top + S(62), margin, leftWidth);
+                AddAirbusAocLabel(page, "EXPECT", rightX, top, rightWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwType, new[] { "HIGHER", "LOWER", "BACK ROUTE", "CLIMB", "DESCENT", "MACH", "SPEED", "DIRECT" }, a220SelectedWcwType, rightX, top + S(22), Math.Min(rightWidth, S(180)));
+                if (a220WcwNeedsValue)
+                {
+                    AddAirbusAocLabel(page, "VALUE", rightX, top + S(66), rightWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                    AddAirbusAocTextBox(page, AirbusAocInputWcwValue, GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwValue, string.Empty), rightX, top + S(88), Math.Min(rightWidth, S(150)), 7);
+                    AddAirbusAocLabel(page, "VALUE FOR CLIMB / DESCENT / MACH / SPEED / DIRECT", margin, top + S(102), leftWidth, S(18), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+                }
+                else
+                {
+                    AddAirbusAocLabel(page, "NO VALUE REQUIRED", margin, top + S(102), leftWidth, S(18), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+                }
+                int a220RemarksY = top + S(146);
+                AddAirbusAocLabel(page, "REMARKS", margin, a220RemarksY, page.Width - (margin * 2), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocTextBox(page, AirbusAocInputRemarks, GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputRemarks, string.Empty), margin, a220RemarksY + S(22), page.Width - (margin * 2), 160, true, Math.Max(S(68), footerY - a220RemarksY - S(40)));
+                AddA220AocButton(page, "RETURN / ATC MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcMainMenu);
+                airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAtcRequestConfirm, true);
+                UpdateAirbusAocSendState();
+                FocusFirstAirbusAocInput();
+                return;
+            }
+
             AddAirbusAocLabel(page, "WHEN CAN WE", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAtcRecipientField(page, AirbusAocPage.AtcWhenCanWeRequest, leftX, 38);
-
             AddAirbusAocLabel(page, "EXPECT", leftX + 150, 38, 110, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             string selectedWcwType = GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwType, "HIGHER");
-            AddAirbusAocCycleBox(page, AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwType,
-                new[] { "HIGHER", "LOWER", "BACK ROUTE", "CLIMB", "DESCENT", "MACH", "SPEED", "DIRECT" },
-                selectedWcwType,
-                leftX + 150, 60, 88);
-
+            AddAirbusAocCycleBox(page, AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwType, new[] { "HIGHER", "LOWER", "BACK ROUTE", "CLIMB", "DESCENT", "MACH", "SPEED", "DIRECT" }, selectedWcwType, leftX + 150, 60, 88);
             bool wcwNeedsValue = AirbusAtcWhenCanWeNeedsValue(selectedWcwType);
             int remarksY = wcwNeedsValue ? 122 : 116;
             int remarksBottomOffset = wcwNeedsValue ? 144 : 138;
-
             if (wcwNeedsValue)
             {
                 AddAirbusAocLabel(page, "VALUE", leftX + 260, 38, 70, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
-                AddAirbusAocTextBox(page, AirbusAocInputWcwValue, GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwValue, string.Empty), leftX + 260, 60, 58, 7);
+                AddAirbusAocTextBox(page, AirbusAocInputWcwValue, GetStoredAirbusAocInput(AirbusAocPage.AtcWhenCanWeRequest, AirbusAocInputWcwValue, string.Empty), leftX + 260, 60, DcduStyleManager.IsA220 ? 150 : 58, 7);
                 AddAirbusAocLabel(page, "VALUE FOR CLIMB / DESCENT / MACH / SPEED / DIRECT", leftX, 92, rightEdge - leftX, 18, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
             }
             else
             {
                 AddAirbusAocLabel(page, "NO VALUE REQUIRED", leftX, 92, rightEdge - leftX, 18, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
             }
-
             AddAirbusAtcRemarksField(page, AirbusAocPage.AtcWhenCanWeRequest, leftX, remarksY, rightEdge - leftX, Math.Max(34, AirbusAocActionY(page) - remarksBottomOffset));
             AddAirbusAtcBottomActions(page);
             UpdateAirbusAocSendState();
@@ -16131,7 +18486,7 @@ airbusAocSendLabel = null;
             int rightEdge = page.Width - 22;
             int actionY = AirbusAocActionY(page);
 
-            AddAirbusAocLabel(page, title ?? "ATC TEXT REQUEST", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
+            if (DcduStyleManager.IsA220) AddA220AocHeader(page, "ATC MENU", title ?? "ATC TEXT REQUEST"); else AddAirbusAocLabel(page, title ?? "ATC TEXT REQUEST", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
             AddAirbusAtcRecipientField(page, AirbusAocPage.AtcTextRequest, leftX, 38);
             AddAirbusAocLabel(page, "ENTER ATC REQUEST TEXT", leftX, 82, rightEdge - leftX, 18, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocTextBox(page, AirbusAocInputFreeText, GetStoredAirbusAocInput(AirbusAocPage.AtcTextRequest, AirbusAocInputFreeText, prefill ?? string.Empty), leftX, 100, rightEdge - leftX, 220, true, Math.Max(40, actionY - 122));
@@ -16216,6 +18571,25 @@ airbusAocSendLabel = null;
         {
             PrepareAirbusAocPage(AirbusAocPage.MainMenu);
             Panel page = CreateAirbusAocCanvas();
+
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "AOC MENU");
+                int margin = S(18);
+                int gap = S(14);
+                int top = S(54);
+                int buttonHeight = S(44);
+                int buttonWidth = Math.Max(S(150), (page.Width - (margin * 2) - gap) / 2);
+                int rightX = margin + buttonWidth + gap;
+
+                AddA220AocButton(page, "ATC REQUEST", margin, top, buttonWidth, buttonHeight, ShowAirbusAocAtcRequestMenu);
+                AddA220AocButton(page, "WX REQUEST", rightX, top, buttonWidth, buttonHeight, () => ShowAirbusAocWeatherRequest(false));
+                AddA220AocButton(page, "ATIS REQUEST", margin, top + buttonHeight + gap, buttonWidth, buttonHeight, () => ShowAirbusAocWeatherRequest(true));
+                AddA220AocButton(page, "FREE TEXT", rightX, top + buttonHeight + gap, buttonWidth, buttonHeight, ShowAirbusAocFreeTextRequest);
+                AddA220AocButton(page, "RETURN", margin, top + ((buttonHeight + gap) * 2), buttonWidth, buttonHeight, CloseAirbusAocPages);
+                return;
+            }
+
             Font titleFont = AirbusAocTitleFont();
             Font menuFont = AirbusAocMenuFont();
             Color labelColor = MainPrimaryTextColor();
@@ -16235,6 +18609,20 @@ airbusAocSendLabel = null;
         {
             PrepareAirbusAocPage(AirbusAocPage.AtcRequestMenu);
             Panel page = CreateAirbusAocCanvas();
+
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "AOC MENU", "ATC REQUEST MENU");
+                int margin = S(18);
+                int top = S(54);
+                int buttonHeight = S(44);
+                int buttonWidth = Math.Min(page.Width - (margin * 2), S(360));
+                AddA220AocButton(page, "PRE DEP CLEARANCE", margin, top, buttonWidth, buttonHeight, ShowAirbusAocPreDepClearance);
+                AddA220AocButton(page, "OCEANIC CLEARANCE", margin, top + buttonHeight + S(14), buttonWidth, buttonHeight, ShowAirbusAocOceanicClearance);
+                AddA220AocButton(page, "RETURN / AOC MENU", margin, top + ((buttonHeight + S(14)) * 2), buttonWidth, buttonHeight, ShowAirbusAocMainMenu);
+                return;
+            }
+
             Font titleFont = AirbusAocTitleFont();
             Font menuFont = AirbusAocMenuFont();
             Color labelColor = MainPrimaryTextColor();
@@ -16248,6 +18636,269 @@ airbusAocSendLabel = null;
         }
 
         private void ShowAirbusAocPreDepClearance()
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                ShowLegacyAirbusAocPreDepClearance();
+                return;
+            }
+
+            PrepareAirbusAocPage(AirbusAocPage.PreDepClearance);
+            Panel page = CreateAirbusAocCanvas();
+            Color labelColor = MainPrimaryTextColor();
+            Font captionFont = AirbusAocCaptionFont();
+            Font valueFont = AirbusAocValueFont();
+
+            string departure = AirbusAocDeparture();
+            string arrival = AirbusAocArrival();
+            string callsignText = AirbusAocCallsign();
+            string aircraft = AirbusAocAircraft();
+            string station = string.IsNullOrWhiteSpace(pdcDiscoveryLogonCode)
+                ? departure
+                : pdcDiscoveryLogonCode.Trim().ToUpperInvariant();
+            string atisLetter = GetBestDepartureAtisLetter(departure);
+
+            AddA220AocHeader(
+                page,
+                "AOC MENU",
+                "ATC REQUEST MENU",
+                "AOC DEPARTURE REQUEST");
+
+            int margin = S(16);
+            int top = S(50);
+            int footerHeight = S(34);
+            int footerY = Math.Max(S(304), page.Height - footerHeight - S(6));
+            int dividerX = Math.Max(
+                S(448),
+                (int)Math.Round(page.Width * 0.68));
+            int leftWidth = Math.Max(
+                S(300),
+                dividerX - margin - S(18));
+            int rightX = dividerX + S(20);
+            int rightWidth = Math.Max(
+                S(150),
+                page.Width - rightX - margin);
+
+            AddAirbusAocVerticalRule(
+                page,
+                dividerX,
+                top,
+                Math.Max(S(170), footerY - top - S(10)));
+
+            // Left column: flight data and free text.
+            AddAirbusAocLabel(
+                page,
+                "ORIG / DEST",
+                margin, top,
+                leftWidth, S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocLabel(
+                page,
+                (departure + "/" + arrival).Trim('/'),
+                margin, top + S(19),
+                leftWidth, S(23),
+                ContentAlignment.MiddleLeft,
+                DcduTheme.Cyan, valueFont);
+
+            AddAirbusAocRule(
+                page,
+                top + S(48),
+                margin,
+                leftWidth);
+
+            int gateY = top + S(60);
+            AddAirbusAocLabel(
+                page,
+                "GATE NUMBER",
+                margin, gateY,
+                S(180), S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocTextBox(
+                page,
+                AirbusAocInputGate,
+                GetStoredAirbusAocInput(
+                    AirbusAocPage.PreDepClearance,
+                    AirbusAocInputGate,
+                    string.Empty),
+                margin,
+                gateY + S(19),
+                S(190),
+                8);
+
+            AddAirbusAocRule(
+                page,
+                gateY + S(55),
+                margin,
+                leftWidth);
+
+            int aircraftY = gateY + S(66);
+            AddAirbusAocLabel(
+                page,
+                "A/C TYPE",
+                margin, aircraftY,
+                S(120), S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocLabel(
+                page,
+                aircraft,
+                margin, aircraftY + S(19),
+                S(160), S(23),
+                ContentAlignment.MiddleLeft,
+                DcduTheme.Cyan, valueFont);
+
+            AddAirbusAocRule(
+                page,
+                aircraftY + S(48),
+                margin,
+                leftWidth);
+
+            int freeLabelY = aircraftY + S(60);
+            int freeBoxY = freeLabelY + S(20);
+
+            // Reserve a fixed visual gap above the footer. This prevents the
+            // multiline field/scrollbar from touching or hiding behind buttons.
+            int freeHeight = Math.Max(
+                S(54),
+                footerY - freeBoxY - S(14));
+
+            AddAirbusAocLabel(
+                page,
+                "OPTIONAL FREE TEXT",
+                margin, freeLabelY,
+                leftWidth, S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocTextBox(
+                page,
+                AirbusAocInputFreeText,
+                GetStoredAirbusAocInput(
+                    AirbusAocPage.PreDepClearance,
+                    AirbusAocInputFreeText,
+                    string.Empty),
+                margin,
+                freeBoxY,
+                leftWidth,
+                160,
+                true,
+                freeHeight);
+
+            // Right column: read-only callsign plus editable ATIS/station.
+            AddAirbusAocLabel(
+                page,
+                "ATC CALLSIGN",
+                rightX, top,
+                rightWidth, S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocLabel(
+                page,
+                callsignText,
+                rightX, top + S(19),
+                rightWidth, S(23),
+                ContentAlignment.MiddleLeft,
+                DcduTheme.Cyan, valueFont);
+
+            AddAirbusAocRule(
+                page,
+                top + S(48),
+                rightX,
+                rightWidth);
+
+            int atisY = top + S(60);
+            AddAirbusAocLabel(
+                page,
+                "ATIS ID",
+                rightX, atisY,
+                rightWidth, S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocTextBox(
+                page,
+                AirbusAocInputAtis,
+                GetStoredAirbusAocInput(
+                    AirbusAocPage.PreDepClearance,
+                    AirbusAocInputAtis,
+                    atisLetter),
+                rightX,
+                atisY + S(19),
+                Math.Min(rightWidth, S(104)),
+                1);
+
+            AddAirbusAocRule(
+                page,
+                atisY + S(55),
+                rightX,
+                rightWidth);
+
+            int stationY = atisY + S(66);
+            AddAirbusAocLabel(
+                page,
+                "STATION",
+                rightX, stationY,
+                rightWidth, S(18),
+                ContentAlignment.MiddleLeft,
+                labelColor, captionFont);
+
+            AddAirbusAocTextBox(
+                page,
+                AirbusAocInputStation,
+                GetStoredAirbusAocInput(
+                    AirbusAocPage.PreDepClearance,
+                    AirbusAocInputStation,
+                    station),
+                rightX,
+                stationY + S(19),
+                Math.Min(rightWidth, S(154)),
+                8);
+
+            AddAirbusAocLabel(
+                page,
+                "EDIT IF ATIS OR STATION CHANGES",
+                rightX,
+                stationY + S(57),
+                rightWidth,
+                S(32),
+                ContentAlignment.TopLeft,
+                Color.FromArgb(155, labelColor),
+                captionFont);
+
+            int buttonWidth = Math.Max(
+                S(190),
+                (page.Width - (margin * 3)) / 2);
+
+            AddA220AocButton(
+                page,
+                "RETURN / ATC REQ MENU",
+                margin,
+                footerY,
+                buttonWidth,
+                footerHeight,
+                ShowAirbusAocAtcRequestMenu);
+
+            airbusAocSendButton = AddA220AocButton(
+                page,
+                "SEND",
+                page.Width - margin - buttonWidth,
+                footerY,
+                buttonWidth,
+                footerHeight,
+                ShowAirbusAocPreDepClearanceConfirm,
+                true);
+
+            UpdateAirbusAocSendState();
+            FocusFirstAirbusAocInput();
+        }
+
+        private void ShowLegacyAirbusAocPreDepClearance()
         {
             PrepareAirbusAocPage(AirbusAocPage.PreDepClearance);
             Panel page = CreateAirbusAocCanvas();
@@ -16306,6 +18957,71 @@ airbusAocSendLabel = null;
 
         private void ShowAirbusAocOceanicClearance()
         {
+            if (!DcduStyleManager.IsA220)
+            {
+                ShowLegacyAirbusAocOceanicClearance();
+                return;
+            }
+
+            PrepareAirbusAocPage(AirbusAocPage.OceanicClearance);
+            Panel page = CreateAirbusAocCanvas();
+            Color labelColor = MainPrimaryTextColor();
+            Font captionFont = AirbusAocCaptionFont();
+            Font valueFont = AirbusAocValueFont();
+
+            int margin = S(18);
+            int top = S(54);
+            int footerY = Math.Max(S(250), page.Height - S(58));
+            int dividerX = Math.Max(S(470), (int)Math.Round(page.Width * 0.66));
+            int leftWidth = dividerX - margin - S(18);
+            int rightX = dividerX + S(22);
+            int rightWidth = page.Width - rightX - margin;
+
+            AddA220AocHeader(page, "AOC MENU", "ATC REQUEST MENU", "OCEANIC CLEARANCE");
+            AddAirbusAocVerticalRule(page, dividerX, top, Math.Max(S(160), footerY - top - S(12)));
+
+            AddAirbusAocLabel(page, "CALLSIGN", margin, top, S(140), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocLabel(page, AirbusAocCallsign(), margin, top + S(20), S(180), S(24), ContentAlignment.MiddleLeft, DcduTheme.Cyan, valueFont);
+            AddAirbusAocLabel(page, "ENTRY POINT", margin + S(220), top, S(150), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputEntryPoint,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputEntryPoint, string.Empty),
+                margin + S(220), top + S(20), S(170), 7);
+            AddAirbusAocRule(page, top + S(58), margin, leftWidth);
+
+            int row2 = top + S(72);
+            AddAirbusAocLabel(page, "ETA", margin, row2, S(100), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputEta,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputEta, string.Empty),
+                margin, row2 + S(20), S(110), 4);
+            AddAirbusAocLabel(page, "MACH", margin + S(140), row2, S(100), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputMach,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputMach, string.Empty),
+                margin + S(140), row2 + S(20), S(110), 2);
+            AddAirbusAocLabel(page, "FLIGHT LEVEL", margin + S(280), row2, S(150), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputFlightLevel,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputFlightLevel, string.Empty),
+                margin + S(280), row2 + S(20), S(130), 3);
+            AddAirbusAocRule(page, row2 + S(58), margin, leftWidth);
+
+            int remarksY = row2 + S(72);
+            AddAirbusAocLabel(page, "REMARKS", margin, remarksY, leftWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputRemarks,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputRemarks, string.Empty),
+                margin, remarksY + S(22), leftWidth, 160, true, Math.Max(S(72), footerY - remarksY - S(38)));
+
+            AddAirbusAocLabel(page, "RECIPIENT / STATION", rightX, top, rightWidth, S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputStation,
+                GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputStation, CurrentATCUnit ?? string.Empty),
+                rightX, top + S(20), Math.Min(rightWidth, S(170)), 8);
+
+            AddA220AocButton(page, "RETURN / ATC REQ MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAocAtcRequestMenu);
+            airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAocOceanicClearanceConfirm, true);
+            UpdateAirbusAocSendState();
+            FocusFirstAirbusAocInput();
+        }
+
+        private void ShowLegacyAirbusAocOceanicClearance()
+        {
             PrepareAirbusAocPage(AirbusAocPage.OceanicClearance);
             Panel page = CreateAirbusAocCanvas();
             Font titleFont = AirbusAocTitleFont();
@@ -16320,17 +19036,24 @@ airbusAocSendLabel = null;
             int rightX = Math.Max(292, rightEdge - 122);
             int actionY = AirbusAocActionY(page);
 
-            int row1LabelY = 28;
-            int row1ValueY = 44;
-            int row2LabelY = 66;
-            int row2BoxY = 82;
-            int row3LabelY = 103;
-            int row3BoxY = 118;
-            int freeLabelY = 138;
-            int freeBoxY = 153;
+            int row1LabelY = DcduStyleManager.IsA220 ? 52 : 28;
+            int row1ValueY = DcduStyleManager.IsA220 ? 68 : 44;
+            int row2LabelY = DcduStyleManager.IsA220 ? 92 : 66;
+            int row2BoxY = DcduStyleManager.IsA220 ? 108 : 82;
+            int row3LabelY = DcduStyleManager.IsA220 ? 132 : 103;
+            int row3BoxY = DcduStyleManager.IsA220 ? 147 : 118;
+            int freeLabelY = DcduStyleManager.IsA220 ? 170 : 138;
+            int freeBoxY = DcduStyleManager.IsA220 ? 185 : 153;
             int freeHeight = Math.Max(26, actionY - freeBoxY - 6);
 
-            AddAirbusAocLabel(page, "AOC OCEANIC CLEARANCE", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "AOC MENU", "ATC REQUEST MENU", "AOC OCEANIC CLEARANCE");
+            }
+            else
+            {
+                AddAirbusAocLabel(page, "AOC OCEANIC CLEARANCE", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, labelColor, titleFont);
+            }
             AddAirbusAocLabel(page, "CALLSIGN", leftX, row1LabelY, 120, 16, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocLabel(page, "ENTRY PT", rightX, row1LabelY, rightEdge - rightX, 16, ContentAlignment.MiddleRight, labelColor, captionFont);
             AddAirbusAocLabel(page, callsignText, leftX, row1ValueY, 150, 20, ContentAlignment.MiddleLeft, DcduTheme.Cyan, valueFont);
@@ -16350,13 +19073,76 @@ airbusAocSendLabel = null;
             AddAirbusAocLabel(page, "ENTER OPTIONAL FREE TEXT", leftX, freeLabelY, rightEdge - leftX, 16, ContentAlignment.MiddleLeft, labelColor, captionFont);
             AddAirbusAocTextBox(page, AirbusAocInputRemarks, GetStoredAirbusAocInput(AirbusAocPage.OceanicClearance, AirbusAocInputRemarks, string.Empty), leftX, freeBoxY, rightEdge - leftX, 160, true, freeHeight);
 
-            AddAirbusAocLabel(page, "<ATC REQ MENU", 14, actionY, 245, 30, ContentAlignment.MiddleLeft, labelColor, actionFont);
-            airbusAocSendLabel = AddAirbusAocLabel(page, "SEND", page.Width - 108, actionY, 96, 30, ContentAlignment.MiddleRight, DcduTheme.Cyan, actionFont);
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocButton(page, "RETURN / ATC REQ MENU", S(18), Math.Max(1, page.Height - S(58)), S(228), S(36), ShowAirbusAocAtcRequestMenu);
+                airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(S(18), page.Width - S(186)), Math.Max(1, page.Height - S(58)), S(168), S(36), ShowAirbusAocOceanicClearanceConfirm, true);
+            }
+            else
+            {
+                AddAirbusAocLabel(page, "<ATC REQ MENU", 14, actionY, 245, 30, ContentAlignment.MiddleLeft, labelColor, actionFont);
+                airbusAocSendLabel = AddAirbusAocLabel(page, "SEND", page.Width - 108, actionY, 96, 30, ContentAlignment.MiddleRight, DcduTheme.Cyan, actionFont);
+            }
             UpdateAirbusAocSendState();
             FocusFirstAirbusAocInput();
         }
 
         private void ShowAirbusAocWeatherRequest(bool atis)
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                ShowLegacyAirbusAocWeatherRequest(atis);
+                return;
+            }
+
+            AirbusAocPage pageKey = atis ? AirbusAocPage.AtisRequest : AirbusAocPage.WxRequest;
+            PrepareAirbusAocPage(pageKey);
+            Panel page = CreateAirbusAocCanvas();
+            Color labelColor = MainPrimaryTextColor();
+            Font captionFont = AirbusAocCaptionFont();
+
+            int margin = S(18);
+            int top = S(58);
+            int footerY = Math.Max(S(230), page.Height - S(58));
+            AddA220AocHeader(page, "AOC MENU", atis ? "ATIS REQUEST" : "WX REQUEST");
+
+            AddAirbusAocLabel(page, "STATION", margin, top, S(150), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputStation,
+                GetStoredAirbusAocInput(pageKey, AirbusAocInputStation, GetSuggestedAirbusAocStation()),
+                margin, top + S(22), S(180), 8);
+
+            if (atis)
+            {
+                int typeX = margin + S(220);
+                int autoX = typeX + S(190);
+                AddAirbusAocLabel(page, "ATIS TYPE", typeX, top, S(160), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, pageKey, AirbusAocInputAtisType,
+                    new[] { "NONE", "ARR", "DEP" },
+                    GetStoredAirbusAocInput(pageKey, AirbusAocInputAtisType, "NONE"),
+                    typeX, top + S(22), S(160));
+
+                AddAirbusAocLabel(page, "AUTO REFRESH", autoX, top, S(170), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+                AddAirbusAocCycleBox(page, pageKey, AirbusAocInputAtisAuto,
+                    new[] { "OFF", "ON" },
+                    GetStoredAirbusAocInput(pageKey, AirbusAocInputAtisAuto, IsAtisAutoRefreshEnabled() ? "ON" : "OFF"),
+                    autoX, top + S(22), S(150));
+
+                AddAirbusAocRule(page, top + S(70), margin, page.Width - (margin * 2));
+                AddAirbusAocLabel(page, "NONE = ICAO     ARR = ICAO_A     DEP = ICAO_D", margin, top + S(84), page.Width - (margin * 2), S(20), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+            }
+            else
+            {
+                AddAirbusAocRule(page, top + S(70), margin, page.Width - (margin * 2));
+                AddAirbusAocLabel(page, "ENTER THE ICAO CODE OF THE REQUIRED AERODROME", margin, top + S(84), page.Width - (margin * 2), S(20), ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+            }
+
+            AddA220AocButton(page, "RETURN / AOC MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAocMainMenu);
+            airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), () => { if (atis) ShowAirbusAocWeatherConfirm(true); else ShowAirbusAocWeatherConfirm(false); }, true);
+            UpdateAirbusAocSendState();
+            FocusFirstAirbusAocInput();
+        }
+
+        private void ShowLegacyAirbusAocWeatherRequest(bool atis)
         {
             PrepareAirbusAocPage(atis ? AirbusAocPage.AtisRequest : AirbusAocPage.WxRequest);
             Panel page = CreateAirbusAocCanvas();
@@ -16412,6 +19198,41 @@ airbusAocSendLabel = null;
         }
 
         private void ShowAirbusAocFreeTextRequest()
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                ShowLegacyAirbusAocFreeTextRequest();
+                return;
+            }
+
+            PrepareAirbusAocPage(AirbusAocPage.FreeTextRequest);
+            Panel page = CreateAirbusAocCanvas();
+            Color labelColor = MainPrimaryTextColor();
+            Font captionFont = AirbusAocCaptionFont();
+            int margin = S(18);
+            int top = S(58);
+            int footerY = Math.Max(S(250), page.Height - S(58));
+
+            AddA220AocHeader(page, "AOC MENU", "FREE TEXT");
+            AddAirbusAocLabel(page, "RECIPIENT / STATION", margin, top, S(220), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputStation,
+                GetStoredAirbusAocInput(AirbusAocPage.FreeTextRequest, AirbusAocInputStation, GetSuggestedAirbusAocFreeTextRecipient()),
+                margin, top + S(22), S(220), 8);
+
+            int msgY = top + S(72);
+            AddAirbusAocLabel(page, "MESSAGE", margin, msgY, S(140), S(18), ContentAlignment.MiddleLeft, labelColor, captionFont);
+            AddAirbusAocLabel(page, "MAX 255 CHARACTERS", page.Width - margin - S(210), msgY, S(210), S(18), ContentAlignment.MiddleRight, Color.FromArgb(175, labelColor), captionFont);
+            AddAirbusAocTextBox(page, AirbusAocInputFreeText,
+                GetStoredAirbusAocInput(AirbusAocPage.FreeTextRequest, AirbusAocInputFreeText, string.Empty),
+                margin, msgY + S(22), page.Width - (margin * 2), 255, true, Math.Max(S(100), footerY - msgY - S(42)));
+
+            AddA220AocButton(page, "RETURN / AOC MENU", margin, footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAocMainMenu);
+            airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(margin, page.Width - margin - Math.Max(S(210), (page.Width - (margin * 3)) / 2)), footerY, Math.Max(S(210), (page.Width - (margin * 3)) / 2), S(38), ShowAirbusAocFreeTextConfirm, true);
+            UpdateAirbusAocSendState();
+            FocusFirstAirbusAocInput();
+        }
+
+        private void ShowLegacyAirbusAocFreeTextRequest()
         {
             PrepareAirbusAocPage(AirbusAocPage.FreeTextRequest);
             Panel page = CreateAirbusAocCanvas();
@@ -16485,6 +19306,25 @@ airbusAocSendLabel = null;
                 // The real action is the adjacent hardware LSK/hotspot, so keep the label itself non-click-looking.
                 airbusAocSendLabel.Cursor = Cursors.Default;
                 airbusAocSendLabel.Invalidate();
+            }
+
+            if (airbusAocSendButton != null)
+            {
+                airbusAocSendButton.Enabled = airbusAocSendReady;
+                if (airbusAocSendButton is A220PanelButton a220SendButton)
+                {
+                    a220SendButton.AccentText = airbusAocSendReady;
+                }
+                else
+                {
+                    airbusAocSendButton.BackColor = airbusAocSendReady
+                        ? Color.FromArgb(49, 54, 60)
+                        : Color.FromArgb(34, 38, 43);
+                    airbusAocSendButton.ForeColor = airbusAocSendReady
+                        ? Color.WhiteSmoke
+                        : Color.FromArgb(165, 170, 175);
+                }
+                airbusAocSendButton.Invalidate();
             }
         }
 
@@ -16763,6 +19603,46 @@ airbusAocSendLabel = null;
             int actionTop = AirbusAocActionY(page);
             int boxHeight = Math.Max(48, Math.Min(72, actionTop - boxY - 18));
 
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "AOC SEND CONFIRM");
+
+                int infoY = S(showRouteHeader ? 38 : 0);
+                if (showRouteHeader)
+                {
+                    AddAirbusAocLabel(page, utcPrefix + airbusAocPendingInfo, S(18), infoY, page.Width - S(36), S(20), ContentAlignment.MiddleLeft, DcduTheme.Green, headerFont);
+                }
+
+                int a220TitleY = S(showRouteHeader ? 60 : 42);
+                AddAirbusAocLabel(page, airbusAocPendingTitle, S(18), a220TitleY, page.Width - S(36), S(22), ContentAlignment.MiddleLeft, MainPrimaryTextColor(), headerFont);
+                AddAirbusAocRule(page, a220TitleY + S(28), S(18), page.Width - S(36));
+
+                System.Windows.Forms.Label a220PreviewLabel = AddAirbusAocLabel(
+                    page,
+                    WrapAirbusAocPreviewText(airbusAocPendingPreview, 44),
+                    S(24),
+                    a220TitleY + S(42),
+                    Math.Max(1, page.Width - S(48)),
+                    Math.Max(S(52), Math.Min(S(90), page.Height - (a220TitleY + S(42)) - S(90))),
+                    ContentAlignment.MiddleLeft,
+                    Color.FromArgb(215, 226, 232),
+                    bodyFont);
+                a220PreviewLabel.BackColor = Color.FromArgb(64, 70, 76);
+                a220PreviewLabel.Padding = SPad(new Padding(12, 6, 10, 6));
+
+                int footerY = Math.Max(1, page.Height - S(58));
+                Button cancelButton = AddA220AocButton(page, "CANCEL", S(18), footerY, S(168), S(36), () => HandleAirbusAocLineSelect(false, 5));
+                cancelButton.ForeColor = Color.WhiteSmoke;
+
+                airbusAocSendButton = AddA220AocButton(page, "SEND", Math.Max(S(18), page.Width - S(186)), footerY, S(168), S(36), () => HandleAirbusAocLineSelect(true, 5));
+                if (airbusAocSendButton is A220PanelButton confirmSendButton)
+                {
+                    confirmSendButton.AccentText = true;
+                }
+                airbusAocSendButton.Enabled = true;
+                return;
+            }
+
             AddAirbusAocLabel(page, "AOC SEND CONFIRM", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, MainPrimaryTextColor(), titleFont);
             if (showRouteHeader)
             {
@@ -16794,6 +19674,116 @@ airbusAocSendLabel = null;
         {
             PrepareAirbusAocPage(AirbusAocPage.SendConfirm);
             Panel page = CreateAirbusAocCanvas();
+
+            if (DcduStyleManager.IsA220)
+            {
+                AddA220AocHeader(page, "AOC", "SEND STATUS");
+
+                string a220StatusRecipient = (recipient ?? string.Empty).Trim().ToUpperInvariant();
+                string a220StatusTitle = (title ?? string.Empty).Trim().ToUpperInvariant();
+                string a220StatusText = (statusText ?? string.Empty).Trim().ToUpperInvariant();
+                string a220StatusPreview = WrapAirbusAocPreviewText(previewText, 48);
+
+                int a220StatusMargin = S(18);
+                int a220StatusTop = S(50);
+                int a220StatusContentWidth = Math.Max(S(220), page.Width - (a220StatusMargin * 2));
+
+                if (!string.IsNullOrWhiteSpace(a220StatusRecipient))
+                {
+                    AddAirbusAocLabel(
+                        page,
+                        "TO  " + a220StatusRecipient,
+                        a220StatusMargin,
+                        a220StatusTop,
+                        a220StatusContentWidth,
+                        S(20),
+                        ContentAlignment.MiddleLeft,
+                        DcduTheme.Green,
+                        CreateDpiStablePointFont("Consolas", 10.6f, FontStyle.Bold));
+                }
+
+                AddAirbusAocLabel(
+                    page,
+                    a220StatusTitle,
+                    a220StatusMargin,
+                    a220StatusTop + S(30),
+                    a220StatusContentWidth,
+                    S(22),
+                    ContentAlignment.MiddleLeft,
+                    Color.WhiteSmoke,
+                    CreateDpiStablePointFont("Consolas", 10.6f, FontStyle.Regular));
+                AddAirbusAocRule(page, a220StatusTop + S(56), a220StatusMargin, a220StatusContentWidth);
+
+                Panel a220StatusPreviewFrame = new()
+                {
+                    BackColor = Color.FromArgb(54, 58, 63),
+                    Location = new Point(a220StatusMargin, a220StatusTop + S(70)),
+                    Size = new Size(a220StatusContentWidth, Math.Max(S(70), page.Height - (a220StatusTop + S(142))))
+                };
+                a220StatusPreviewFrame.Paint += (_, paintArgs) =>
+                {
+                    Rectangle a220StatusBounds = new Rectangle(
+                        0,
+                        0,
+                        Math.Max(1, a220StatusPreviewFrame.Width - 1),
+                        Math.Max(1, a220StatusPreviewFrame.Height - 1));
+                    using Pen a220StatusBorder = new Pen(Color.FromArgb(160, 164, 169), 1.0f);
+                    paintArgs.Graphics.DrawRectangle(a220StatusBorder, a220StatusBounds);
+                };
+                page.Controls.Add(a220StatusPreviewFrame);
+
+                AddAirbusAocLabel(
+                    a220StatusPreviewFrame,
+                    a220StatusPreview,
+                    S(12),
+                    S(8),
+                    Math.Max(1, a220StatusPreviewFrame.Width - S(24)),
+                    Math.Max(1, a220StatusPreviewFrame.Height - S(16)),
+                    ContentAlignment.MiddleLeft,
+                    DcduTheme.CyanWhite,
+                    CreateDpiStablePointFont("Consolas", 10.0f, FontStyle.Bold));
+
+                Color a220StatusColor = a220StatusText.Contains("FAILED", StringComparison.OrdinalIgnoreCase)
+                    ? Color.FromArgb(255, 116, 92)
+                    : a220StatusText.Contains("SENT", StringComparison.OrdinalIgnoreCase)
+                        ? Color.FromArgb(112, 255, 120)
+                        : DcduTheme.Cyan;
+
+                Panel a220StatusFooter = new()
+                {
+                    BackColor = Color.FromArgb(54, 58, 63),
+                    Location = new Point(a220StatusMargin, page.Height - S(44)),
+                    Size = new Size(a220StatusContentWidth, S(34))
+                };
+                a220StatusFooter.Paint += (_, paintArgs) =>
+                {
+                    Rectangle a220FooterBounds = new Rectangle(
+                        0,
+                        0,
+                        Math.Max(1, a220StatusFooter.Width - 1),
+                        Math.Max(1, a220StatusFooter.Height - 1));
+                    using Pen a220FooterBorder = new Pen(Color.FromArgb(146, 151, 156), 1.0f);
+                    paintArgs.Graphics.DrawRectangle(a220FooterBorder, a220FooterBounds);
+                };
+                page.Controls.Add(a220StatusFooter);
+                AddAirbusAocLabel(
+                    a220StatusFooter,
+                    a220StatusText,
+                    0,
+                    0,
+                    a220StatusFooter.Width,
+                    a220StatusFooter.Height,
+                    ContentAlignment.MiddleCenter,
+                    a220StatusColor,
+                    CreateDpiStablePointFont("Consolas", 11.0f, FontStyle.Bold));
+
+                a220StatusPreviewFrame.BringToFront();
+                a220StatusFooter.BringToFront();
+                screenPanel?.Refresh();
+                messageFormatPanel?.Refresh();
+                return;
+            }
+
             Font titleFont = AirbusAocTitleFont();
             Font headerFont = AirbusAocValueFont();
             Font bodyFont = CreateDpiStablePointFont("Consolas", 10.0f, FontStyle.Bold);
@@ -16923,6 +19913,10 @@ airbusAocSendLabel = null;
                     ShowAirbusAtcWhenCanWeRequest();
                     break;
 
+                case AirbusAocPage.AtcLogonRequest:
+                    ShowAirbusAtcLogonRequest();
+                    break;
+
                 default:
                     if (pendingKind == AirbusAocPendingSendKind.PreDepClearance)
                     {
@@ -16950,7 +19944,7 @@ airbusAocSendLabel = null;
             string recipient = airbusAocPendingRecipient;
             string message = airbusAocPendingMessage;
             string title = airbusAocPendingTitle;
-            string preview = airbusAocPendingPreview;
+            string previewText = airbusAocPendingPreview;
             bool autoRefresh = airbusAocPendingAutoRefresh;
 
             if (kind == AirbusAocPendingSendKind.None || string.IsNullOrWhiteSpace(recipient))
@@ -16959,7 +19953,7 @@ airbusAocSendLabel = null;
                 return;
             }
 
-            ShowAirbusAocSendStatusPage("SENDING....", recipient, title, preview);
+            ShowAirbusAocSendStatusPage("SENDING....", recipient, title, previewText);
             await Task.Delay(1200);
             ClearAirbusAocPendingSend();
 
@@ -16968,7 +19962,7 @@ airbusAocSendLabel = null;
                 switch (kind)
                 {
                     case AirbusAocPendingSendKind.PreDepClearance:
-                        WriteMessage("AOC PRE DEP CLEARANCE REQUEST", "TELEX", recipient, true);
+                        // The full outbound request is written once by SendCPDLCMessage after Hoppie accepts it.
                         await SendCPDLCMessage(recipient, "TELEX", message.Trim());
                         ClearStoredAirbusAocPage(AirbusAocPage.PreDepClearance);
                         break;
@@ -16999,6 +19993,10 @@ airbusAocSendLabel = null;
                         ClearStoredAirbusAocPage(AirbusAocPage.FreeTextRequest);
                         break;
 
+                    case AirbusAocPendingSendKind.ManualLogon:
+                        await CompleteManualCpdlcLogonAfterConfirmAsync(recipient);
+                        return;
+
                     case AirbusAocPendingSendKind.AtcRequest:
                         string atcPacket = (message ?? string.Empty).Trim();
                         if (!atcPacket.StartsWith("/data2/", StringComparison.OrdinalIgnoreCase))
@@ -17021,13 +20019,13 @@ airbusAocSendLabel = null;
                 {
                 }
 
-                ShowAirbusAocSendStatusPage("SEND FAILED", recipient, title, preview);
+                ShowAirbusAocSendStatusPage("SEND FAILED", recipient, title, previewText);
                 await Task.Delay(2200);
                 CloseAirbusAocPages();
                 return;
             }
 
-            ShowAirbusAocSendStatusPage("SENT", recipient, title, preview);
+            ShowAirbusAocSendStatusPage("SENT", recipient, title, previewText);
             await Task.Delay(1800);
             CloseAirbusAocPages();
         }
@@ -17048,6 +20046,7 @@ airbusAocSendLabel = null;
             airbusAocPage = AirbusAocPage.None;
             airbusAocInputs.Clear();
             airbusAocSendLabel = null;
+            airbusAocSendButton = null;
             airbusAocSendReady = false;
             ClearAirbusAocPendingSend();
             airbusAocFormValues.Clear();
@@ -17256,6 +20255,7 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                 lastNextFlightPlanCheckUtc = DateTime.MinValue;
                 lastPdcAvailabilityHintStation = string.Empty;
                 pendingLogon = null;
+                cpdlcSessionEstablished = false;
                 CurrentATCUnit = null;
                 SetAtisAutoRefresh(string.Empty, false);
                 lock (atisHoverLock)
@@ -17342,7 +20342,10 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
         private void ApplyMainWindowBounds(bool isBoeing)
         {
-            Size baseTargetSize = isBoeing ? new Size(660, 450) : new Size(700, 350);
+            bool isA220 = DcduStyleManager.IsA220;
+            Size baseTargetSize = isA220
+                ? new Size(760, 485)
+                : (isBoeing ? new Size(660, 450) : new Size(700, 350));
             Size targetSize = SS(baseTargetSize);
 
             if (ClientSize != targetSize)
@@ -17361,11 +20364,27 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                 dcduFrame.Invalidate();
             }
 
-            DcduWindowHelper.ApplyDeviceWindow(this, dcduFrame, S(22));
+            if (isA220)
+            {
+                ConfigureA220InteriorBackdrop();
+            }
+
+            DcduWindowHelper.ApplyDeviceWindow(this, dcduFrame, S(DcduStyleManager.IsA220 ? 14 : 22));
         }
 
         private void ApplyMainScreenLayout(bool isBoeing)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                ApplyA220MainScreenLayout();
+                return;
+            }
+
+            if (a220BlackScreenSurface != null)
+            {
+                a220BlackScreenSurface.Visible = false;
+            }
+
             if (isBoeing)
             {
                 // Boeing main layout scaled for the new 656x450 main window asset.
@@ -17489,6 +20508,21 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
         private void ApplyMainButtonLayout(bool isBoeing)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                // Existing hardware hotspots are not part of the A220 touchscreen.
+                retrieveButton.Location = SP(new Point(-500, -500));
+                telexButton.Location = SP(new Point(-500, -500));
+                atcButton.Location = SP(new Point(-500, -500));
+                settingsButton.Location = SP(new Point(-500, -500));
+                helpButton.Location = SP(new Point(-500, -500));
+                exitButton.Location = SP(new Point(-500, -500));
+                mainMinimizeButton.Bounds = SR(new Rectangle(-500, -500, 1, 1));
+                mainReloadFlightPlanButton.Bounds = SR(new Rectangle(-500, -500, 1, 1));
+                a220NavigationPanel?.BringToFront();
+                return;
+            }
+
             if (isBoeing)
             {
                 // Hitboxes tuned for the 656x450 Boeing main asset.
@@ -17545,13 +20579,867 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             UpdateMainFrameButtonHotspots(isBoeing);
         }
 
+
+        private void ConfigureA220InteriorBackdrop()
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                if (a220InteriorBackdrop != null)
+                {
+                    a220InteriorBackdrop.Visible = false;
+                }
+
+                return;
+            }
+
+            if (a220InteriorBackdrop == null || a220InteriorBackdrop.IsDisposed)
+            {
+                a220InteriorBackdrop = new Panel
+                {
+                    Name = "a220InteriorBackdrop",
+                    BackColor = Color.Black,
+                    Enabled = false,
+                    TabStop = false,
+                    Margin = Padding.Empty,
+                    Padding = Padding.Empty
+                };
+
+                if (dcduFrame != null)
+                {
+                    dcduFrame.Controls.Add(a220InteriorBackdrop);
+                }
+                else
+                {
+                    Controls.Add(a220InteriorBackdrop);
+                }
+
+                ApplyA220BlackGradient(a220InteriorBackdrop);
+            }
+            else if (dcduFrame != null && a220InteriorBackdrop.Parent != dcduFrame)
+            {
+                a220InteriorBackdrop.Parent?.Controls.Remove(a220InteriorBackdrop);
+                dcduFrame.Controls.Add(a220InteriorBackdrop);
+            }
+
+            // Cover the whole recessed inner area while keeping the metallic
+            // outer bezel and its rounded edge visible.
+            a220InteriorBackdrop.Location = SP(new Point(12, 9));
+            a220InteriorBackdrop.Size = SS(new Size(736, 465));
+            a220InteriorBackdrop.BackColor = Color.Black;
+
+            int radius = Math.Max(S(12), S(18));
+            Rectangle regionBounds = new(
+                0,
+                0,
+                Math.Max(1, a220InteriorBackdrop.Width),
+                Math.Max(1, a220InteriorBackdrop.Height));
+
+            using (GraphicsPath roundedPath = new())
+            {
+                int diameter = Math.Max(2, radius * 2);
+                Rectangle arc = new(
+                    regionBounds.Left,
+                    regionBounds.Top,
+                    diameter,
+                    diameter);
+
+                roundedPath.AddArc(arc, 180, 90);
+                arc.X = Math.Max(regionBounds.Left, regionBounds.Right - diameter);
+                roundedPath.AddArc(arc, 270, 90);
+                arc.Y = Math.Max(regionBounds.Top, regionBounds.Bottom - diameter);
+                roundedPath.AddArc(arc, 0, 90);
+                arc.X = regionBounds.Left;
+                roundedPath.AddArc(arc, 90, 90);
+                roundedPath.CloseFigure();
+
+                Region oldRegion = a220InteriorBackdrop.Region;
+                a220InteriorBackdrop.Region = new Region(roundedPath);
+                oldRegion?.Dispose();
+            }
+
+            ApplyA220BlackGradient(a220InteriorBackdrop);
+            a220InteriorBackdrop.Visible = true;
+            a220InteriorBackdrop.SendToBack();
+
+            // screenPanel may be hosted by the frame. Explicitly restore the
+            // intended order after the backing surface has been resized.
+            screenPanel?.BringToFront();
+            a220NavigationPanel?.BringToFront();
+        }
+
+        private void ConfigureA220Navigation()
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                if (a220NavigationPanel != null)
+                {
+                    a220NavigationPanel.Visible = false;
+                }
+
+                return;
+            }
+
+            if (a220NavigationPanel == null)
+            {
+                a220NavigationPanel = new Panel
+                {
+                    BackColor = Color.Black,
+                    Padding = new Padding(0),
+                    Margin = new Padding(0)
+                };
+
+                AddA220NavigationButton("CONN", () =>
+                {
+                    // Use the exact same connection/disconnection path as the
+                    // AIRBUS and BOEING frame hotspot. This includes the normal
+                    // VATSIM offline/not-found messages and all cleanup logic.
+                    a220ActiveNavigationKey = "CONN";
+                    CloseAirbusAocPages();
+                    RetrieveButton_Click(retrieveButton, EventArgs.Empty);
+                    UpdateA220NavigationVisuals();
+                });
+                AddA220NavigationButton("AOC", () =>
+                {
+                    // Call the original handler directly. Hidden hotspot buttons
+                    // are not guaranteed to execute PerformClick reliably.
+                    a220ActiveNavigationKey = "AOC";
+                    TelexButton_Click(telexButton, EventArgs.Empty);
+                    UpdateA220NavigationVisuals();
+                });
+                AddA220NavigationButton("ATC", () =>
+                {
+                    a220ActiveNavigationKey = "ATC";
+                    RequestButton_Click(atcButton, EventArgs.Empty);
+                    UpdateA220NavigationVisuals();
+                });
+                AddA220NavigationButton("RLD FP", () =>
+                {
+                    a220ActiveNavigationKey = "RLD FP";
+                    ReloadFlightPlanButton_Click(mainReloadFlightPlanButton, EventArgs.Empty);
+                    UpdateA220NavigationVisuals();
+                });
+                AddA220NavigationButton("SETUP", () =>
+                {
+                    a220ActiveNavigationKey = "SETUP";
+                    SettingsButton_Click(settingsButton, EventArgs.Empty);
+                    UpdateA220NavigationVisuals();
+                });
+
+                a220MinimizeButton = new A220PanelButton
+                {
+                    Text = "MIN",
+                    Font = CreateDpiStablePointFont("Consolas", 9.6f, FontStyle.Regular),
+                    AccessibleName = "Minimize EasyCPDLC"
+                };
+                a220MinimizeButton.Click += (_, __) => Hide();
+                a220NavigationPanel.Controls.Add(a220MinimizeButton);
+
+                a220CloseButton = new A220PanelButton
+                {
+                    Text = "CLOSE",
+                    Font = CreateDpiStablePointFont("Consolas", 9.6f, FontStyle.Regular)
+                };
+                a220CloseButton.Click += (_, __) => ExitButton_Click(a220CloseButton, EventArgs.Empty);
+                a220NavigationPanel.Controls.Add(a220CloseButton);
+
+                Controls.Add(a220NavigationPanel);
+            }
+
+            a220NavigationPanel.Visible = true;
+            // Keep the complete top row inside the straight section of the
+            // rounded bezel. The previous row started inside the corner radius
+            // and visually crossed the outer frame.
+            a220NavigationPanel.Location = SP(new Point(34, 24));
+            a220NavigationPanel.Size = SS(new Size(692, 30));
+
+            int gap = S(4);
+            int minimizeWidth = S(50);
+            int closeWidth = S(66);
+            int navHeight = a220NavigationPanel.Height;
+            int buttonWidth = Math.Max(
+                S(92),
+                (a220NavigationPanel.Width - minimizeWidth - closeWidth - (gap * 6)) / 5);
+            int x = 0;
+            foreach (string key in new[] { "CONN", "AOC", "ATC", "RLD FP", "SETUP" })
+            {
+                Button button = a220NavigationButtons[key];
+                button.Location = new Point(x, 0);
+                button.Size = new Size(buttonWidth, navHeight);
+                x += buttonWidth + gap;
+            }
+
+            if (a220MinimizeButton != null)
+            {
+                a220MinimizeButton.Location = new Point(
+                    a220NavigationPanel.Width - closeWidth - gap - minimizeWidth,
+                    0);
+                a220MinimizeButton.Size = new Size(minimizeWidth, navHeight);
+                a220MinimizeButton.BringToFront();
+            }
+
+            if (a220CloseButton != null)
+            {
+                a220CloseButton.Location = new Point(a220NavigationPanel.Width - closeWidth, 0);
+                a220CloseButton.Size = new Size(closeWidth, navHeight);
+                a220CloseButton.BringToFront();
+            }
+
+            SyncA220NavigationAvailability();
+            UpdateA220NavigationVisuals();
+            a220InteriorBackdrop?.SendToBack();
+            screenPanel?.BringToFront();
+            a220NavigationPanel.BringToFront();
+        }
+
+        private void AddA220NavigationButton(string key, Action action)
+        {
+            A220PanelButton button = new()
+            {
+                Text = key,
+                Font = CreateDpiStablePointFont("Consolas", 9.8f, FontStyle.Regular)
+            };
+            button.Click += (_, __) =>
+            {
+                SyncA220NavigationAvailability();
+                if (!IsA220NavigationAvailable(key))
+                {
+                    return;
+                }
+
+                action();
+            };
+            a220NavigationButtons[key] = button;
+            a220NavigationPanel.Controls.Add(button);
+        }
+
+        private bool IsA220NavigationAvailable(string key)
+        {
+            switch ((key ?? string.Empty).Trim().ToUpperInvariant())
+            {
+                case "CONN":
+                    return retrieveButton == null || retrieveButton.Enabled;
+
+                case "AOC":
+                    return telexButton != null && telexButton.Enabled;
+
+                case "ATC":
+                    return atcButton != null && atcButton.Enabled;
+
+                case "RLD FP":
+                    return mainReloadFlightPlanButton != null && mainReloadFlightPlanButton.Enabled;
+
+                case "SETUP":
+                    return settingsButton == null || settingsButton.Enabled;
+
+                default:
+                    return false;
+            }
+        }
+
+        private void SyncA220NavigationAvailability()
+        {
+            if (!DcduStyleManager.IsA220 || a220NavigationPanel == null)
+            {
+                return;
+            }
+
+            bool activePageStillAvailable = true;
+
+            foreach (KeyValuePair<string, Button> item in a220NavigationButtons)
+            {
+                bool enabled = IsA220NavigationAvailable(item.Key);
+                item.Value.Enabled = enabled;
+                item.Value.Cursor = enabled ? Cursors.Hand : Cursors.Default;
+
+                if (string.Equals(item.Key, a220ActiveNavigationKey, StringComparison.OrdinalIgnoreCase) &&
+                    !enabled)
+                {
+                    activePageStillAvailable = false;
+                }
+            }
+
+            if (a220MinimizeButton != null)
+            {
+                bool enabled = mainMinimizeButton == null || mainMinimizeButton.Enabled;
+                a220MinimizeButton.Enabled = enabled;
+                a220MinimizeButton.Cursor = enabled ? Cursors.Hand : Cursors.Default;
+            }
+
+            if (a220CloseButton != null)
+            {
+                bool enabled = exitButton == null || exitButton.Enabled;
+                a220CloseButton.Enabled = enabled;
+                a220CloseButton.Cursor = enabled ? Cursors.Hand : Cursors.Default;
+            }
+
+            if (!activePageStillAvailable &&
+                !string.Equals(a220ActiveNavigationKey, "CONN", StringComparison.OrdinalIgnoreCase))
+            {
+                a220ActiveNavigationKey = "CONN";
+                CloseAirbusAocPages();
+            }
+
+            UpdateA220NavigationVisuals();
+        }
+
+        private void UpdateA220NavigationVisuals()
+        {
+            if (!DcduStyleManager.IsA220 || a220NavigationPanel == null)
+            {
+                return;
+            }
+
+            foreach (KeyValuePair<string, Button> item in a220NavigationButtons)
+            {
+                bool enabled = IsA220NavigationAvailable(item.Key);
+                if (item.Value.Enabled != enabled)
+                {
+                    item.Value.Enabled = enabled;
+                    item.Value.Cursor = enabled ? Cursors.Hand : Cursors.Default;
+                }
+
+                bool active = enabled &&
+                    string.Equals(item.Key, a220ActiveNavigationKey, StringComparison.OrdinalIgnoreCase);
+                if (item.Value is A220PanelButton a220Button)
+                {
+                    a220Button.Active = active;
+                }
+                else
+                {
+                    item.Value.BackColor = active
+                        ? Color.FromArgb(20, 92, 186)
+                        : Color.FromArgb(132, 132, 132);
+                }
+
+                item.Value.Invalidate();
+            }
+        }
+
+        private void ApplyA220MainScreenLayout()
+        {
+            ConfigureSmartWidgets();
+
+            if (screenPanel == null ||
+                outputTable == null ||
+                messageFormatPanel == null ||
+                clearanceStatusLabel == null ||
+                datalinkStatusLabel == null ||
+                atisStatusLabel == null ||
+                atisAutoStatusLabel == null ||
+                quickWxStatusLabel == null ||
+                cpdlcDiscoveryLabel == null ||
+                messageFilterLabel == null)
+            {
+                Logger.Warn("A220 layout was deferred because its controls were not initialised.");
+                return;
+            }
+
+            if (outputTable.ColumnStyles.Count >= 3)
+            {
+                outputTable.ColumnStyles[0].SizeType = SizeType.Absolute;
+                outputTable.ColumnStyles[0].Width = SF(68F);
+                outputTable.ColumnStyles[1].SizeType = SizeType.Percent;
+                outputTable.ColumnStyles[1].Width = 100F;
+                outputTable.ColumnStyles[2].SizeType = SizeType.Absolute;
+                outputTable.ColumnStyles[2].Width = OpenMessageActionsIndicatorWidth();
+            }
+
+            BackColor = DcduTheme.TransparentKey;
+            // Align the screen recess with the inset navigation row, leaving
+            // equal side margins and a visible gap below the buttons.
+            screenPanel.Location = SP(new Point(34, 64));
+            screenPanel.Size = SS(new Size(692, 383));
+            screenPanel.BackColor = Color.Black;
+            screenPanel.DrawScreenBackground = false;
+            ApplyA220BlackGradient(screenPanel);
+
+            titleLabel.Visible = false;
+            clockLabel.Visible = false;
+
+            foreach (System.Windows.Forms.Label a220MainLabel in new[]
+            {
+                statusCaptionLabel, statusValueLabel, callsignCaptionLabel, callsignDisplayLabel,
+                routeCaptionLabel, callsignRouteLabel, flightPhaseCaptionLabel, flightPhaseLabel,
+                atcUnitLabel, atcUnitDisplay, nextAtcUnitLabel, nextAtcUnitDisplay,
+                messageHeaderLabel, cpdlcDiscoveryLabel
+            })
+            {
+                if (a220MainLabel != null)
+                {
+                    a220MainLabel.BackColor = Color.Transparent;
+                }
+            }
+
+            if (a220BlackScreenSurface != null)
+            {
+                a220BlackScreenSurface.Visible = false;
+            }
+
+            Font a220Caption = CreateDpiStablePointFont("Consolas", 9.5f, FontStyle.Regular);
+            Font a220Value = CreateDpiStablePointFont("Consolas", 9.8f, FontStyle.Bold);
+
+            statusCaptionLabel.Location = SP(new Point(16, 12));
+            statusCaptionLabel.Size = SS(new Size(90, 18));
+            statusCaptionLabel.Font = a220Caption;
+            statusValueLabel.Location = SP(new Point(112, 12));
+            statusValueLabel.Size = SS(new Size(158, 18));
+            statusValueLabel.Font = a220Value;
+
+            callsignCaptionLabel.Location = SP(new Point(16, 34));
+            callsignCaptionLabel.Size = SS(new Size(90, 18));
+            callsignCaptionLabel.Font = a220Caption;
+            callsignDisplayLabel.Location = SP(new Point(112, 34));
+            callsignDisplayLabel.Size = SS(new Size(158, 18));
+            callsignDisplayLabel.Font = a220Value;
+
+            routeCaptionLabel.Location = SP(new Point(16, 56));
+            routeCaptionLabel.Size = SS(new Size(90, 18));
+            routeCaptionLabel.Font = a220Caption;
+            callsignRouteLabel.Location = SP(new Point(112, 56));
+            callsignRouteLabel.Size = SS(new Size(190, 18));
+            callsignRouteLabel.Font = a220Value;
+
+            flightPhaseCaptionLabel.Location = SP(new Point(16, 78));
+            flightPhaseCaptionLabel.Size = SS(new Size(90, 18));
+            flightPhaseCaptionLabel.Font = a220Caption;
+            flightPhaseLabel.Location = SP(new Point(112, 78));
+            flightPhaseLabel.Size = SS(new Size(190, 18));
+            flightPhaseLabel.Font = a220Value;
+
+            // CURRENT ATS UNIT block. The state buttons now sit immediately below
+            // the heading/value row as one compact group.
+            atcUnitLabel.Location = SP(new Point(354, 12));
+            atcUnitLabel.Size = SS(new Size(150, 18));
+            atcUnitLabel.Text = "CURRENT ATS UNIT:";
+            atcUnitLabel.Font = a220Caption;
+
+            cpdlcDiscoveryLabel.Location = SP(new Point(506, 11));
+            cpdlcDiscoveryLabel.Size = SS(new Size(18, 18));
+
+            atcUnitDisplay.Location = SP(new Point(530, 12));
+            atcUnitDisplay.Size = SS(new Size(112, 18));
+            atcUnitDisplay.Font = a220Value;
+
+            clearanceStatusLabel.Location = SP(new Point(354, 38));
+            clearanceStatusLabel.Size = SS(new Size(54, 24));
+            datalinkStatusLabel.Location = SP(new Point(414, 38));
+            datalinkStatusLabel.Size = SS(new Size(54, 24));
+            atisStatusLabel.Location = SP(new Point(474, 38));
+            atisStatusLabel.Size = SS(new Size(54, 24));
+            atisAutoStatusLabel.Location = SP(new Point(534, 38));
+            atisAutoStatusLabel.Size = SS(new Size(42, 24));
+            quickWxStatusLabel.Location = SP(new Point(582, 38));
+            quickWxStatusLabel.Size = SS(new Size(42, 24));
+
+            if (nextAtcUnitLabel != null)
+            {
+                nextAtcUnitLabel.Location = SP(new Point(354, 72));
+                nextAtcUnitLabel.Size = SS(new Size(174, 18));
+                nextAtcUnitLabel.Font = a220Caption;
+            }
+            if (nextAtcUnitDisplay != null)
+            {
+                nextAtcUnitDisplay.Location = SP(new Point(530, 72));
+                nextAtcUnitDisplay.Size = SS(new Size(112, 18));
+                nextAtcUnitDisplay.Font = a220Value;
+            }
+
+            messageHeaderLabel.Location = SP(new Point(16, 112));
+            messageHeaderLabel.Size = SS(new Size(126, 22));
+            messageHeaderLabel.Text = "MESSAGES / DATA";
+            messageHeaderLabel.Font = CreateDpiStablePointFont("Consolas", 10.0f, FontStyle.Bold);
+
+            // Keep the filter visually attached to DATA instead of floating far right.
+            messageFilterLabel.Location = SP(new Point(148, 110));
+            messageFilterLabel.Size = SS(new Size(70, 22));
+            messageFilterLabel.Font = CreateDpiStablePointFont("Consolas", 9.2f, FontStyle.Regular);
+
+            outputTable.Location = SP(new Point(16, 146));
+            outputTable.Size = SS(new Size(676, 221));
+            outputTable.Padding = SPad(new Padding(4, 5, 4, 5));
+            outputTable.BackColor = Color.Transparent;
+
+            messageFormatPanel.Location = SP(new Point(16, 146));
+            messageFormatPanel.Size = SS(new Size(676, 221));
+            messageFormatPanel.BackColor = Color.Transparent;
+
+            SendingProgress.Location = SP(new Point(16, 374));
+            SendingProgress.Size = SS(new Size(676, 7));
+
+            outputScrollBar.Location = SP(new Point(694, 146));
+            outputScrollBar.Size = SS(new Size(10, 221));
+            outputScrollBar.Target = outputTable;
+            outputScrollBar.Invalidate();
+
+            if (clearanceTimelinePopupPanel != null)
+            {
+                PositionClearanceTimelinePopup();
+            }
+            if (atisAvailabilityPopupPanel != null)
+            {
+                PositionAtisAvailabilityPopup();
+            }
+            if (atisAutoPopupPanel != null)
+            {
+                PositionAtisAutoPopup();
+            }
+
+            EnsureA220GuideLine("a220TopSectionDivider", 16, 102, 688, 1);
+            EnsureA220GuideLine("a220StatusAtsDivider", 334, 12, 1, 84);
+            EnsureA220GuideLine("a220MessagesDivider", 16, 138, 688, 1);
+
+            if (onlineStatusLabel != null)
+            {
+                onlineStatusLabel.Visible = false;
+            }
+
+            clearanceStatusLabel.BringToFront();
+            datalinkStatusLabel.BringToFront();
+            atisStatusLabel.BringToFront();
+            atisAutoStatusLabel.BringToFront();
+            quickWxStatusLabel.BringToFront();
+            messageFilterLabel.BringToFront();
+
+            UpdateMainFrameButtonHotspots(false);
+            UpdateSmartStatusLabelColors();
+            UpdateMessageFilterLabel();
+            UpdateOnlineStatusLabel();
+            UpdateClearanceStatusLabel();
+            UpdateCallsignDisplay();
+            UpdateFlightPhaseBadge();
+        }
+
+        private void ApplyA220BlackGradient(Control surface)
+        {
+            if (surface == null || surface.IsDisposed)
+            {
+                return;
+            }
+
+            surface.BackColor = Color.Black;
+
+            // Nested panels intentionally share this exact background value.
+
+            if (a220BlackGradientSurfaces.Add(surface))
+            {
+                surface.Paint += PaintA220BlackGradient;
+                surface.Disposed += (_, __) => a220BlackGradientSurfaces.Remove(surface);
+            }
+
+            surface.Invalidate(true);
+        }
+
+        private void PaintA220BlackGradient(object sender, PaintEventArgs e)
+        {
+            if (!DcduStyleManager.IsA220 || sender is not Control surface)
+            {
+                return;
+            }
+
+            Rectangle bounds = surface.ClientRectangle;
+            if (bounds.Width <= 0 || bounds.Height <= 0)
+            {
+                return;
+            }
+
+            // Every A220 panel samples the same global display effect. The phase is
+            // based on screen coordinates, so nested WinForms panels cannot restart
+            // the gradient or scanline pattern and create visible seams.
+            Rectangle referenceScreenBounds;
+            try
+            {
+                if (a220InteriorBackdrop != null &&
+                    !a220InteriorBackdrop.IsDisposed &&
+                    a220InteriorBackdrop.IsHandleCreated)
+                {
+                    referenceScreenBounds = a220InteriorBackdrop.RectangleToScreen(
+                        a220InteriorBackdrop.ClientRectangle);
+                }
+                else if (surface.FindForm() is Form hostForm && hostForm.IsHandleCreated)
+                {
+                    referenceScreenBounds = hostForm.RectangleToScreen(
+                        hostForm.ClientRectangle);
+                }
+                else
+                {
+                    referenceScreenBounds = surface.RectangleToScreen(bounds);
+                }
+            }
+            catch
+            {
+                referenceScreenBounds = new Rectangle(
+                    0,
+                    0,
+                    Math.Max(1, bounds.Width),
+                    Math.Max(1, bounds.Height));
+            }
+
+            Rectangle surfaceScreenBounds;
+            try
+            {
+                surfaceScreenBounds = surface.RectangleToScreen(bounds);
+            }
+            catch
+            {
+                surfaceScreenBounds = new Rectangle(
+                    referenceScreenBounds.Left,
+                    referenceScreenBounds.Top,
+                    bounds.Width,
+                    bounds.Height);
+            }
+
+            int referenceHeight = Math.Max(1, referenceScreenBounds.Height);
+            int gradientTop = referenceScreenBounds.Top - surfaceScreenBounds.Top;
+
+            e.Graphics.SmoothingMode = SmoothingMode.None;
+            e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+            e.Graphics.Clear(Color.Black);
+
+            // Near-black LCD depth: only a tiny luminance difference from top to
+            // bottom, with no blue tint.
+            Rectangle globalGradientBounds = new(
+                0,
+                gradientTop,
+                Math.Max(1, bounds.Width),
+                referenceHeight);
+
+            using (LinearGradientBrush lcdGradient = new(
+                globalGradientBounds,
+                Color.FromArgb(12, 12, 13),
+                Color.Black,
+                LinearGradientMode.Vertical))
+            {
+                e.Graphics.FillRectangle(lcdGradient, bounds);
+            }
+
+            // A very soft reflection across the upper part of the complete display.
+            int reflectionHeight = Math.Max(1, referenceHeight / 5);
+            Rectangle reflectionScreenBounds = new(
+                referenceScreenBounds.Left,
+                referenceScreenBounds.Top,
+                referenceScreenBounds.Width,
+                reflectionHeight);
+
+            Rectangle reflectionIntersection = Rectangle.Intersect(
+                surfaceScreenBounds,
+                reflectionScreenBounds);
+
+            if (reflectionIntersection.Width > 0 && reflectionIntersection.Height > 0)
+            {
+                Rectangle localReflection = new(
+                    reflectionIntersection.Left - surfaceScreenBounds.Left,
+                    reflectionIntersection.Top - surfaceScreenBounds.Top,
+                    reflectionIntersection.Width,
+                    reflectionIntersection.Height);
+
+                Rectangle fullReflectionGradient = new(
+                    0,
+                    referenceScreenBounds.Top - surfaceScreenBounds.Top,
+                    Math.Max(1, bounds.Width),
+                    reflectionHeight);
+
+                using LinearGradientBrush reflectionBrush = new(
+                    fullReflectionGradient,
+                    Color.FromArgb(8, 255, 255, 255),
+                    Color.FromArgb(0, 255, 255, 255),
+                    LinearGradientMode.Vertical);
+                e.Graphics.FillRectangle(reflectionBrush, localReflection);
+            }
+
+            // Fine horizontal LCD scanlines, aligned globally across every panel.
+            int scanlineSpacing = Math.Max(3, S(3));
+            int globalYOffset = surfaceScreenBounds.Top - referenceScreenBounds.Top;
+            int firstScanline = (scanlineSpacing -
+                ((globalYOffset % scanlineSpacing) + scanlineSpacing) %
+                scanlineSpacing) % scanlineSpacing;
+
+            using Pen scanlinePen = new(Color.FromArgb(7, 255, 255, 255), 1.0f);
+            for (int y = firstScanline; y < bounds.Height; y += scanlineSpacing)
+            {
+                e.Graphics.DrawLine(
+                    scanlinePen,
+                    bounds.Left,
+                    y,
+                    Math.Max(bounds.Left, bounds.Right - 1),
+                    y);
+            }
+
+            // Sparse deterministic phosphor grain. Its global coordinate phase also
+            // remains continuous when controls overlap or are rebuilt after scaling.
+            int grainStepX = Math.Max(11, S(11));
+            int grainStepY = Math.Max(13, S(13));
+            int globalXOffset = surfaceScreenBounds.Left - referenceScreenBounds.Left;
+            int firstGrainX = (grainStepX -
+                ((globalXOffset % grainStepX) + grainStepX) %
+                grainStepX) % grainStepX;
+            int firstGrainY = (grainStepY -
+                ((globalYOffset % grainStepY) + grainStepY) %
+                grainStepY) % grainStepY;
+
+            using SolidBrush grainBrush = new(Color.FromArgb(5, 255, 255, 255));
+            for (int y = firstGrainY; y < bounds.Height; y += grainStepY)
+            {
+                int rowShift = ((surfaceScreenBounds.Top + y) / grainStepY) % 2 == 0
+                    ? 0
+                    : grainStepX / 2;
+
+                for (int x = firstGrainX + rowShift; x < bounds.Width; x += grainStepX)
+                {
+                    e.Graphics.FillRectangle(grainBrush, x, y, 1, 1);
+                }
+            }
+        }
+
+        private void EnsureA220BlackScreenSurface()
+        {
+            if (screenPanel == null || screenPanel.IsDisposed)
+            {
+                return;
+            }
+
+            if (a220BlackScreenSurface == null || a220BlackScreenSurface.IsDisposed)
+            {
+                a220BlackScreenSurface = new Panel
+                {
+                    Name = "a220BlackScreenSurface",
+                    BackColor = Color.Black,
+                    Enabled = false,
+                    TabStop = false,
+                    Margin = Padding.Empty,
+                    Padding = Padding.Empty
+                };
+                screenPanel.Controls.Add(a220BlackScreenSurface);
+            }
+
+            // Leave a narrow edge visible so the recessed LCD border remains intact.
+            int inset = Math.Max(1, S(2));
+            a220BlackScreenSurface.Location = new Point(inset, inset);
+            a220BlackScreenSurface.Size = new Size(
+                Math.Max(1, screenPanel.ClientSize.Width - (inset * 2)),
+                Math.Max(1, screenPanel.ClientSize.Height - (inset * 2)));
+            a220BlackScreenSurface.BackColor = Color.Black;
+            ApplyA220BlackGradient(a220BlackScreenSurface);
+            a220BlackScreenSurface.Visible = true;
+            a220BlackScreenSurface.SendToBack();
+        }
+
+        private void SetA220MainGuideLinesVisible(bool visible)
+        {
+            if (screenPanel == null || screenPanel.IsDisposed)
+            {
+                return;
+            }
+
+            foreach (string guideName in new[]
+            {
+                "a220TopSectionDivider",
+                "a220StatusAtsDivider",
+                "a220MessagesDivider"
+            })
+            {
+                Control guide = screenPanel.Controls
+                    .Find(guideName, false)
+                    .FirstOrDefault();
+
+                if (guide != null && !guide.IsDisposed)
+                {
+                    guide.Visible = visible;
+                }
+            }
+        }
+
+        private void EnsureA220GuideLine(string name, int x, int y, int width, int height)
+        {
+            if (screenPanel == null)
+            {
+                return;
+            }
+
+            Panel guide = screenPanel.Controls.Find(name, false).OfType<Panel>().FirstOrDefault();
+            if (guide == null)
+            {
+                guide = new Panel
+                {
+                    Name = name,
+                    Enabled = false,
+                    TabStop = false,
+                    BackColor = Color.FromArgb(72, 122, 132, 142)
+                };
+                screenPanel.Controls.Add(guide);
+            }
+
+            guide.Location = SP(new Point(x, y));
+            guide.Size = SS(new Size(Math.Max(1, width), Math.Max(1, height)));
+            guide.Visible = true;
+            guide.SendToBack();
+        }
+
+        private void PositionClearanceTimelinePopup()
+        {
+            if (clearanceTimelinePopupPanel == null || screenPanel == null)
+            {
+                return;
+            }
+
+            int popupWidth = DcduStyleManager.IsA220 ? S(224) : S(282);
+            int popupHeight = DcduStyleManager.IsA220 ? S(104) : S(118);
+            clearanceTimelinePopupPanel.Size = new Size(popupWidth, popupHeight);
+
+            int x = clearanceStatusLabel != null ? clearanceStatusLabel.Left : S(182);
+            int y = clearanceStatusLabel != null ? clearanceStatusLabel.Bottom + S(4) : S(82);
+            x = Math.Max(S(6), Math.Min(x, screenPanel.Width - popupWidth - S(6)));
+            y = Math.Max(S(6), Math.Min(y, screenPanel.Height - popupHeight - S(6)));
+            clearanceTimelinePopupPanel.Location = new Point(x, y);
+        }
+
+        private void PositionAtisAvailabilityPopup()
+        {
+            if (atisAvailabilityPopupPanel == null || screenPanel == null)
+            {
+                return;
+            }
+
+            int popupWidth = DcduStyleManager.IsA220 ? S(224) : S(282);
+            int popupHeight = DcduStyleManager.IsA220 ? S(104) : S(118);
+            atisAvailabilityPopupPanel.Size = new Size(popupWidth, popupHeight);
+
+            int x = atisStatusLabel != null ? atisStatusLabel.Left - S(24) : S(182);
+            int y = atisStatusLabel != null ? atisStatusLabel.Bottom + S(4) : S(82);
+            x = Math.Max(S(6), Math.Min(x, screenPanel.Width - popupWidth - S(6)));
+            y = Math.Max(S(6), Math.Min(y, screenPanel.Height - popupHeight - S(6)));
+            atisAvailabilityPopupPanel.Location = new Point(x, y);
+        }
+
+        private void PositionAtisAutoPopup()
+        {
+            if (atisAutoPopupPanel == null || screenPanel == null)
+            {
+                return;
+            }
+
+            int popupWidth = S(166);
+            int popupHeight = S(58);
+            atisAutoPopupPanel.Size = new Size(popupWidth, popupHeight);
+
+            int x = atisAutoStatusLabel != null ? atisAutoStatusLabel.Left - S(22) : S(298);
+            int y = atisAutoStatusLabel != null ? atisAutoStatusLabel.Bottom + S(4) : S(82);
+            x = Math.Max(S(6), Math.Min(x, screenPanel.Width - popupWidth - S(6)));
+            y = Math.Max(S(6), Math.Min(y, screenPanel.Height - popupHeight - S(6)));
+            atisAutoPopupPanel.Location = new Point(x, y);
+        }
+
         private void ConfigureSoundPlayers()
         {
             // Sounds are embedded into the EXE for single-file publishing.
             // Notification.wav remains app-start only.
             // Notification2.wav is the Airbus inbound message sound.
             // Notification3.wav is the Boeing inbound message sound.
+            // a220notify.wav is the A220 inbound message sound.
             ConfigureSoundPlayer(startupPlayer, "Notification.wav");   // app start only
+
+            // Keep the loose-file fallback usable during IDE/debug runs. In a normal
+            // publish the project already embeds every file from Sounds\**\*.*.
+            SyncSoundFileToOutput("a220notify.wav");
             ConfigureInboundMessageSound();
 
             // Callsign mismatch alert: prefer embedded asset, otherwise use Sounds/callsign_mismatch.wav.
@@ -17561,7 +21449,23 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
         private void ConfigureInboundMessageSound()
         {
-            ConfigureSoundPlayer(messagePlayer, DcduStyleManager.IsBoeing ? "Notification3.wav" : "Notification2.wav");
+            string selectedSoundFile = DcduStyleManager.IsA220
+                ? "a220notify.wav"
+                : DcduStyleManager.IsBoeing
+                    ? "Notification3.wav"
+                    : "Notification2.wav";
+
+            ConfigureSoundPlayer(messagePlayer, selectedSoundFile);
+
+            // Do not leave A220 without an alert if the new file was accidentally
+            // omitted from Sounds. The log still records the missing A220 asset.
+            if (DcduStyleManager.IsA220 &&
+                string.IsNullOrWhiteSpace(messagePlayer.SoundLocation) &&
+                messagePlayer.Stream == null)
+            {
+                Logger.Warn("A220 notification sound a220notify.wav is unavailable; using Notification2.wav as fallback.");
+                ConfigureSoundPlayer(messagePlayer, "Notification2.wav");
+            }
         }
 
         private void PlayInboundMessageSound()
@@ -18634,6 +22538,9 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 private const string UpdateGithubOwner = "fresH229a";
 private const string UpdateGithubRepo = "EasyCPDLC-Modernized";
 private const string UpdateGithubApiAccept = "application/vnd.github+json";
+private const string UpdateGithubApiVersion = "2022-11-28";
+private const string IntegratedUpdaterFileName = "EasyCPDLC.Updater.exe";
+private const string UpdateTemporaryDirectoryPrefix = "EasyCPDLC_Update_";
 private static readonly Version MinimumSupportedRollbackVersion = new Version(1, 0, 0, 12);
 
 private static void ClearPendingLogonUpdateState()
@@ -18902,6 +22809,8 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
             using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, assetApiUri);
             request.Headers.UserAgent.ParseAdd("EasyCPDLC-Updater");
             request.Headers.Accept.ParseAdd(UpdateGithubApiAccept);
+            request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", UpdateGithubApiVersion);
+            request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache, no-store");
 
             using HttpResponseMessage response = await webclient.SendAsync(request);
             response.EnsureSuccessStatusCode();
@@ -18958,6 +22867,460 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
             return builder.ToString();
         }
 
+
+        private static Uri BuildTrustedGithubAssetApiDownloadUri(ReleaseAsset asset)
+        {
+            if (asset == null || asset.Id <= 0)
+            {
+                throw new InvalidOperationException("Update asset has no valid GitHub asset id.");
+            }
+
+            string assetApiUrl = "https://api.github.com/repos/" +
+                UpdateGithubOwner + "/" + UpdateGithubRepo + "/releases/assets/" +
+                asset.Id.ToString(System.Globalization.CultureInfo.InvariantCulture);
+
+            if (!Uri.TryCreate(assetApiUrl, UriKind.Absolute, out Uri assetApiUri) ||
+                assetApiUri.Scheme != Uri.UriSchemeHttps ||
+                !string.Equals(assetApiUri.Host, "api.github.com", StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException("Update asset download URL is not a trusted GitHub API URL.");
+            }
+
+            return assetApiUri;
+        }
+
+        private static async Task DownloadAndVerifyGithubAssetAsync(
+            ReleaseAsset asset,
+            string destinationPath,
+            string expectedSha256,
+            long maximumBytes,
+            UpdateProgressDialog progress)
+        {
+            if (asset == null)
+            {
+                throw new ArgumentNullException(nameof(asset));
+            }
+
+            if (string.IsNullOrWhiteSpace(destinationPath))
+            {
+                throw new ArgumentException("Update destination path is empty.", nameof(destinationPath));
+            }
+
+            if (string.IsNullOrWhiteSpace(expectedSha256))
+            {
+                throw new ArgumentException("Expected update checksum is empty.", nameof(expectedSha256));
+            }
+
+            Uri assetApiUri = BuildTrustedGithubAssetApiDownloadUri(asset);
+            long expectedBytes = Math.Max(
+                0L,
+                Convert.ToInt64(asset.Size, System.Globalization.CultureInfo.InvariantCulture));
+
+            string lastActualSha256 = string.Empty;
+            string lastFailure = string.Empty;
+
+            for (int attempt = 1; attempt <= 2; attempt++)
+            {
+                try
+                {
+                    try
+                    {
+                        if (File.Exists(destinationPath))
+                        {
+                            File.Delete(destinationPath);
+                        }
+                    }
+                    catch
+                    {
+                        // File creation below will report a clear error if replacement is impossible.
+                    }
+
+                    progress?.SetStep(
+                        attempt == 1 ? "Downloading update" : "Retrying update download",
+                        "Downloading exact GitHub release asset #" +
+                        asset.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + "...",
+                        -1);
+                    progress?.Refresh();
+
+                    using HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, assetApiUri);
+                    request.Headers.UserAgent.ParseAdd("EasyCPDLC-Updater");
+                    request.Headers.Accept.ParseAdd("application/octet-stream");
+                    request.Headers.TryAddWithoutValidation("X-GitHub-Api-Version", UpdateGithubApiVersion);
+                    request.Headers.TryAddWithoutValidation("Cache-Control", "no-cache, no-store");
+
+                    using HttpResponseMessage response = await webclient.SendAsync(
+                        request,
+                        HttpCompletionOption.ResponseHeadersRead);
+
+                    response.EnsureSuccessStatusCode();
+
+                    string contentType = response.Content.Headers.ContentType?.MediaType ?? string.Empty;
+                    if (contentType.IndexOf("json", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        contentType.IndexOf("html", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                        contentType.StartsWith("text/", StringComparison.OrdinalIgnoreCase))
+                    {
+                        throw new InvalidOperationException(
+                            "GitHub returned metadata or an HTML page instead of the release ZIP (Content-Type: " +
+                            (string.IsNullOrWhiteSpace(contentType) ? "unknown" : contentType) + ").");
+                    }
+
+                    long? responseBytes = response.Content.Headers.ContentLength;
+                    if (responseBytes.HasValue && responseBytes.Value > maximumBytes)
+                    {
+                        throw new InvalidOperationException(
+                            "Update package is unexpectedly large: " + FormatByteCount(responseBytes.Value));
+                    }
+
+                    long downloadedBytes = 0;
+                    byte[] buffer = new byte[128 * 1024];
+
+                    using (Stream source = await response.Content.ReadAsStreamAsync())
+                    using (FileStream destination = new FileStream(
+                        destinationPath,
+                        System.IO.FileMode.Create,
+                        System.IO.FileAccess.Write,
+                        System.IO.FileShare.None,
+                        buffer.Length,
+                        true))
+                    {
+                        while (true)
+                        {
+                            int read = await source.ReadAsync(buffer, 0, buffer.Length);
+                            if (read <= 0)
+                            {
+                                break;
+                            }
+
+                            downloadedBytes += read;
+                            if (downloadedBytes > maximumBytes)
+                            {
+                                throw new InvalidOperationException(
+                                    "Update package exceeded the maximum allowed size of " +
+                                    FormatByteCount(maximumBytes));
+                            }
+
+                            await destination.WriteAsync(buffer, 0, read);
+
+                            long progressTotal = responseBytes.GetValueOrDefault() > 0
+                                ? responseBytes.Value
+                                : expectedBytes;
+
+                            if (progressTotal > 0)
+                            {
+                                int percent = (int)Math.Max(
+                                    0,
+                                    Math.Min(100, downloadedBytes * 100L / progressTotal));
+
+                                progress?.SetStep(
+                                    attempt == 1 ? "Downloading update" : "Retrying update download",
+                                    FormatByteCount(downloadedBytes) + " / " + FormatByteCount(progressTotal),
+                                    percent);
+                            }
+                            else
+                            {
+                                progress?.SetStep(
+                                    attempt == 1 ? "Downloading update" : "Retrying update download",
+                                    FormatByteCount(downloadedBytes) + " downloaded",
+                                    -1);
+                            }
+                        }
+
+                        destination.Flush(true);
+                    }
+
+                    if (downloadedBytes <= 0)
+                    {
+                        throw new InvalidOperationException("Update package download was empty.");
+                    }
+
+                    lastActualSha256 = ComputeFileSha256Hex(destinationPath);
+
+                    bool sizeMatches = expectedBytes <= 0 || downloadedBytes == expectedBytes;
+                    bool hashMatches = string.Equals(
+                        lastActualSha256,
+                        expectedSha256,
+                        StringComparison.OrdinalIgnoreCase);
+
+                    if (!sizeMatches || !hashMatches)
+                    {
+                        lastFailure =
+                            "GitHub asset #" +
+                            asset.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                            " returned " +
+                            downloadedBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                            " bytes (expected " +
+                            expectedBytes.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                            "), SHA-256 " + lastActualSha256 +
+                            " (expected " + expectedSha256 + ").";
+
+                        Logger.Debug("Update asset verification attempt " +
+                            attempt.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                            " failed: " + lastFailure);
+
+                        if (attempt < 2)
+                        {
+                            await Task.Delay(900);
+                            continue;
+                        }
+
+                        break;
+                    }
+
+                    // Verify that the authenticated bytes are also a readable ZIP before launching
+                    // any component from the package.
+                    using (ZipArchive archive = ZipFile.OpenRead(destinationPath))
+                    {
+                        if (archive.Entries.Count == 0)
+                        {
+                            throw new InvalidOperationException("The verified update ZIP contains no files.");
+                        }
+                    }
+
+                    Logger.Info(
+                        "Verified GitHub release asset #" +
+                        asset.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        ": " + lastActualSha256);
+
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    lastFailure = ex.Message;
+                    Logger.Debug(
+                        "Update asset download attempt " +
+                        attempt.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                        " failed: " + ex.Message);
+
+                    if (attempt < 2)
+                    {
+                        await Task.Delay(900);
+                        continue;
+                    }
+                }
+            }
+
+            throw new InvalidOperationException(
+                "The exact GitHub release asset could not be verified after two downloads." +
+                Environment.NewLine +
+                "Asset: " + (asset.Name ?? string.Empty) +
+                " (#" + asset.Id.ToString(System.Globalization.CultureInfo.InvariantCulture) + ")" +
+                Environment.NewLine +
+                "Expected SHA-256: " + expectedSha256 +
+                Environment.NewLine +
+                "Downloaded SHA-256: " +
+                (string.IsNullOrWhiteSpace(lastActualSha256) ? "not available" : lastActualSha256) +
+                (string.IsNullOrWhiteSpace(lastFailure)
+                    ? string.Empty
+                    : Environment.NewLine + "Details: " + lastFailure));
+        }
+
+        private static string ResolveIntegratedUpdaterPath()
+        {
+            try
+            {
+                string path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, IntegratedUpdaterFileName);
+                return File.Exists(path) ? path : string.Empty;
+            }
+            catch
+            {
+                return string.Empty;
+            }
+        }
+
+        private static string PrepareIntegratedUpdaterForLaunch(string installedUpdaterPath, string verifiedZipPath, string updateTempDirectory)
+        {
+            // Never launch the already installed updater for a new release. The command-line
+            // protocol can change together with MainForm, so an older installed updater may not
+            // understand new handshake arguments. The release ZIP has already been restricted to
+            // the trusted GitHub repository and verified with SHA-256; use the updater shipped in
+            // that same verified package so both components always have the matching protocol.
+            _ = installedUpdaterPath;
+
+            string launchDirectory = Path.Combine(updateTempDirectory, "launcher");
+            Directory.CreateDirectory(launchDirectory);
+
+            string launchPath = Path.Combine(launchDirectory, IntegratedUpdaterFileName);
+
+            using ZipArchive archive = ZipFile.OpenRead(verifiedZipPath);
+            List<ZipArchiveEntry> matches = archive.Entries
+                .Where(entry =>
+                    entry != null &&
+                    !string.IsNullOrWhiteSpace(entry.Name) &&
+                    string.Equals(
+                        (entry.FullName ?? string.Empty).Replace('\\', '/'),
+                        IntegratedUpdaterFileName,
+                        StringComparison.OrdinalIgnoreCase))
+                .ToList();
+
+            if (matches.Count != 1)
+            {
+                throw new FileNotFoundException(
+                    "The verified update ZIP must contain exactly one " + IntegratedUpdaterFileName +
+                    " in its root directory. Automatic installation was aborted.");
+            }
+
+            ZipArchiveEntry updaterEntry = matches[0];
+
+            // File size alone is not a trustworthy executable validation criterion.
+            // A small .NET Framework updater may be below 16 KB, while a self-contained
+            // updater can legitimately be much larger. Keep only a package safety limit.
+            const long MaxIntegratedUpdaterBytes = 200L * 1024L * 1024L;
+            if (updaterEntry.Length <= 0 || updaterEntry.Length > MaxIntegratedUpdaterBytes)
+            {
+                throw new InvalidOperationException(
+                    "The updater executable in the verified ZIP is empty or exceeds the maximum supported size.");
+            }
+
+            using (Stream source = updaterEntry.Open())
+            using (FileStream destination = new FileStream(
+                launchPath,
+                System.IO.FileMode.Create,
+                System.IO.FileAccess.Write,
+                System.IO.FileShare.None))
+            {
+                source.CopyTo(destination);
+                destination.Flush(true);
+            }
+
+            if (!IsWindowsPortableExecutable(launchPath))
+            {
+                try
+                {
+                    File.Delete(launchPath);
+                }
+                catch
+                {
+                    // Best-effort cleanup only.
+                }
+
+                throw new InvalidOperationException(
+                    "The updater file in the verified ZIP is not a valid Windows executable.");
+            }
+
+            return launchPath;
+        }
+
+        private static bool IsWindowsPortableExecutable(string filePath)
+        {
+            try
+            {
+                using FileStream stream = new FileStream(
+                    filePath,
+                    System.IO.FileMode.Open,
+                    System.IO.FileAccess.Read,
+                    System.IO.FileShare.Read);
+
+                if (stream.Length < 64)
+                {
+                    return false;
+                }
+
+                // DOS header: "MZ"
+                if (stream.ReadByte() != 'M' || stream.ReadByte() != 'Z')
+                {
+                    return false;
+                }
+
+                // DWORD at offset 0x3C points to the PE signature.
+                stream.Position = 0x3C;
+                byte[] offsetBytes = new byte[4];
+                if (stream.Read(offsetBytes, 0, offsetBytes.Length) != offsetBytes.Length)
+                {
+                    return false;
+                }
+
+                int peOffset = BitConverter.ToInt32(offsetBytes, 0);
+                if (peOffset < 0 || peOffset > stream.Length - 4)
+                {
+                    return false;
+                }
+
+                stream.Position = peOffset;
+                return stream.ReadByte() == 'P' &&
+                       stream.ReadByte() == 'E' &&
+                       stream.ReadByte() == 0 &&
+                       stream.ReadByte() == 0;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void AddUpdaterArgument(ProcessStartInfo startInfo, string name, string value)
+        {
+            if (startInfo == null || string.IsNullOrWhiteSpace(name))
+            {
+                return;
+            }
+
+            startInfo.ArgumentList.Add(name);
+            startInfo.ArgumentList.Add(value ?? string.Empty);
+        }
+
+        private static async Task WaitForIntegratedUpdaterReadyAsync(Process updaterProcess, string readyFilePath, TimeSpan timeout)
+        {
+            if (updaterProcess == null)
+            {
+                throw new ArgumentNullException(nameof(updaterProcess));
+            }
+
+            Stopwatch stopwatch = Stopwatch.StartNew();
+
+            while (stopwatch.Elapsed < timeout)
+            {
+                if (!string.IsNullOrWhiteSpace(readyFilePath) && File.Exists(readyFilePath))
+                {
+                    return;
+                }
+
+                if (updaterProcess.HasExited)
+                {
+                    throw new InvalidOperationException(
+                        IntegratedUpdaterFileName + " closed before it could validate the running EasyCPDLC process.");
+                }
+
+                await Task.Delay(100);
+                updaterProcess.Refresh();
+            }
+
+            throw new TimeoutException(
+                IntegratedUpdaterFileName + " did not confirm startup within " +
+                ((int)timeout.TotalSeconds).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                " seconds.");
+        }
+
+        private static void CleanupStaleUpdateTemporaryDirectories()
+        {
+            try
+            {
+                string tempRoot = Path.GetTempPath();
+                DateTime cutoffUtc = DateTime.UtcNow - TimeSpan.FromHours(12);
+
+                foreach (string directory in Directory.EnumerateDirectories(tempRoot, UpdateTemporaryDirectoryPrefix + "*", SearchOption.TopDirectoryOnly))
+                {
+                    try
+                    {
+                        if (Directory.GetLastWriteTimeUtc(directory) > cutoffUtc)
+                        {
+                            continue;
+                        }
+
+                        Directory.Delete(directory, true);
+                        Logger.Debug("Removed stale updater directory: " + directory);
+                    }
+                    catch
+                    {
+                        // A currently running updater or antivirus scan can temporarily keep files open.
+                    }
+                }
+            }
+            catch
+            {
+                // Cleanup is best-effort only and must never prevent startup.
+            }
+        }
+
         private static async Task DownloadAndInstallUpdateAsync(Release latest, ReleaseAsset asset)
         {
             const long MaxUpdateDownloadBytes = 200L * 1024L * 1024L;
@@ -18980,107 +23343,79 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
                 throw new InvalidOperationException("Update download URL is not the expected HTTPS GitHub release asset URL for this repository.");
             }
 
-            string tempDir = Path.Combine(Path.GetTempPath(), "EasyCPDLC_Update_" + Guid.NewGuid().ToString("N"));
+            string installedUpdaterPath = ResolveIntegratedUpdaterPath();
+
+            string tempDir = Path.Combine(Path.GetTempPath(), UpdateTemporaryDirectoryPrefix + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(tempDir);
 
             string zipPath = Path.Combine(tempDir, safeAssetName);
-            string scriptPath = Path.Combine(tempDir, "InstallEasyCPDLCUpdate.ps1");
-            string appDir = AppDomain.CurrentDomain.BaseDirectory;
             string exePath = System.Windows.Forms.Application.ExecutablePath;
             int currentPid = Process.GetCurrentProcess().Id;
             string currentUserConfigPath = CurrentUserConfigFilePath();
 
             using UpdateProgressDialog progress = new UpdateProgressDialog("EasyCPDLC Update");
             progress.Show();
-            progress.SetStep("Preparing update", "Reading GitHub asset checksum...", -1);
-            progress.Refresh();
-
-            string expectedSha256 = await GetExpectedGithubAssetSha256Async(asset);
-
-            progress.SetStep("Preparing update", "Connecting to GitHub release asset...", -1);
-            progress.Refresh();
-
             try
             {
-                using (HttpRequestMessage request = new HttpRequestMessage(HttpMethod.Get, downloadUri))
-                {
-                    request.Headers.UserAgent.ParseAdd("EasyCPDLC-Updater");
+                progress.SetStep("Preparing update", "Reading GitHub asset checksum...", -1);
+                progress.Refresh();
 
-                    using (HttpResponseMessage response = await webclient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead))
-                    {
-                        response.EnsureSuccessStatusCode();
+                string expectedSha256 = await GetExpectedGithubAssetSha256Async(asset);
 
-                        long? totalBytes = response.Content.Headers.ContentLength;
-                        if (totalBytes.HasValue && totalBytes.Value > MaxUpdateDownloadBytes)
-                        {
-                            throw new InvalidOperationException("Update package is unexpectedly large: " + FormatByteCount(totalBytes.Value));
-                        }
+                progress.SetStep("Preparing update", "Connecting to the exact GitHub release asset...", -1);
+                progress.Refresh();
 
-                        long downloadedBytes = 0;
-                        byte[] buffer = new byte[128 * 1024];
+                // The checksum metadata and binary download now use the same immutable GitHub
+                // release-asset id. This avoids filename/CDN cache mismatches after an asset with
+                // the same name has been replaced during testing.
+                await DownloadAndVerifyGithubAssetAsync(
+                    asset,
+                    zipPath,
+                    expectedSha256,
+                    MaxUpdateDownloadBytes,
+                    progress);
 
-                        using Stream source = await response.Content.ReadAsStreamAsync();
-                        using FileStream destination = new FileStream(zipPath, System.IO.FileMode.Create, System.IO.FileAccess.Write, System.IO.FileShare.None, buffer.Length, true);
-
-                        while (true)
-                        {
-                            int read = await source.ReadAsync(buffer, 0, buffer.Length);
-                            if (read <= 0)
-                            {
-                                break;
-                            }
-
-                            downloadedBytes += read;
-                            if (downloadedBytes > MaxUpdateDownloadBytes)
-                            {
-                                throw new InvalidOperationException("Update package exceeded the maximum allowed size of " + FormatByteCount(MaxUpdateDownloadBytes));
-                            }
-
-                            await destination.WriteAsync(buffer, 0, read);
-
-                            if (totalBytes.HasValue && totalBytes.Value > 0)
-                            {
-                                int percent = (int)Math.Max(0, Math.Min(100, downloadedBytes * 100L / totalBytes.Value));
-                                progress.SetStep(
-                                    "Downloading update",
-                                    FormatByteCount(downloadedBytes) + " / " + FormatByteCount(totalBytes.Value),
-                                    percent);
-                            }
-                            else
-                            {
-                                progress.SetStep(
-                                    "Downloading update",
-                                    FormatByteCount(downloadedBytes) + " downloaded",
-                                    -1);
-                            }
-                        }
-
-                        if (downloadedBytes <= 0)
-                        {
-                            throw new InvalidOperationException("Update package download was empty.");
-                        }
-                    }
-                }
-
-                progress.SetStep("Verifying update", "Checking SHA-256 checksum...", -1);
-                string actualSha256 = ComputeFileSha256Hex(zipPath);
-                if (!string.Equals(actualSha256, expectedSha256, StringComparison.OrdinalIgnoreCase))
-                {
-                    throw new InvalidOperationException("Update package SHA-256 verification failed. Automatic install was aborted.");
-                }
-
-                progress.SetStep("Preparing installer", "Update package verified. Preparing install animation...", 100);
+                progress.SetStep("Preparing updater", "Starting the integrated C# updater...", 100);
 
                 string userConfigSourcePath = PrepareUserConfigForVersionChange(latest, tempDir, currentUserConfigPath);
+                if (!string.IsNullOrWhiteSpace(userConfigSourcePath) && !File.Exists(userConfigSourcePath))
+                {
+                    userConfigSourcePath = string.Empty;
+                }
 
                 string targetReleaseVersionText = ParseReleaseVersion(latest?.TagName)?.ToString() ?? string.Empty;
+                string updaterLaunchPath = PrepareIntegratedUpdaterForLaunch(installedUpdaterPath, zipPath, tempDir);
+                string updaterReadyPath = Path.Combine(tempDir, "updater.ready");
+                try
+                {
+                    if (File.Exists(updaterReadyPath))
+                    {
+                        File.Delete(updaterReadyPath);
+                    }
+                }
+                catch
+                {
+                    // The updater will report a clear error if the ready signal cannot be created.
+                }
 
-                File.WriteAllText(
-                    scriptPath,
-                    BuildUpdaterPowerShellScript(currentPid, zipPath, appDir, Path.GetFileName(exePath), userConfigSourcePath, currentUserConfigPath, targetReleaseVersionText),
-                    System.Text.Encoding.UTF8);
+                ProcessStartInfo updaterStartInfo = new ProcessStartInfo
+                {
+                    FileName = updaterLaunchPath,
+                    WorkingDirectory = Path.GetDirectoryName(updaterLaunchPath) ?? tempDir,
+                    UseShellExecute = false,
+                    CreateNoWindow = false,
+                    WindowStyle = ProcessWindowStyle.Normal
+                };
 
-                progress.SetStep("Starting installer", "EasyCPDLC will close and restart automatically.", 100);
+                AddUpdaterArgument(updaterStartInfo, "--wait-process-id", currentPid.ToString(System.Globalization.CultureInfo.InvariantCulture));
+                AddUpdaterArgument(updaterStartInfo, "--zip-path", zipPath);
+                AddUpdaterArgument(updaterStartInfo, "--expected-sha256", expectedSha256);
+                AddUpdaterArgument(updaterStartInfo, "--expected-current-exe-sha256", ComputeFileSha256Hex(exePath));
+                AddUpdaterArgument(updaterStartInfo, "--ready-file", updaterReadyPath);
+                AddUpdaterArgument(updaterStartInfo, "--config-source-path", userConfigSourcePath);
+                AddUpdaterArgument(updaterStartInfo, "--current-user-config-path", currentUserConfigPath);
+                AddUpdaterArgument(updaterStartInfo, "--target-release-version", targetReleaseVersionText);
+
                 await Task.Delay(350);
 
                 if (!progress.IsDisposed)
@@ -19089,20 +23424,21 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
                 }
 
                 MessageBox.Show(
-                    "EasyCPDLC is now restarting to install the update.",
+                    "EasyCPDLC will now close. The visible EasyCPDLC Updater will install the verified package and restart the client.",
                     "EasyCPDLC Update",
                     MessageBoxButtons.OK,
                     MessageBoxIcon.Information);
 
-                Process.Start(new ProcessStartInfo
+                Process updaterProcess = Process.Start(updaterStartInfo);
+                if (updaterProcess == null)
                 {
-                    FileName = "powershell.exe",
-                    Arguments = "-NoProfile -Sta -ExecutionPolicy Bypass -File " + QuoteForProcessArgument(scriptPath),
-                    WorkingDirectory = tempDir,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                });
+                    throw new InvalidOperationException("Windows could not start " + IntegratedUpdaterFileName + ".");
+                }
+
+                // Keep EasyCPDLC alive until the updater has read and validated the
+                // process identity. Without this handshake a fast shutdown can race
+                // the updater and produce "The EasyCPDLC process no longer exists."
+                await WaitForIntegratedUpdaterReadyAsync(updaterProcess, updaterReadyPath, TimeSpan.FromSeconds(20));
 
                 System.Windows.Forms.Application.Exit();
                 Environment.Exit(0);
@@ -19250,326 +23586,6 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
                 detailLabel.Refresh();
                 titleLabel.Refresh();
             }
-        }
-
-        private static string QuoteForProcessArgument(string value)
-        {
-            return "\"" + (value ?? string.Empty).Replace("\"", "\\\"") + "\"";
-        }
-
-        private static string EscapePowerShellSingleQuotedString(string value)
-        {
-            return (value ?? string.Empty).Replace("'", "''");
-        }
-
-        private static string BuildUpdaterPowerShellScript(int processId, string zipPath, string appDir, string exeName, string userConfigSourcePath, string currentUserConfigPath, string targetReleaseVersionText)
-        {
-            string psZip = EscapePowerShellSingleQuotedString(zipPath);
-            string psAppDir = EscapePowerShellSingleQuotedString(appDir);
-            string psExeName = EscapePowerShellSingleQuotedString(exeName);
-            string psUserConfigSourcePath = EscapePowerShellSingleQuotedString(userConfigSourcePath ?? string.Empty);
-            string psCurrentUserConfigPath = EscapePowerShellSingleQuotedString(currentUserConfigPath ?? string.Empty);
-            string psTargetReleaseVersionText = EscapePowerShellSingleQuotedString(targetReleaseVersionText ?? string.Empty);
-
-            return
-@"$ErrorActionPreference = 'Stop'
-$pidToWait = " + processId + @"
-$zipPath = '" + psZip + @"'
-$appDir = '" + psAppDir + @"'
-$exeName = '" + psExeName + @"'
-$userConfigSourcePath = '" + psUserConfigSourcePath + @"'
-$currentUserConfigPath = '" + psCurrentUserConfigPath + @"'
-$targetReleaseVersionText = '" + psTargetReleaseVersionText + @"'
-$configName = 'EasyCPDLC.dll.config'
-$workDir = Join-Path $env:TEMP ('EasyCPDLC_Update_Extract_' + [guid]::NewGuid().ToString('N'))
-$logPath = Join-Path $env:TEMP 'EasyCPDLC_Update.log'
-
-Add-Type -AssemblyName System.Windows.Forms
-Add-Type -AssemblyName System.Drawing
-[System.Windows.Forms.Application]::EnableVisualStyles()
-
-$form = New-Object System.Windows.Forms.Form
-$form.Text = 'EasyCPDLC Update'
-$form.StartPosition = 'CenterScreen'
-$form.FormBorderStyle = 'FixedDialog'
-$form.MaximizeBox = $false
-$form.MinimizeBox = $false
-$form.TopMost = $true
-$form.ClientSize = New-Object System.Drawing.Size(430, 132)
-$form.BackColor = [System.Drawing.Color]::FromArgb(12, 18, 22)
-$form.ForeColor = [System.Drawing.Color]::White
-
-$titleLabel = New-Object System.Windows.Forms.Label
-$titleLabel.AutoSize = $false
-$titleLabel.Left = 18
-$titleLabel.Top = 16
-$titleLabel.Width = 394
-$titleLabel.Height = 26
-$titleLabel.ForeColor = [System.Drawing.Color]::White
-$titleLabel.Font = New-Object System.Drawing.Font('Segoe UI Semibold', 10.5, [System.Drawing.FontStyle]::Regular)
-$titleLabel.Text = 'Installing update'
-
-$detailLabel = New-Object System.Windows.Forms.Label
-$detailLabel.AutoSize = $false
-$detailLabel.Left = 18
-$detailLabel.Top = 44
-$detailLabel.Width = 394
-$detailLabel.Height = 24
-$detailLabel.ForeColor = [System.Drawing.Color]::FromArgb(190, 210, 220)
-$detailLabel.Font = New-Object System.Drawing.Font('Segoe UI', 9.0, [System.Drawing.FontStyle]::Regular)
-$detailLabel.Text = 'Starting updater...'
-
-$progressBar = New-Object System.Windows.Forms.ProgressBar
-$progressBar.Left = 18
-$progressBar.Top = 78
-$progressBar.Width = 394
-$progressBar.Height = 24
-$progressBar.Minimum = 0
-$progressBar.Maximum = 100
-$progressBar.Style = 'Marquee'
-$progressBar.MarqueeAnimationSpeed = 28
-
-$form.Controls.Add($titleLabel)
-$form.Controls.Add($detailLabel)
-$form.Controls.Add($progressBar)
-$form.Show()
-$form.Activate()
-$form.BringToFront()
-[System.Windows.Forms.Application]::DoEvents()
-
-function Set-UpdateStep($title, $detail, $percent) {
-    $titleLabel.Text = $title
-    $detailLabel.Text = $detail
-
-    if ($percent -ge 0) {
-        $progressBar.Style = 'Continuous'
-        $progressBar.MarqueeAnimationSpeed = 0
-        $progressBar.Value = [Math]::Max(0, [Math]::Min(100, $percent))
-    } else {
-        $progressBar.Style = 'Marquee'
-        $progressBar.MarqueeAnimationSpeed = 28
-    }
-
-    $titleLabel.Refresh()
-    $detailLabel.Refresh()
-    $progressBar.Refresh()
-    [System.Windows.Forms.Application]::DoEvents()
-}
-
-function Write-UpdateLog($text) {
-    Add-Content -LiteralPath $logPath -Value ((Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + ' ' + $text)
-}
-
-function Get-VersionCandidatesForInstalledExe {
-    param(
-        [string] $installedExe,
-        [string] $releaseVersion
-    )
-
-    $versions = New-Object System.Collections.Generic.List[string]
-
-    function Add-VersionCandidate([string] $value) {
-        if ([string]::IsNullOrWhiteSpace($value)) {
-            return
-        }
-
-        $match = [regex]::Match($value, '\d+(?:\.\d+){0,3}')
-        if (-not $match.Success) {
-            return
-        }
-
-        $parts = $match.Value.Split('.')
-        while ($parts.Count -lt 4) {
-            $parts += '0'
-        }
-
-        $candidate = ($parts[0..3] -join '.')
-        if (-not $versions.Contains($candidate)) {
-            $versions.Add($candidate)
-        }
-    }
-
-    Add-VersionCandidate $releaseVersion
-
-    try {
-        $assemblyVersion = [System.Reflection.AssemblyName]::GetAssemblyName($installedExe).Version.ToString()
-        Add-VersionCandidate $assemblyVersion
-    }
-    catch {
-        Write-UpdateLog ('Could not read target assembly version: ' + $_.Exception.Message)
-    }
-
-    try {
-        $fileInfo = [System.Diagnostics.FileVersionInfo]::GetVersionInfo($installedExe)
-        Add-VersionCandidate $fileInfo.ProductVersion
-        Add-VersionCandidate $fileInfo.FileVersion
-    }
-    catch {
-        Write-UpdateLog ('Could not read target file version: ' + $_.Exception.Message)
-    }
-
-    return $versions.ToArray()
-}
-
-function Get-EasyCpdlcSettingsRoots {
-    param([string] $oldConfigPath)
-
-    $roots = New-Object System.Collections.Generic.List[string]
-
-    function Add-SettingsRoot([string] $rootPath) {
-        if ([string]::IsNullOrWhiteSpace($rootPath)) {
-            return
-        }
-
-        try {
-            $full = [System.IO.Path]::GetFullPath($rootPath)
-            if (-not $roots.Contains($full)) {
-                $roots.Add($full)
-            }
-        }
-        catch {}
-    }
-
-    if (-not [string]::IsNullOrWhiteSpace($oldConfigPath) -and (Test-Path -LiteralPath $oldConfigPath)) {
-        try {
-            $oldConfigItem = Get-Item -LiteralPath $oldConfigPath
-            $oldVersionDir = Split-Path -Parent $oldConfigItem.FullName
-            $settingsRoot = Split-Path -Parent $oldVersionDir
-            Add-SettingsRoot $settingsRoot
-        }
-        catch {
-            Write-UpdateLog ('Could not derive settings root from current config: ' + $_.Exception.Message)
-        }
-    }
-
-    try {
-        $localAppData = [Environment]::GetFolderPath('LocalApplicationData')
-        if (-not [string]::IsNullOrWhiteSpace($localAppData) -and (Test-Path -LiteralPath $localAppData)) {
-            Get-ChildItem -LiteralPath $localAppData -Filter user.config -File -Recurse -ErrorAction SilentlyContinue |
-                Where-Object { $_.FullName -match 'EasyCPDLC' } |
-                ForEach-Object {
-                    try {
-                        $versionDir = Split-Path -Parent $_.FullName
-                        $root = Split-Path -Parent $versionDir
-                        Add-SettingsRoot $root
-                    }
-                    catch {}
-                }
-        }
-    }
-    catch {
-        Write-UpdateLog ('Could not enumerate EasyCPDLC settings roots: ' + $_.Exception.Message)
-    }
-
-    return $roots.ToArray()
-}
-
-function Copy-UserConfigForInstalledVersion {
-    param(
-        [string] $sourceConfigPath,
-        [string] $oldConfigPath,
-        [string] $installedExe,
-        [string] $releaseVersion
-    )
-
-    if ([string]::IsNullOrWhiteSpace($sourceConfigPath) -or -not (Test-Path -LiteralPath $sourceConfigPath)) {
-        Write-UpdateLog 'No user.config source available for version migration.'
-        return
-    }
-
-    $versionCandidates = Get-VersionCandidatesForInstalledExe -installedExe $installedExe -releaseVersion $releaseVersion
-    if (-not $versionCandidates -or $versionCandidates.Count -eq 0) {
-        Write-UpdateLog 'No version candidates available for user.config migration.'
-        return
-    }
-
-    $settingsRoots = Get-EasyCpdlcSettingsRoots -oldConfigPath $oldConfigPath
-    if (-not $settingsRoots -or $settingsRoots.Count -eq 0) {
-        Write-UpdateLog 'No EasyCPDLC settings roots found for user.config migration.'
-        return
-    }
-
-    foreach ($root in $settingsRoots) {
-        foreach ($version in $versionCandidates) {
-            try {
-                $targetConfigDir = Join-Path $root $version
-                $targetConfigPath = Join-Path $targetConfigDir 'user.config'
-
-                New-Item -ItemType Directory -Force -Path $targetConfigDir | Out-Null
-                Copy-Item -LiteralPath $sourceConfigPath -Destination $targetConfigPath -Force
-                Write-UpdateLog ('Copied rollback-compatible user.config to ' + $targetConfigPath)
-            }
-            catch {
-                Write-UpdateLog ('Could not copy user.config to root=' + $root + ' version=' + $version + ': ' + $_.Exception.Message)
-            }
-        }
-    }
-}
-
-
-try {
-    $form.TopMost = $true
-    $form.Activate()
-    $form.BringToFront()
-    [System.Windows.Forms.Application]::DoEvents()
-
-    Set-UpdateStep 'Installing update' 'Waiting for EasyCPDLC to close...' 5
-    Write-UpdateLog 'Waiting for EasyCPDLC to exit.'
-
-    while (Get-Process -Id $pidToWait -ErrorAction SilentlyContinue) {
-        Start-Sleep -Milliseconds 300
-        [System.Windows.Forms.Application]::DoEvents()
-    }
-
-    Set-UpdateStep 'Installing update' 'Extracting update package...' 25
-    New-Item -ItemType Directory -Force -Path $workDir | Out-Null
-    Write-UpdateLog ('Extracting ' + $zipPath)
-    Expand-Archive -LiteralPath $zipPath -DestinationPath $workDir -Force
-
-    Set-UpdateStep 'Installing update' 'Checking update files...' 45
-    $newExe = Get-ChildItem -Path $workDir -Recurse -File -Filter $exeName | Select-Object -First 1
-    $newConfig = Get-ChildItem -Path $workDir -Recurse -File -Filter $configName | Select-Object -First 1
-
-    if (-not $newExe) {
-        throw ('Update ZIP does not contain ' + $exeName)
-    }
-
-    $targetExe = Join-Path $appDir $exeName
-    $targetConfig = Join-Path $appDir $configName
-
-    Set-UpdateStep 'Installing update' 'Preparing installation folder...' 60
-
-    Set-UpdateStep 'Installing update' 'Copying EasyCPDLC files...' 78
-    Write-UpdateLog 'Copying EasyCPDLC.exe.'
-    Copy-Item -LiteralPath $newExe.FullName -Destination $targetExe -Force
-
-    if ($newConfig) {
-        Write-UpdateLog 'Copying EasyCPDLC.dll.config.'
-        Copy-Item -LiteralPath $newConfig.FullName -Destination $targetConfig -Force
-    } else {
-        Write-UpdateLog 'No EasyCPDLC.dll.config in update ZIP; keeping existing config.'
-    }
-
-    Set-UpdateStep 'Installing update' 'Preserving user settings...' 88
-    Copy-UserConfigForInstalledVersion -sourceConfigPath $userConfigSourcePath -oldConfigPath $currentUserConfigPath -installedExe $targetExe -releaseVersion $targetReleaseVersionText
-
-    Set-UpdateStep 'Restarting EasyCPDLC' 'The updated client is opening now...' 100
-    Write-UpdateLog 'Restarting EasyCPDLC.'
-    Start-Process -FilePath $targetExe -WorkingDirectory $appDir
-
-    Remove-Item -LiteralPath $workDir -Recurse -Force -ErrorAction SilentlyContinue
-    Remove-Item -LiteralPath $zipPath -Force -ErrorAction SilentlyContinue
-    Write-UpdateLog 'Update completed.'
-
-    Start-Sleep -Milliseconds 700
-    $form.Close()
-}
-catch {
-    Write-UpdateLog ('Update failed: ' + $_.Exception.Message)
-    try { $form.Close() } catch {}
-    [System.Windows.Forms.MessageBox]::Show('EasyCPDLC update failed: ' + $_.Exception.Message + [Environment]::NewLine + 'See: ' + $logPath, 'EasyCPDLC Update Failed', 'OK', 'Error') | Out-Null
-}
-";
         }
 
         private static Version ParseReleaseVersion(string value)
@@ -19893,16 +23909,33 @@ catch {
                 return;
             }
 
-            foreach (System.Windows.Forms.Label label in messageFormatPanel.Controls
-                         .Cast<Control>()
-                         .SelectMany(control => control.Controls.Cast<Control>())
-                         .OfType<System.Windows.Forms.Label>())
+            // Airbus/Boeing actions are labels, while the A220 message view uses
+            // real buttons. Walk the entire preview tree and hide every control
+            // explicitly marked as a message action while SENDING/SENT is shown.
+            Stack<Control> pending = new();
+            foreach (Control root in messageFormatPanel.Controls)
             {
-                if (string.Equals(label.AccessibleDescription, "DCDU_STYLED_MESSAGE_ACTION", StringComparison.Ordinal))
+                pending.Push(root);
+            }
+
+            while (pending.Count > 0)
+            {
+                Control control = pending.Pop();
+                foreach (Control child in control.Controls)
                 {
-                    label.Visible = visible;
-                    label.Enabled = visible;
+                    pending.Push(child);
                 }
+
+                if (!string.Equals(
+                        control.AccessibleDescription,
+                        "DCDU_STYLED_MESSAGE_ACTION",
+                        StringComparison.Ordinal))
+                {
+                    continue;
+                }
+
+                control.Visible = visible;
+                control.Enabled = visible;
             }
         }
 
@@ -19943,7 +23976,9 @@ catch {
             }
             else
             {
-                panelW = Math.Max(S(170), host.ClientSize.Width / 3);
+                panelW = DcduStyleManager.IsA220
+                    ? Math.Max(S(190), host.ClientSize.Width / 3)
+                    : Math.Max(S(170), host.ClientSize.Width / 3);
                 panelX = Math.Max(0, (host.ClientSize.Width - panelW) / 2);
             }
 
@@ -20994,6 +25029,14 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                    clean == "NEGATIVE";
         }
 
+        private static bool IsCpdlcLogonFailedLocalNoticeText(string text)
+        {
+            string clean = NormalizeCpdlcOverviewText(text);
+
+            return clean.Contains("CPDLC LOGON FAILED") &&
+                   clean.Contains("NOT ONLINE ON HOPPIE");
+        }
+
         private static bool IsCpdlcDirectStatusText(string contents)
         {
             string clean = NormalizeCpdlcOverviewText(contents);
@@ -21090,6 +25133,18 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 return string.IsNullOrWhiteSpace(connectedUnit)
                     ? "CPDLC CONNECTED"
                     : "CPDLC CONNECTED TO: " + connectedUnit;
+            }
+
+            if (IsCpdlcLogonFailedLocalNoticeText(clean))
+            {
+                Match failedStation = Regex.Match(clean, @"\bSTATION\s+([A-Z0-9_]{3,16})\s+NOT\s+ONLINE\s+ON\s+HOPPIE\b");
+                string station = failedStation.Success
+                    ? failedStation.Groups[1].Value.Trim().ToUpperInvariant()
+                    : unit;
+
+                return string.IsNullOrWhiteSpace(station)
+                    ? "CPDLC LOGON FAILED - STATION NOT ONLINE"
+                    : "CPDLC LOGON FAILED - " + station + " NOT ONLINE";
             }
 
             if (clean.Contains("LOGON REJECTED") || clean.Contains("LOGON FAILED"))
@@ -22659,6 +26714,11 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             string type = (message.type ?? string.Empty).Trim().ToUpperInvariant();
             string text = (message.message ?? string.Empty).Trim().ToUpperInvariant();
 
+            if (IsCpdlcLogonFailedLocalNoticeText(text))
+            {
+                return false;
+            }
+
             // Harmless generic SYSTEM lines can be auto-cleaned. Keep interactive /
             // safety-critical system messages visible below.
             if (type == "SYSTEM" || text == "SYSTEM MESSAGE")
@@ -23006,6 +27066,127 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                 private System.Windows.Forms.Label CreateAutoDeletePopupActionLabel(string text, Color accent, EventHandler onClick)
         {
+            if (DcduStyleManager.IsA220)
+            {
+                string displayText = (text ?? string.Empty)
+                    .Replace(">", string.Empty)
+                    .Replace("<", string.Empty)
+                    .Trim()
+                    .ToUpperInvariant();
+
+                Font a220Font = CreateDpiStablePointFont("Consolas", 9.4f, FontStyle.Regular);
+                int a220MeasuredWidth = TextRenderer.MeasureText(
+                    displayText,
+                    a220Font,
+                    Size.Empty,
+                    TextFormatFlags.NoPadding | TextFormatFlags.SingleLine).Width;
+
+                System.Windows.Forms.Label a220Label = new()
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    ForeColor = Color.White,
+                    Font = a220Font,
+                    Text = string.Empty,
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Cursor = Cursors.Hand,
+                    Size = new Size(Math.Max(S(112), a220MeasuredWidth + S(30)), S(24)),
+                    Padding = Padding.Empty,
+                    Margin = Padding.Empty,
+                    UseCompatibleTextRendering = false,
+                    TabStop = true,
+                    AccessibleName = displayText
+                };
+
+                bool hover = false;
+                bool pressed = false;
+
+                a220Label.Paint += (_, e) =>
+                {
+                    e.Graphics.SmoothingMode = SmoothingMode.None;
+                    e.Graphics.PixelOffsetMode = PixelOffsetMode.None;
+
+                    Rectangle shadow = new(
+                        S(2),
+                        S(2),
+                        Math.Max(1, a220Label.Width - S(2)),
+                        Math.Max(1, a220Label.Height - S(2)));
+                    Rectangle face = new(
+                        0,
+                        pressed ? S(1) : 0,
+                        Math.Max(1, a220Label.Width - S(3)),
+                        Math.Max(1, a220Label.Height - S(3)));
+
+                    Color faceColor = hover
+                        ? (pressed ? Color.FromArgb(2, 72, 166) : Color.FromArgb(3, 91, 207))
+                        : (pressed ? Color.FromArgb(101, 101, 101) : Color.FromArgb(112, 112, 112));
+
+                    using SolidBrush shadowBrush = new(Color.FromArgb(5, 7, 10));
+                    using SolidBrush faceBrush = new(faceColor);
+                    using Pen lightPen = new(hover ? Color.FromArgb(196, 221, 255) : Color.FromArgb(214, 214, 214), 1.0f);
+                    using Pen darkPen = new(hover ? Color.FromArgb(0, 43, 106) : Color.FromArgb(35, 35, 35), 1.0f);
+
+                    e.Graphics.FillRectangle(shadowBrush, shadow);
+                    e.Graphics.FillRectangle(faceBrush, face);
+                    e.Graphics.DrawLine(lightPen, face.Left, face.Top, face.Right - 1, face.Top);
+                    e.Graphics.DrawLine(lightPen, face.Left, face.Top, face.Left, face.Bottom - 1);
+                    e.Graphics.DrawLine(darkPen, face.Left, face.Bottom - 1, face.Right - 1, face.Bottom - 1);
+                    e.Graphics.DrawLine(darkPen, face.Right - 1, face.Top, face.Right - 1, face.Bottom - 1);
+
+                    Rectangle textBounds = Rectangle.Inflate(face, -S(7), -S(2));
+                    if (pressed)
+                    {
+                        textBounds.Offset(0, S(1));
+                    }
+
+                    using StringFormat centeredFormat = new()
+                    {
+                        Alignment = StringAlignment.Center,
+                        LineAlignment = StringAlignment.Center,
+                        Trimming = StringTrimming.EllipsisCharacter,
+                        FormatFlags = StringFormatFlags.NoWrap
+                    };
+                    using SolidBrush textBrush = new(Color.White);
+                    e.Graphics.DrawString(
+                        displayText,
+                        a220Label.Font,
+                        textBrush,
+                        textBounds,
+                        centeredFormat);
+                };
+
+                void SetHover(bool value)
+                {
+                    hover = value;
+                    if (!value)
+                    {
+                        pressed = false;
+                    }
+                    a220Label.Invalidate();
+                }
+
+                a220Label.MouseEnter += (_, __) => SetHover(true);
+                a220Label.MouseLeave += (_, __) => SetHover(false);
+                a220Label.MouseDown += (_, args) =>
+                {
+                    if (args.Button == MouseButtons.Left)
+                    {
+                        pressed = true;
+                        a220Label.Invalidate();
+                    }
+                };
+                a220Label.MouseUp += (_, args) =>
+                {
+                    if (args.Button == MouseButtons.Left)
+                    {
+                        pressed = false;
+                        a220Label.Invalidate();
+                    }
+                };
+                a220Label.Click += onClick;
+                return a220Label;
+            }
+
             Font actionFont = PopupActionFont();
             int measuredWidth = TextRenderer.MeasureText(
                 text ?? string.Empty,
@@ -23080,8 +27261,8 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
             bool canWilco = CanDirectWilcoFromOverview(message);
             bool canRoger = CanDirectRogerFromOverview(message);
-            int rowY = S(5);
-            int rowGap = S(21);
+            int rowY = S(DcduStyleManager.IsA220 ? 6 : 5);
+            int rowGap = S(DcduStyleManager.IsA220 ? 28 : 21);
 
             if (canWilco)
             {
@@ -23097,7 +27278,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     }
                 });
 
-                wilcoLabel.Location = new Point(S(8), rowY);
+                wilcoLabel.Location = new Point(S(DcduStyleManager.IsA220 ? 7 : 8), rowY);
                 autoDeleteActionPopupPanel.Controls.Add(wilcoLabel);
                 rowY += rowGap;
             }
@@ -23116,7 +27297,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     }
                 });
 
-                rogerLabel.Location = new Point(S(8), rowY);
+                rogerLabel.Location = new Point(S(DcduStyleManager.IsA220 ? 7 : 8), rowY);
                 autoDeleteActionPopupPanel.Controls.Add(rogerLabel);
                 rowY += rowGap;
             }
@@ -23149,9 +27330,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 }
             });
 
-            openLabel.Location = new Point(S(8), rowY);
+            openLabel.Location = new Point(S(DcduStyleManager.IsA220 ? 7 : 8), rowY);
             rowY += rowGap;
-            deleteLabel.Location = new Point(S(8), rowY);
+            deleteLabel.Location = new Point(S(DcduStyleManager.IsA220 ? 7 : 8), rowY);
             rowY += rowGap;
             autoDeleteActionPopupPanel.Controls.Add(openLabel);
             autoDeleteActionPopupPanel.Controls.Add(deleteLabel);
@@ -23165,9 +27346,28 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 .DefaultIfEmpty(S(106))
                 .Max();
 
-            int popupWidth = Math.Max(S(124), contentWidth + S(12));
-            int popupHeight = Math.Max(S(52), rowY + S(5));
+            int popupWidth = Math.Max(
+                S(DcduStyleManager.IsA220 ? 128 : 124),
+                contentWidth + S(DcduStyleManager.IsA220 ? 14 : 12));
+            int popupHeight = Math.Max(
+                S(DcduStyleManager.IsA220 ? 58 : 52),
+                rowY + S(DcduStyleManager.IsA220 ? 6 : 5));
             autoDeleteActionPopupPanel.Size = new Size(popupWidth, popupHeight);
+
+            if (DcduStyleManager.IsA220)
+            {
+                int centeredButtonWidth = Math.Max(S(80), popupWidth - S(16));
+                int centeredButtonX = Math.Max(0, (popupWidth - centeredButtonWidth) / 2);
+                foreach (System.Windows.Forms.Label actionLabel in autoDeleteActionPopupPanel.Controls.OfType<System.Windows.Forms.Label>())
+                {
+                    actionLabel.Location = new Point(centeredButtonX, actionLabel.Top);
+                    actionLabel.Size = new Size(centeredButtonWidth, actionLabel.Height);
+                    actionLabel.TextAlign = ContentAlignment.MiddleCenter;
+                    actionLabel.Padding = Padding.Empty;
+                    actionLabel.Invalidate();
+                }
+            }
+
             autoDeleteActionPopupPanel.Location = new Point(
                 Math.Max(S(4), Math.Min(localPoint.X - popupWidth + menuLabel.Width, screenPanel.Width - popupWidth - S(4))),
                 Math.Max(S(4), Math.Min(localPoint.Y, screenPanel.Height - popupHeight - S(4))));
@@ -24160,6 +28360,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
             clearanceTimelinePopupPinned = pin || clearanceTimelinePopupPinned;
             UpdateClearanceHoverPopupText();
+            PositionClearanceTimelinePopup();
             clearanceTimelinePopupPanel.Visible = true;
             clearanceTimelinePopupPanel.BringToFront();
             clearanceTimelinePopupPanel.Invalidate();
@@ -24724,6 +28925,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 return;
             }
 
+            if (DcduStyleManager.IsA220)
+            {
+                ShowA220StyledMessagePreview(message);
+                return;
+            }
+
             HideMainScreenForStyledMessagePreview();
 
             messageFormatPanel.SuspendLayout();
@@ -25281,6 +29488,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             var unit = cpdlcUnitParse.Match(_response);
             if (unit.Success)
             {
+                cpdlcSessionEstablished = true;
                 CurrentATCUnit = unit.Value.Trim('_', '@');
             }
 
@@ -25328,9 +29536,13 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             {
                 messageString = messageContent[1];
             }
-            if (messageString.StartsWith("HANDOVER"))
+
+            messageString = (messageString ?? string.Empty).Trim();
+            string controlMessage = Regex.Replace(messageString, @"\s+", " ").ToUpperInvariant();
+
+            if (controlMessage.StartsWith("HANDOVER", StringComparison.Ordinal))
             {
-                string nextATCUnit = messageString.Split(' ').Last().Trim('@').Trim();
+                string nextATCUnit = controlMessage.Split(' ').Last().Trim('@').Trim();
                 SetNextAtcUnitDisplay(nextATCUnit);
                 CurrentATCUnit = null;
                 pendingLogon = nextATCUnit;
@@ -25339,13 +29551,24 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 messageOutCounter += 1;
                 _showUser = false;
             }
-            else if (messageString.StartsWith("LOGON ACCEPTED"))
+            else if (IsCpdlcConnectionEstablishedText(controlMessage))
             {
-                string connectedUnit = !string.IsNullOrWhiteSpace(pendingLogon)
+                string fallbackUnit = !string.IsNullOrWhiteSpace(pendingLogon)
                     ? pendingLogon
                     : NormalizeAtcUnitCallsign(_sender);
+                string connectedUnit = ExtractConnectedAtcUnitFromCpdlcText(controlMessage, fallbackUnit);
 
-                CurrentATCUnit = connectedUnit;
+                cpdlcSessionEstablished = true;
+                pendingLogon = null;
+                if (!string.IsNullOrWhiteSpace(connectedUnit))
+                {
+                    CurrentATCUnit = connectedUnit;
+                }
+                else
+                {
+                    RemoveObsoleteCpdlcWatchMessages();
+                }
+
                 ClearNextAtcUnitDisplay();
                 if (string.Equals(cpdlcHandoverTargetCode, connectedUnit, StringComparison.OrdinalIgnoreCase) &&
                     IsCpdlcUnitVerifiedOnActiveFrequency(connectedUnit))
@@ -25356,9 +29579,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 WriteMessage("CPDLC CONNECTED TO: " + CurrentATCUnit, "CPDLC", _sender, false, header);
                 _showUser = false;
             }
-            else if (messageString.StartsWith("CURRENT ATC UNIT") || messageString.StartsWith("CURRENT ATS UNIT"))
+            else if (controlMessage.StartsWith("CURRENT ATC UNIT", StringComparison.Ordinal) ||
+                     controlMessage.StartsWith("CURRENT ATS UNIT", StringComparison.Ordinal))
             {
-                string connectedUnit = ExtractCurrentAtcUnitFromMessage(messageString, _sender);
+                string connectedUnit = ExtractCurrentAtcUnitFromMessage(controlMessage, _sender);
+                cpdlcSessionEstablished = true;
+                pendingLogon = null;
                 if (!string.IsNullOrWhiteSpace(connectedUnit))
                 {
                     CurrentATCUnit = connectedUnit;
@@ -25378,9 +29604,11 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
             Logger.Debug(message);
 
-            if (message.Contains("LOGOFF"))
+            if (message.Contains("LOGOFF", StringComparison.OrdinalIgnoreCase) ||
+                message.Contains("CONNECTION TERMINATED", StringComparison.OrdinalIgnoreCase))
             {
-                StartCpdlcVerifiedSuggestionCooldownForCurrentConnection("CPDLC logoff received", _sender);
+                StartCpdlcVerifiedSuggestionCooldownForCurrentConnection("CPDLC logoff / termination received", _sender);
+                cpdlcSessionEstablished = false;
                 CurrentATCUnit = null;
                 pendingLogon = null;
                 ClearNextAtcUnitDisplay();
@@ -25389,6 +29617,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             else if (IsCpdlcGoodbyeOrUnicomInstruction(message))
             {
                 StartCpdlcVerifiedSuggestionCooldownForCurrentConnection("CPDLC goodbye / monitor advisory", _sender);
+                cpdlcSessionEstablished = false;
                 CurrentATCUnit = null;
                 pendingLogon = null;
                 ClearNextAtcUnitDisplay();
@@ -26095,6 +30324,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 vatsimCallsignMismatchWarningActive = false;
                 lastVatsimCallsignMismatchWarningUtc = DateTime.MinValue;
                 pendingLogon = null;
+                cpdlcSessionEstablished = false;
                 CurrentATCUnit = null;
                 ClearNextAtcUnitDisplay();
                 loadedFlightPlanSignature = string.Empty;
@@ -26387,8 +30617,11 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return (index >= 1 && index <= 4) || (!rightSide && index == bottom);
 
                 case EmbeddedSetupPage.Style:
-                    return (!rightSide && (index == 1 || index == 2 || index == bottom)) ||
-                           (rightSide && index == 3);
+                    // Left line-select keys choose AIRBUS, BOEING and A220.
+                    // The right line-select key on row 4 changes window scale.
+                    return (!rightSide &&
+                            (index == 1 || index == 2 || index == 3 || index == bottom)) ||
+                           (rightSide && index == 4);
 
                 case EmbeddedSetupPage.UpdateRollback:
                     if (!rightSide && index == bottom)
@@ -26509,7 +30742,11 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     {
                         SetEmbeddedSetupDisplayStyle(DcduStyleManager.Boeing);
                     }
-                    else if (rightSide && index == 3)
+                    else if (!rightSide && index == 3)
+                    {
+                        SetEmbeddedSetupDisplayStyle(DcduStyleManager.A220);
+                    }
+                    else if (rightSide && index == 4)
                     {
                         CycleEmbeddedSetupWindowScale();
                     }
@@ -26571,8 +30808,19 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             messageFormatPanel.Visible = true;
             messageFormatPanel.Enabled = true;
             messageFormatPanel.BringToFront();
-            messageFormatPanel.Location = SP(new Point(12, 10));
-            messageFormatPanel.Size = new Size(Math.Max(1, screenPanel.Width - S(24)), Math.Max(1, screenPanel.Height - S(20)));
+            if (DcduStyleManager.IsA220)
+            {
+                messageFormatPanel.Location = Point.Empty;
+                messageFormatPanel.Size = screenPanel.ClientSize;
+                messageFormatPanel.BackColor = Color.Black;
+                ApplyA220BlackGradient(messageFormatPanel);
+            }
+            else
+            {
+                messageFormatPanel.Location = SP(new Point(12, 10));
+                messageFormatPanel.Size = new Size(Math.Max(1, screenPanel.Width - S(24)), Math.Max(1, screenPanel.Height - S(20)));
+                messageFormatPanel.BackColor = Color.Transparent;
+            }
             messageFormatPanel.Padding = SPad(new Padding(0));
             messageFormatPanel.Margin = SPad(new Padding(0));
             messageFormatPanel.AutoScroll = false;
@@ -26585,12 +30833,18 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         {
             Panel canvas = new()
             {
-                BackColor = Color.Transparent,
+                BackColor = DcduStyleManager.IsA220
+                    ? Color.Black
+                    : Color.Transparent,
                 Margin = new Padding(0),
                 Padding = new Padding(0),
                 Size = messageFormatPanel.ClientSize
             };
             messageFormatPanel.Controls.Add(canvas);
+            if (DcduStyleManager.IsA220)
+            {
+                ApplyA220BlackGradient(canvas);
+            }
             canvas.BringToFront();
             return canvas;
         }
@@ -26641,6 +30895,374 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             return box;
         }
 
+
+        private Button AddA220SetupButton(Control parent, string text, int x, int y, int width, int height, Action onClick, bool accent = false)
+        {
+            return AddA220AocButton(parent, text, x, y, width, height, onClick, accent);
+        }
+
+        private TextBox AddA220SetupTextBox(Control parent, string key, string value, int x, int y, int width, int maxLength, bool password = false)
+        {
+            int logicalHeight = 30;
+            Panel frame = new()
+            {
+                BackColor = Color.FromArgb(52, 56, 61),
+                Location = new Point(x, y),
+                Size = new Size(width, logicalHeight),
+                Margin = new Padding(0),
+                Padding = new Padding(0),
+                Cursor = Cursors.IBeam,
+                TabStop = false
+            };
+
+            TextBox box = new()
+            {
+                Name = "embeddedSetup_" + key,
+                BackColor = Color.FromArgb(52, 56, 61),
+                ForeColor = DcduTheme.Cyan,
+                BorderStyle = BorderStyle.None,
+                CharacterCasing = CharacterCasing.Normal,
+                Font = CreateDpiStablePointFont("Consolas", 10.4f, FontStyle.Regular),
+                Location = new Point(8, 6),
+                Size = new Size(Math.Max(1, width - 16), 18),
+                MaxLength = maxLength,
+                Text = value ?? string.Empty,
+                UseSystemPasswordChar = password,
+                Multiline = false
+            };
+
+            bool focused = false;
+            frame.Paint += (_, e) =>
+            {
+                Rectangle bounds = new Rectangle(0, 0, Math.Max(1, frame.Width - 1), Math.Max(1, frame.Height - 1));
+                using Pen border = new Pen(focused ? Color.FromArgb(82, 158, 228) : Color.FromArgb(164, 168, 172), focused ? 1.5f : 1.0f);
+                e.Graphics.DrawRectangle(border, bounds);
+            };
+
+            void SetFocusState(bool valueState)
+            {
+                focused = valueState;
+                Color background = valueState ? Color.FromArgb(63, 69, 75) : Color.FromArgb(52, 56, 61);
+                frame.BackColor = background;
+                box.BackColor = background;
+                frame.Invalidate();
+            }
+
+            box.TextChanged += (_, __) => SaveEmbeddedSetupTextValue(key, box.Text ?? string.Empty);
+            box.GotFocus += (_, __) => SetFocusState(true);
+            box.LostFocus += (_, __) => SetFocusState(false);
+            frame.Click += (_, __) => box.Focus();
+            frame.Controls.Add(box);
+            parent.Controls.Add(frame);
+            frame.BringToFront();
+            embeddedSetupInputs[key] = box;
+            return box;
+        }
+
+        private void RenderA220SetupMainMenu(Panel page)
+        {
+            AddA220AocHeader(page, "SETUP MENU");
+            int margin = S(18);
+            int gap = S(14);
+            int top = S(54);
+            int buttonHeight = S(38);
+            int buttonWidth = Math.Max(S(180), (page.Width - (margin * 3)) / 2);
+            int rightX = page.Width - margin - buttonWidth;
+            AddA220SetupButton(page, "ACCOUNT / LOGIN", margin, top, buttonWidth, buttonHeight, ShowEmbeddedSetupAccountPage);
+            AddA220SetupButton(page, "OPTIONS", rightX, top, buttonWidth, buttonHeight, ShowEmbeddedSetupOptionsPage);
+            AddA220SetupButton(page, "DISPLAY STYLE", margin, top + buttonHeight + gap, buttonWidth, buttonHeight, ShowEmbeddedSetupStylePage);
+            AddA220SetupButton(page, "UPDATE / ROLLBACK", rightX, top + buttonHeight + gap, buttonWidth, buttonHeight, () => ShowEmbeddedSetupUpdateRollbackPage(true));
+            AddAirbusAocLabel(page, "CURRENT STYLE", margin, top + ((buttonHeight + gap) * 2) + S(8), buttonWidth, S(20), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddAirbusAocLabel(page, DcduStyleManager.CurrentStyle.ToUpperInvariant(), rightX, top + ((buttonHeight + gap) * 2) + S(8), buttonWidth, S(20), ContentAlignment.MiddleRight, DcduTheme.Cyan, EmbeddedSetupCaptionFont());
+            AddA220SetupButton(page, "CLOSE", margin, page.Height - S(54), buttonWidth, buttonHeight, CloseEmbeddedSetupPages);
+        }
+
+        private void RenderA220SetupAccountPage(Panel page)
+        {
+            AddA220AocHeader(page, "SETUP MENU", "ACCOUNT / LOGIN");
+            int margin = S(18);
+            int leftWidth = Math.Max(S(170), (page.Width / 2) - S(36));
+            int rightX = page.Width / 2 + S(8);
+            int inputWidth = Math.Max(S(190), page.Width - rightX - margin);
+            int y = S(58);
+            int rowGap = S(52);
+            AddAirbusAocLabel(page, "VATSIM CID", margin, y, leftWidth, S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddA220SetupTextBox(page, SetupInputCid, SavedCID > 0 ? SavedCID.ToString(System.Globalization.CultureInfo.InvariantCulture) : string.Empty, rightX, y - S(4), inputWidth, 8);
+            y += rowGap;
+            AddAirbusAocLabel(page, "HOPPIE LOGON CODE", margin, y, leftWidth, S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddA220SetupTextBox(page, SetupInputHoppie, SavedHoppieCode, rightX, y - S(4), inputWidth, 64, true);
+            y += rowGap;
+            AddAirbusAocLabel(page, "SIMBRIEF PILOT ID", margin, y, leftWidth, S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddA220SetupTextBox(page, SetupInputSimbrief, SimbriefID, rightX, y - S(4), inputWidth, 64);
+            int footerY = page.Height - S(54);
+            int buttonWidth = Math.Max(S(180), (page.Width - (margin * 3)) / 2);
+            AddA220SetupButton(page, "RETURN / SETUP", margin, footerY, buttonWidth, S(38), ShowEmbeddedSetupMainMenu);
+            AddA220SetupButton(page, "CLOSE", page.Width - margin - buttonWidth, footerY, buttonWidth, S(38), CloseEmbeddedSetupPages);
+        }
+
+        private void RenderA220SetupOptionsPage(Panel page)
+        {
+            AddA220AocHeader(page, "SETUP MENU", "OPTIONS");
+            int margin = S(18);
+            int valueWidth = S(168);
+            int labelWidth = Math.Max(S(180), page.Width - (margin * 3) - valueWidth);
+            int valueX = page.Width - margin - valueWidth;
+            int y = S(58);
+            int rowGap = S(46);
+
+            void AddOptionRow(string label, string value, Action click)
+            {
+                AddAirbusAocLabel(page, label, margin, y, labelWidth, S(22), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupMenuFont());
+                AddA220SetupButton(page, value, valueX, y - S(6), valueWidth, S(34), click, string.Equals(value, "ON", StringComparison.OrdinalIgnoreCase));
+                y += rowGap;
+            }
+
+            AddOptionRow("SOUND ALERT", EmbeddedSetupOnOff(PlaySound), ToggleEmbeddedSetupPlaySound);
+            AddOptionRow("AUTO DELETE MSG", EmbeddedSetupOnOff(AutoDeleteRequestMessages), ToggleEmbeddedSetupAutoDelete);
+            if (AutoDeleteRequestMessages)
+            {
+                AddOptionRow("AUTO DELETE TIMER", AutoDeleteRequestMessageSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + "S", CycleEmbeddedSetupAutoDeleteSeconds);
+            }
+            AddOptionRow("USE FSUIPC", EmbeddedSetupOnOff(UseFSUIPC), ToggleEmbeddedSetupFsuipc);
+            AddOptionRow("MSG TEXT SIZE", MessageTextSize.ToUpperInvariant(), CycleEmbeddedSetupMessageTextSize);
+
+            int footerY = page.Height - S(54);
+            int buttonWidth = Math.Max(S(180), (page.Width - (margin * 3)) / 2);
+            AddA220SetupButton(page, "RETURN / SETUP", margin, footerY, buttonWidth, S(38), ShowEmbeddedSetupMainMenu);
+            AddA220SetupButton(page, "CLOSE", page.Width - margin - buttonWidth, footerY, buttonWidth, S(38), CloseEmbeddedSetupPages);
+        }
+
+        private void RenderA220SetupAutoDeleteTimerPage(Panel page)
+        {
+            AddA220AocHeader(page, "SETUP MENU", "AUTO DELETE TIMER");
+            AddAirbusAocLabel(page, "SELECT DELETE DELAY", S(18), S(42), page.Width - S(36), S(18), ContentAlignment.MiddleLeft, DcduTheme.Cyan, EmbeddedSetupCaptionFont());
+            int[] values = EmbeddedSetupAutoDeleteTimerValues();
+            int margin = S(18);
+            int gap = S(14);
+            int buttonWidth = Math.Max(S(160), (page.Width - (margin * 3)) / 2);
+            int rightX = page.Width - margin - buttonWidth;
+            int top = S(70);
+            int rowHeight = S(34);
+            for (int i = 0; i < 4; i++)
+            {
+                int seconds = values[i];
+                AddA220SetupButton(page, seconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + " SEC", margin, top + (i * (rowHeight + gap)), buttonWidth, rowHeight, () => SetEmbeddedSetupAutoDeleteSeconds(seconds), seconds == AutoDeleteRequestMessageSeconds);
+            }
+            for (int i = 0; i < 4; i++)
+            {
+                int seconds = values[i + 4];
+                AddA220SetupButton(page, seconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + " SEC", rightX, top + (i * (rowHeight + gap)), buttonWidth, rowHeight, () => SetEmbeddedSetupAutoDeleteSeconds(seconds), seconds == AutoDeleteRequestMessageSeconds);
+            }
+            AddA220SetupButton(page, "RETURN / OPTIONS", margin, page.Height - S(54), buttonWidth, S(38), ShowEmbeddedSetupOptionsPage);
+        }
+
+        private void RenderA220SetupUpdateRollbackPage(Panel page, bool refresh)
+        {
+            AddA220AocHeader(page, "SETUP MENU", "UPDATE / ROLLBACK");
+            int margin = S(18);
+            int y = S(48);
+            AddAirbusAocLabel(page, "CURRENT VERSION", margin, y, S(190), S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddAirbusAocLabel(page, System.Windows.Forms.Application.ProductVersion, page.Width - S(220), y, S(202), S(18), ContentAlignment.MiddleRight, DcduTheme.Cyan, EmbeddedSetupCaptionFont());
+            y += S(30);
+            int buttonWidth = Math.Max(S(190), page.Width - (margin * 2));
+            if (embeddedSetupRollbackLoading)
+            {
+                AddAirbusAocLabel(page, "LOADING RELEASES FROM GITHUB...", margin, y, buttonWidth, S(22), ContentAlignment.MiddleLeft, DcduTheme.Cyan, EmbeddedSetupMenuFont());
+            }
+            else if (embeddedSetupRollbackReleases.Count == 0)
+            {
+                string status = string.IsNullOrWhiteSpace(embeddedSetupRollbackStatus) ? "NO SUPPORTED ROLLBACK RELEASES" : embeddedSetupRollbackStatus.ToUpperInvariant();
+                AddAirbusAocLabel(page, status, margin, y, buttonWidth, S(22), ContentAlignment.MiddleLeft, DcduTheme.Cyan, EmbeddedSetupMenuFont());
+            }
+            else
+            {
+                int rowY = y;
+                int rowH = S(34);
+                int gap = S(12);
+                int count = Math.Min(3, embeddedSetupRollbackReleases.Count);
+                for (int i = 0; i < count; i++)
+                {
+                    Release item = embeddedSetupRollbackReleases[i];
+                    string tag = string.IsNullOrWhiteSpace(item.TagName) ? item.Name : item.TagName;
+                    if (string.IsNullOrWhiteSpace(tag)) tag = "UNKNOWN";
+                    Release capture = item;
+                    AddA220SetupButton(page, "ROLLBACK " + tag.ToUpperInvariant(), margin, rowY, buttonWidth, rowH, () => ShowEmbeddedSetupRollbackConfirmPage(capture));
+                    rowY += rowH + gap;
+                }
+                if (!string.IsNullOrWhiteSpace(embeddedSetupRollbackStatus))
+                {
+                    AddAirbusAocLabel(page, embeddedSetupRollbackStatus.ToUpperInvariant(), margin, rowY + S(4), buttonWidth, S(18), ContentAlignment.MiddleLeft, DcduTheme.Cyan, EmbeddedSetupCaptionFont());
+                }
+            }
+            int footerY = page.Height - S(54);
+            int footerWidth = Math.Max(S(180), (page.Width - (margin * 3)) / 2);
+            AddA220SetupButton(page, "REFRESH", margin, footerY, footerWidth, S(38), () => ShowEmbeddedSetupUpdateRollbackPage(true));
+            AddA220SetupButton(page, "RETURN / SETUP", page.Width - margin - footerWidth, footerY, footerWidth, S(38), ShowEmbeddedSetupMainMenu);
+            if (refresh || (!embeddedSetupRollbackLoading && embeddedSetupRollbackReleases.Count == 0 && string.IsNullOrWhiteSpace(embeddedSetupRollbackStatus)))
+            {
+                _ = LoadEmbeddedSetupRollbackReleasesAsync();
+            }
+        }
+
+        private void RenderA220SetupRollbackConfirmPage(Panel page, Release release)
+        {
+            string tag = string.IsNullOrWhiteSpace(release?.TagName) ? release?.Name : release.TagName;
+            if (string.IsNullOrWhiteSpace(tag)) tag = "SELECTED VERSION";
+            AddA220AocHeader(page, "SETUP MENU", "ROLLBACK CONFIRM");
+            AddAirbusAocLabel(page, "ROLLBACK TO", S(18), S(58), page.Width - S(36), S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddAirbusAocLabel(page, tag.ToUpperInvariant(), S(18), S(82), page.Width - S(36), S(24), ContentAlignment.MiddleLeft, DcduTheme.Cyan, EmbeddedSetupMenuFont());
+            AddAirbusAocLabel(page, "THE APP WILL RESTART AFTER INSTALL.", S(18), S(122), page.Width - S(36), S(18), ContentAlignment.MiddleLeft, DcduTheme.CyanWhite, EmbeddedSetupCaptionFont());
+            int margin = S(18);
+            int buttonWidth = Math.Max(S(180), (page.Width - (margin * 3)) / 2);
+            int footerY = page.Height - S(54);
+            AddA220SetupButton(page, "NO", margin, footerY, buttonWidth, S(38), () => ShowEmbeddedSetupUpdateRollbackPage(false));
+            AddA220SetupButton(page, "YES", page.Width - margin - buttonWidth, footerY, buttonWidth, S(38), () => _ = StartEmbeddedSetupRollbackAsync(), true);
+        }
+
+        private void RenderA220SetupStylePage(Panel page)
+        {
+            AddA220AocHeader(page, "SETUP MENU", "DISPLAY STYLE");
+            int margin = S(18);
+            int buttonWidth = Math.Max(S(190), page.Width - (margin * 2));
+            int y = S(54);
+            int gap = S(12);
+            AddA220SetupButton(page, "AIRBUS" + (string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.Airbus, StringComparison.OrdinalIgnoreCase) ? "  ACTIVE" : string.Empty), margin, y, buttonWidth, S(34), () => SetEmbeddedSetupDisplayStyle(DcduStyleManager.Airbus), string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.Airbus, StringComparison.OrdinalIgnoreCase));
+            y += S(46);
+            AddA220SetupButton(page, "BOEING" + (string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase) ? "  ACTIVE" : string.Empty), margin, y, buttonWidth, S(34), () => SetEmbeddedSetupDisplayStyle(DcduStyleManager.Boeing), string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase));
+            y += S(46);
+            AddA220SetupButton(page, "A220" + (string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.A220, StringComparison.OrdinalIgnoreCase) ? "  ACTIVE" : string.Empty), margin, y, buttonWidth, S(34), () => SetEmbeddedSetupDisplayStyle(DcduStyleManager.A220), string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.A220, StringComparison.OrdinalIgnoreCase));
+            y += S(56);
+            AddAirbusAocLabel(page, "WINDOW SCALE", margin, y, S(200), S(18), ContentAlignment.MiddleLeft, Color.WhiteSmoke, EmbeddedSetupCaptionFont());
+            AddA220SetupButton(page, WindowScalePercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%", page.Width - margin - S(140), y - S(8), S(140), S(34), CycleEmbeddedSetupWindowScale);
+            AddAirbusAocLabel(page, "STYLE / SCALE APPLIES IMMEDIATELY", margin, y + S(40), page.Width - S(36), S(18), ContentAlignment.MiddleLeft, DcduTheme.CyanWhite, EmbeddedSetupCaptionFont());
+            AddA220SetupButton(page, "RETURN / SETUP", margin, page.Height - S(54), buttonWidth, S(38), ShowEmbeddedSetupMainMenu);
+        }
+
+        private void ShowA220StyledMessagePreview(CPDLCMessage message)
+        {
+            if (messageFormatPanel == null || messageFormatPanel.IsDisposed || screenPanel == null)
+            {
+                return;
+            }
+
+            HideMainScreenForStyledMessagePreview();
+            SetA220MainGuideLinesVisible(false);
+            messageFormatPanel.SuspendLayout();
+            messageFormatPanel.Controls.Clear();
+            messageFormatPanel.Visible = true;
+            messageFormatPanel.Enabled = true;
+            messageFormatPanel.Location = Point.Empty;
+            messageFormatPanel.Size = screenPanel.ClientSize;
+            messageFormatPanel.BackColor = Color.Black;
+            ApplyA220BlackGradient(messageFormatPanel);
+            messageFormatPanel.AutoScroll = false;
+            messageFormatPanel.AutoScrollMinSize = Size.Empty;
+            messageFormatPanel.FlowDirection = FlowDirection.LeftToRight;
+            messageFormatPanel.WrapContents = false;
+            messageFormatPanel.BringToFront();
+
+            Panel page = new()
+            {
+                BackColor = Color.Black,
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+                Size = messageFormatPanel.ClientSize,
+                Tag = A220PhysicalLayoutTag
+            };
+            messageFormatPanel.Controls.Add(page);
+            ApplyA220BlackGradient(page);
+
+            AddA220AocHeader(page, "MESSAGE VIEW");
+            string headerText = StyledPreviewHeaderText(message);
+            AddAirbusAocLabel(page, headerText, S(18), S(46), page.Width - S(36), S(20), ContentAlignment.MiddleLeft, DcduTheme.Green, CreateDpiStablePointFont("Consolas", 10.8f, FontStyle.Bold));
+
+            Panel bodyFrame = new()
+            {
+                BackColor = Color.FromArgb(2, 2, 2),
+                Location = new Point(S(18), S(72)),
+                Size = new Size(Math.Max(1, page.Width - S(36)), Math.Max(S(160), page.Height - S(136)))
+            };
+            bodyFrame.Paint += (_, e) =>
+            {
+                Rectangle bounds = new Rectangle(0, 0, Math.Max(1, bodyFrame.Width - 1), Math.Max(1, bodyFrame.Height - 1));
+                using Pen border = new Pen(Color.FromArgb(138, 144, 150), 1.0f);
+                e.Graphics.DrawRectangle(border, bounds);
+            };
+            page.Controls.Add(bodyFrame);
+            bodyFrame.BringToFront();
+
+            string previewText = GetPreviewMessageText(message).ToUpperInvariant();
+            if (IsClearanceStatusText(message?.message ?? string.Empty))
+            {
+                previewText = previewText.Trim();
+            }
+            AddStyledPreviewBody(bodyFrame, previewText, S(10), S(10), Math.Max(1, bodyFrame.Width - S(20)), Math.Max(1, bodyFrame.Height - S(20)), GetMessageTextFont(true));
+
+            string responseCode = (message?.header?.Responses ?? "NE").Trim().ToUpperInvariant();
+            bool canReply = message != null &&
+                string.Equals(message.type, "CPDLC", StringComparison.OrdinalIgnoreCase) &&
+                !message.outbound &&
+                !message.acknowledged &&
+                message.header != null &&
+                !string.IsNullOrWhiteSpace(responseCode) &&
+                !string.Equals(responseCode, "NE", StringComparison.OrdinalIgnoreCase);
+
+            int footerY = page.Height - S(50);
+            int margin = S(18);
+            int gap = S(10);
+            int buttonWidth = S(150);
+            int buttonHeight = S(34);
+
+            void AddBottomButton(string caption, int x, Action click, bool accent = false)
+            {
+                Button actionButton = AddA220SetupButton(
+                    page,
+                    caption,
+                    x,
+                    footerY,
+                    buttonWidth,
+                    buttonHeight,
+                    click,
+                    accent);
+
+                // Reply transmission status temporarily replaces the whole footer.
+                actionButton.AccessibleDescription = "DCDU_STYLED_MESSAGE_ACTION";
+            }
+
+            if (canReply)
+            {
+                AddBottomButton("RETURN", margin, ClearPreview);
+                switch (responseCode)
+                {
+                    case "WU":
+                        AddBottomButton("UNABLE", margin + buttonWidth + gap, () => ReplyMessage(EventArgs.Empty, message, "UNABLE"));
+                        AddBottomButton("STBY", margin + ((buttonWidth + gap) * 2), () => ReplyMessage(EventArgs.Empty, message, "STANDBY"));
+                        AddBottomButton("WILCO", page.Width - margin - buttonWidth, () => ReplyMessage(EventArgs.Empty, message, "WILCO"), true);
+                        break;
+                    case "AN":
+                        AddBottomButton("NEG", margin + buttonWidth + gap, () => ReplyMessage(EventArgs.Empty, message, "NEGATIVE"));
+                        AddBottomButton("STBY", margin + ((buttonWidth + gap) * 2), () => ReplyMessage(EventArgs.Empty, message, "STANDBY"));
+                        AddBottomButton("AFFIRM", page.Width - margin - buttonWidth, () => ReplyMessage(EventArgs.Empty, message, "AFFIRMATIVE"), true);
+                        break;
+                    case "R":
+                        AddBottomButton("STBY", margin + buttonWidth + gap, () => ReplyMessage(EventArgs.Empty, message, "STANDBY"));
+                        AddBottomButton("ROGER", page.Width - margin - buttonWidth, () => ReplyMessage(EventArgs.Empty, message, "ROGER"), true);
+                        break;
+                }
+            }
+            else
+            {
+                AddBottomButton("RETURN", margin, ClearPreview);
+                AddBottomButton("DELETE", page.Width - margin - (buttonWidth * 2) - gap, () => DeleteElement(EventArgs.Empty, message));
+                AddBottomButton("CLOSE", page.Width - margin - buttonWidth, ClearPreview);
+            }
+
+            messageFormatPanel.ResumeLayout(false);
+            HidePreviewHorizontalScrollbar();
+            page.BringToFront();
+            page.Focus();
+        }
+
         private string EmbeddedSetupOnOff(bool value)
         {
             return value ? "ON" : "OFF";
@@ -26689,6 +31311,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupMainMenu()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.MainMenu);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupMainMenu(a220Page);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -26706,6 +31334,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupAccountPage()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.Account);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupAccountPage(a220Page);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font captionFont = EmbeddedSetupCaptionFont();
@@ -26723,7 +31357,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             AddEmbeddedSetupTextBox(page, SetupInputHoppie, SavedHoppieCode, leftX + 180, y - 2, 190, 64, true);
             y += 44;
 
-            AddEmbeddedSetupLabel(page, "SIMBRIEF USERNAME", leftX, y, 190, 18, ContentAlignment.MiddleLeft, color, captionFont);
+            AddEmbeddedSetupLabel(page, "SIMBRIEF PILOT ID", leftX, y, 190, 18, ContentAlignment.MiddleLeft, color, captionFont);
             AddEmbeddedSetupTextBox(page, SetupInputSimbrief, SimbriefID, leftX + 180, y - 2, 190, 64);
             AddEmbeddedSetupLabel(page, "<SETUP MENU", 4, EmbeddedSetupLskTextY(page, EmbeddedSetupBottomIndex()), 230, 30, ContentAlignment.MiddleLeft, color, EmbeddedSetupMenuFont());
         }
@@ -26731,6 +31365,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupOptionsPage()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.Options);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupOptionsPage(a220Page);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -26780,6 +31420,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupAutoDeleteTimerPage()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.AutoDeleteTimer);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupAutoDeleteTimerPage(a220Page);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -26819,6 +31465,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupUpdateRollbackPage(bool refresh)
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.UpdateRollback);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupUpdateRollbackPage(a220Page, refresh);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -26971,6 +31623,13 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             embeddedSetupSelectedRollbackRelease = release;
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.RollbackConfirm);
 
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupRollbackConfirmPage(a220Page, release);
+                return;
+            }
+
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -27095,6 +31754,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void ShowEmbeddedSetupStylePage()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.Style);
+            if (DcduStyleManager.IsA220)
+            {
+                Panel a220Page = CreateEmbeddedSetupCanvas();
+                RenderA220SetupStylePage(a220Page);
+                return;
+            }
             Panel page = CreateEmbeddedSetupCanvas();
             Font titleFont = EmbeddedSetupTitleFont();
             Font menuFont = EmbeddedSetupMenuFont();
@@ -27110,10 +31775,17 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             AddEmbeddedSetupLabel(page, string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase) ? "ACTIVE" : string.Empty,
                 page.Width - 160, EmbeddedSetupRightLskTextY(page, 2), 156, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
 
-            AddEmbeddedSetupLabel(page, "WINDOW SCALE", 4, EmbeddedSetupLskTextY(page, 3), 220, 30, ContentAlignment.MiddleLeft, color, menuFont);
-            AddEmbeddedSetupLabel(page, WindowScalePercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%>", page.Width - 160, EmbeddedSetupRightLskTextY(page, 3), 156, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
+            AddEmbeddedSetupLabel(page, "<A220", 4, EmbeddedSetupLskTextY(page, 3), 220, 30, ContentAlignment.MiddleLeft, color, menuFont);
+            AddEmbeddedSetupLabel(page, string.Equals(DcduStyleManager.CurrentStyle, DcduStyleManager.A220, StringComparison.OrdinalIgnoreCase) ? "ACTIVE" : string.Empty,
+                page.Width - 160, EmbeddedSetupRightLskTextY(page, 3), 156, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
 
-            AddEmbeddedSetupLabel(page, "STYLE/SCALE APPLIES IMMEDIATELY", 4, EmbeddedSetupLskTextY(page, 4), page.Width - 8, 22, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
+            AddEmbeddedSetupLabel(page, "WINDOW SCALE", 4, EmbeddedSetupLskTextY(page, 4), 220, 30, ContentAlignment.MiddleLeft, color, menuFont);
+            AddEmbeddedSetupLabel(page, WindowScalePercent.ToString(System.Globalization.CultureInfo.InvariantCulture) + "%>", page.Width - 160, EmbeddedSetupRightLskTextY(page, 4), 156, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
+
+            int styleHintY = Math.Min(
+                EmbeddedSetupLskTextY(page, 4) + 30,
+                EmbeddedSetupLskTextY(page, EmbeddedSetupBottomIndex()) - 22);
+            AddEmbeddedSetupLabel(page, "STYLE/SCALE APPLIES IMMEDIATELY", 4, styleHintY, page.Width - 8, 20, ContentAlignment.MiddleLeft, DcduTheme.Amber, captionFont);
             AddEmbeddedSetupLabel(page, "<SETUP MENU", 4, EmbeddedSetupLskTextY(page, EmbeddedSetupBottomIndex()), 230, 30, ContentAlignment.MiddleLeft, color, menuFont);
         }
 
@@ -27136,7 +31808,6 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             WindowScalePercent = percent;
             Properties.Settings.Default.Save();
             RefreshWindowScaleUi();
-            ShowEmbeddedSetupStylePage();
         }
 
         private void ResetScaleSensitivePopups()
@@ -27214,6 +31885,14 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 ApplyDisplayStyle();
                 ApplyMessageFilter();
                 RefreshMainDisplaySurface();
+
+                if (DcduStyleManager.IsA220)
+                {
+                    // A220 pages are generated controls. Rebuild the currently
+                    // visible surface after changing scale instead of stretching
+                    // controls created for the previous percentage.
+                    RebuildActiveA220SurfaceAfterScale();
+                }
             }
             catch (Exception ex)
             {
@@ -27221,11 +31900,80 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             }
         }
 
+        private void RebuildActiveA220SurfaceAfterScale()
+        {
+            if (!DcduStyleManager.IsA220)
+            {
+                return;
+            }
+
+            // Scale is changed from the style page, but keep this switch complete
+            // so future callers can safely refresh any active generated page.
+            switch (embeddedSetupPage)
+            {
+                case EmbeddedSetupPage.MainMenu:
+                    ShowEmbeddedSetupMainMenu();
+                    return;
+                case EmbeddedSetupPage.Account:
+                    ShowEmbeddedSetupAccountPage();
+                    return;
+                case EmbeddedSetupPage.Options:
+                    ShowEmbeddedSetupOptionsPage();
+                    return;
+                case EmbeddedSetupPage.AutoDeleteTimer:
+                    ShowEmbeddedSetupAutoDeleteTimerPage();
+                    return;
+                case EmbeddedSetupPage.UpdateRollback:
+                    ShowEmbeddedSetupUpdateRollbackPage(false);
+                    return;
+                case EmbeddedSetupPage.RollbackConfirm:
+                    if (embeddedSetupSelectedRollbackRelease != null)
+                    {
+                        ShowEmbeddedSetupRollbackConfirmPage(embeddedSetupSelectedRollbackRelease);
+                        return;
+                    }
+                    break;
+                case EmbeddedSetupPage.Style:
+                    ShowEmbeddedSetupStylePage();
+                    return;
+            }
+
+            switch (airbusAocPage)
+            {
+                case AirbusAocPage.MainMenu: ShowAirbusAocMainMenu(); return;
+                case AirbusAocPage.AtcRequestMenu: ShowAirbusAocAtcRequestMenu(); return;
+                case AirbusAocPage.PreDepClearance: ShowAirbusAocPreDepClearance(); return;
+                case AirbusAocPage.OceanicClearance: ShowAirbusAocOceanicClearance(); return;
+                case AirbusAocPage.WxRequest: ShowAirbusAocWeatherRequest(false); return;
+                case AirbusAocPage.AtisRequest: ShowAirbusAocWeatherRequest(true); return;
+                case AirbusAocPage.FreeTextRequest: ShowAirbusAocFreeTextRequest(); return;
+                case AirbusAocPage.AtcMainMenu: ShowAirbusAtcMainMenu(); return;
+                case AirbusAocPage.AtcConnectionMenu: ShowAirbusAtcConnectionMenu(); return;
+                case AirbusAocPage.AtcLogonRequest: ShowAirbusAtcLogonRequest(); return;
+                case AirbusAocPage.AtcDirectRequest: ShowAirbusAtcDirectRequest(); return;
+                case AirbusAocPage.AtcLevelRequest: ShowAirbusAtcLevelRequest(); return;
+                case AirbusAocPage.AtcSpeedRequest: ShowAirbusAtcSpeedRequest(); return;
+                case AirbusAocPage.AtcWhenCanWeRequest: ShowAirbusAtcWhenCanWeRequest(); return;
+            }
+
+            ApplyA220MainScreenLayout();
+        }
+
         private void SetEmbeddedSetupDisplayStyle(string style)
         {
-            string selected = string.Equals(style, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase)
-                ? DcduStyleManager.Boeing
-                : DcduStyleManager.Airbus;
+            string selected;
+            if (string.Equals(style, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase))
+            {
+                selected = DcduStyleManager.Boeing;
+            }
+            else if (string.Equals(style, DcduStyleManager.A220, StringComparison.OrdinalIgnoreCase))
+            {
+                selected = DcduStyleManager.A220;
+            }
+            else
+            {
+                selected = DcduStyleManager.Airbus;
+            }
 
             DcduStyleManager.CurrentStyle = selected;
             Properties.Settings.Default.Save();

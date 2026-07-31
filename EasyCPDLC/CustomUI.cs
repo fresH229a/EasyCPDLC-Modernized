@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.IO;
@@ -90,6 +90,7 @@ namespace EasyCPDLC
     {
         public const string Airbus = "AIRBUS";
         public const string Boeing = "BOEING";
+        public const string A220 = "A220";
 
         private static string currentStyle = LoadStyle();
 
@@ -104,6 +105,7 @@ namespace EasyCPDLC
         }
 
         public static bool IsBoeing => string.Equals(CurrentStyle, Boeing, StringComparison.OrdinalIgnoreCase);
+        public static bool IsA220 => string.Equals(CurrentStyle, A220, StringComparison.OrdinalIgnoreCase);
 
         public static string NormalizeStyle(string style)
         {
@@ -111,12 +113,18 @@ namespace EasyCPDLC
             {
                 return Boeing;
             }
+
+            if (string.Equals(style, A220, StringComparison.OrdinalIgnoreCase))
+            {
+                return A220;
+            }
+
             return Airbus;
         }
 
         public static string AssetFile(string airbusAssetFile)
         {
-            if (!IsBoeing || string.IsNullOrWhiteSpace(airbusAssetFile))
+            if (IsA220 || !IsBoeing || string.IsNullOrWhiteSpace(airbusAssetFile))
             {
                 return airbusAssetFile;
             }
@@ -249,6 +257,20 @@ namespace EasyCPDLC
         private string assetFileName;
         private Rectangle highlightRectangle = Rectangle.Empty;
         private bool highlightPressed;
+        private bool drawA220Bezel;
+
+        [Browsable(false)]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
+        public bool DrawA220Bezel
+        {
+            get => drawA220Bezel;
+            set
+            {
+                if (drawA220Bezel == value) return;
+                drawA220Bezel = value;
+                Invalidate();
+            }
+        }
 
         [Browsable(false)]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Hidden)]
@@ -315,18 +337,103 @@ namespace EasyCPDLC
             e.Graphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
 
-            cachedImage ??= DcduAssets.LoadImage(AssetFileName);
-            if (cachedImage != null)
+            if (DrawA220Bezel)
             {
-                e.Graphics.DrawImage(cachedImage, new Rectangle(0, 0, Width, Height));
+                DrawA220Background(e.Graphics);
             }
             else
             {
-                using SolidBrush fallback = new SolidBrush(DcduTheme.BezelMid);
-                e.Graphics.FillRectangle(fallback, ClientRectangle);
+                cachedImage ??= DcduAssets.LoadImage(AssetFileName);
+                if (cachedImage != null)
+                {
+                    e.Graphics.DrawImage(cachedImage, new Rectangle(0, 0, Width, Height));
+                }
+                else
+                {
+                    using SolidBrush fallback = new SolidBrush(DcduTheme.BezelMid);
+                    e.Graphics.FillRectangle(fallback, ClientRectangle);
+                }
             }
 
             DrawHotspotHighlight(e.Graphics);
+        }
+
+        private void DrawA220Background(Graphics graphics)
+        {
+            if (Width <= 2 || Height <= 2)
+            {
+                return;
+            }
+
+            graphics.SmoothingMode = SmoothingMode.AntiAlias;
+            graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
+
+            Rectangle outer = new Rectangle(1, 1, Width - 3, Height - 3);
+            int outerRadius = Math.Max(12, Math.Min(28, Math.Min(Width, Height) / 18));
+
+            using (GraphicsPath outerPath = DcduPanel.RoundedRect(outer, outerRadius))
+            using (LinearGradientBrush bezelBrush = new LinearGradientBrush(
+                outer,
+                Color.FromArgb(105, 124, 145),
+                Color.FromArgb(48, 64, 82),
+                LinearGradientMode.Vertical))
+            using (Pen brightEdge = new Pen(Color.FromArgb(145, 163, 183), 1.2f))
+            using (Pen darkEdge = new Pen(Color.FromArgb(20, 29, 39), 2.0f))
+            {
+                graphics.FillPath(bezelBrush, outerPath);
+                graphics.DrawPath(darkEdge, outerPath);
+
+                Rectangle highlight = Rectangle.Inflate(outer, -3, -3);
+                using GraphicsPath highlightPath = DcduPanel.RoundedRect(
+                    highlight,
+                    Math.Max(8, outerRadius - 3));
+                graphics.DrawPath(brightEdge, highlightPath);
+            }
+
+            // Dark recessed touchscreen area. The actual navigation and content controls
+            // are placed over this surface by MainForm.
+            Rectangle recess = new Rectangle(
+                Math.Max(14, Width / 50),
+                Math.Max(12, Height / 54),
+                Width - (Math.Max(14, Width / 50) * 2),
+                Height - (Math.Max(12, Height / 54) * 2));
+
+            using (GraphicsPath recessPath = DcduPanel.RoundedRect(
+                recess,
+                Math.Max(10, outerRadius - 7)))
+            using (LinearGradientBrush recessBrush = new LinearGradientBrush(
+                recess,
+                Color.FromArgb(10, 17, 25),
+                Color.FromArgb(2, 5, 9),
+                LinearGradientMode.Vertical))
+            using (Pen recessOuter = new Pen(Color.FromArgb(22, 31, 42), 5.0f))
+            using (Pen recessInner = new Pen(Color.FromArgb(122, 142, 161), 1.0f))
+            {
+                graphics.FillPath(recessBrush, recessPath);
+                graphics.DrawPath(recessOuter, recessPath);
+
+                Rectangle innerLine = Rectangle.Inflate(recess, -5, -5);
+                using GraphicsPath innerPath = DcduPanel.RoundedRect(
+                    innerLine,
+                    Math.Max(7, outerRadius - 10));
+                graphics.DrawPath(recessInner, innerPath);
+            }
+
+            // Very subtle blue reflection along the top edge, similar to the A220 display.
+            Rectangle reflection = new Rectangle(
+                recess.Left + 10,
+                recess.Top + 7,
+                Math.Max(1, recess.Width - 20),
+                Math.Max(1, recess.Height / 5));
+
+            using (LinearGradientBrush reflectionBrush = new LinearGradientBrush(
+                reflection,
+                Color.FromArgb(22, 72, 106, 142),
+                Color.FromArgb(0, 72, 106, 142),
+                LinearGradientMode.Vertical))
+            {
+                graphics.FillRectangle(reflectionBrush, reflection);
+            }
         }
 
         private void DrawHotspotHighlight(Graphics g)

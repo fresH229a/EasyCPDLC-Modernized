@@ -249,6 +249,7 @@ namespace EasyCPDLC
 
             styleSelector.Items.Add(DcduStyleManager.Airbus);
             styleSelector.Items.Add(DcduStyleManager.Boeing);
+            styleSelector.Items.Add(DcduStyleManager.A220);
             styleSelector.SelectedItem = DcduStyleManager.CurrentStyle;
             styleSelector.SelectedIndexChanged += StyleSelector_SelectedIndexChanged;
 

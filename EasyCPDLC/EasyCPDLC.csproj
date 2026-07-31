@@ -119,4 +119,31 @@
 		<EmbeddedResource Include="*.ico" />
 	</ItemGroup>
 
+
+	<!-- The updater is a separate visible C# executable. Its source must not be compiled into the main WinForms project. -->
+	<ItemGroup>
+		<Compile Remove="EasyCPDLC.Updater\**\*.cs" />
+		<EmbeddedResource Remove="EasyCPDLC.Updater\**\*" />
+		<None Remove="EasyCPDLC.Updater\**\*" />
+	</ItemGroup>
+
+	<PropertyGroup>
+		<IntegratedUpdaterProject>$(MSBuildProjectDirectory)\EasyCPDLC.Updater\EasyCPDLC.Updater.csproj</IntegratedUpdaterProject>
+		<IntegratedUpdaterPublishDir>$(MSBuildProjectDirectory)\obj\IntegratedUpdater\$(Configuration)\$(RuntimeIdentifier)\</IntegratedUpdaterPublishDir>
+	</PropertyGroup>
+
+	<!-- A normal Publish of EasyCPDLC also publishes the self-contained updater and copies it next to EasyCPDLC.exe. -->
+	<Target Name="PublishIntegratedUpdater" AfterTargets="Publish" Condition="Exists('$(IntegratedUpdaterProject)')">
+		<MSBuild
+			Projects="$(IntegratedUpdaterProject)"
+			Targets="Publish"
+			Properties="Configuration=$(Configuration);RuntimeIdentifier=$(RuntimeIdentifier);SelfContained=true;PublishSingleFile=true;PublishDir=$(IntegratedUpdaterPublishDir)" />
+		<Error
+			Condition="!Exists('$(IntegratedUpdaterPublishDir)EasyCPDLC.Updater.exe')"
+			Text="The integrated updater publish did not produce EasyCPDLC.Updater.exe." />
+		<Copy
+			SourceFiles="$(IntegratedUpdaterPublishDir)EasyCPDLC.Updater.exe"
+			DestinationFiles="$(PublishDir)EasyCPDLC.Updater.exe" />
+	</Target>
+
 </Project>

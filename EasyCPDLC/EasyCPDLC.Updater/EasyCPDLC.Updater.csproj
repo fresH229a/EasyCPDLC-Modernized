@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0-windows</TargetFramework>
+    <RuntimeIdentifier>win-x64</RuntimeIdentifier>
+    <OutputType>WinExe</OutputType>
+    <UseWindowsForms>true</UseWindowsForms>
+
+    <SelfContained>true</SelfContained>
+    <PublishSingleFile>true</PublishSingleFile>
+    <EnableCompressionInSingleFile>false</EnableCompressionInSingleFile>
+    <IncludeNativeLibrariesForSelfExtract>true</IncludeNativeLibrariesForSelfExtract>
+    <PublishTrimmed>false</PublishTrimmed>
+
+    <AssemblyName>EasyCPDLC.Updater</AssemblyName>
+    <RootNamespace>EasyCPDLC.Updater</RootNamespace>
+    <ApplicationIcon>..\Resources\EasyCPDLC.ico</ApplicationIcon>
+    <Company>EasyCPDLC</Company>
+    <Product>EasyCPDLC Updater</Product>
+    <Description>Visible update installer for EasyCPDLC</Description>
+
+    <DebugType>none</DebugType>
+    <DebugSymbols>false</DebugSymbols>
+  </PropertyGroup>
+</Project>
