@@ -3329,6 +3329,12 @@ private TelexForm tForm;
 
         private void AtisStatusLabel_MouseUp(object sender, MouseEventArgs e)
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideAtisAvailabilityPopup();
+                return;
+            }
+
             if (e.Button == MouseButtons.Right)
             {
                 _ = QuickWeatherRefreshAsync();
@@ -4471,6 +4477,47 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 flightPhaseLabel.ForeColor = FlightPhaseStatusColor();
                 flightPhaseLabel.BackColor = Color.Transparent;
             }
+
+            UpdateA220StatusActionAvailability();
+        }
+
+        private bool CanUseA220StatusActions()
+        {
+            return !DcduStyleManager.IsA220 || Connected;
+        }
+
+        private void UpdateA220StatusActionAvailability()
+        {
+            bool enabled = CanUseA220StatusActions();
+
+            foreach (System.Windows.Forms.Label label in new[]
+            {
+                clearanceStatusLabel,
+                datalinkStatusLabel,
+                atisStatusLabel,
+                atisAutoStatusLabel,
+                quickWxStatusLabel
+            })
+            {
+                if (label == null || label.IsDisposed)
+                {
+                    continue;
+                }
+
+                label.Enabled = enabled;
+                label.Cursor = enabled ? Cursors.Hand : Cursors.Default;
+                label.TabStop = enabled;
+                label.Invalidate();
+            }
+
+            if (!enabled)
+            {
+                HideClearanceTimelinePopup();
+                HidePdcQuickActionButton();
+                HideAtisAvailabilityPopup();
+                HideAtisAutoPopup();
+                HideQuickWxPopup();
+            }
         }
 
         private Color ClearanceStatusColor()
@@ -4612,9 +4659,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
 
             Rectangle bounds = new Rectangle(0, 0, Math.Max(1, label.Width - 1), Math.Max(1, label.Height - 1));
-            Color accent = label.ForeColor;
-            bool focused = label.Focused;
-            bool hovered = label.ClientRectangle.Contains(label.PointToClient(Cursor.Position));
+            bool enabled = label.Enabled;
+            Color accent = enabled ? label.ForeColor : Color.FromArgb(105, 110, 116);
+            bool focused = enabled && label.Focused;
+            bool hovered = enabled && label.ClientRectangle.Contains(label.PointToClient(Cursor.Position));
 
             e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
             e.Graphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
@@ -4622,11 +4670,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             using GraphicsPath path = RoundedButtonRect(bounds, 3);
             using LinearGradientBrush fill = new LinearGradientBrush(
                 bounds,
-                Color.FromArgb(34, accent),
-                Color.FromArgb(12, accent),
+                Color.FromArgb(enabled ? 34 : 18, accent),
+                Color.FromArgb(enabled ? 12 : 7, accent),
                 LinearGradientMode.Vertical);
-            using Pen border = new Pen(Color.FromArgb((focused || hovered) ? 180 : 112, accent), (focused || hovered) ? ScaleUi(1.35f) : ScaleUi(1.0f));
-            using Pen topLine = new Pen(Color.FromArgb(45, Color.White), 1.0f);
+            using Pen border = new Pen(
+                Color.FromArgb(enabled ? ((focused || hovered) ? 180 : 112) : 70, accent),
+                (focused || hovered) ? ScaleUi(1.35f) : ScaleUi(1.0f));
+            using Pen topLine = new Pen(Color.FromArgb(enabled ? 45 : 20, Color.White), 1.0f);
 
             e.Graphics.FillPath(fill, path);
             e.Graphics.DrawPath(border, path);
@@ -4637,7 +4687,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 label.Text,
                 label.Font,
                 Rectangle.Inflate(bounds, -4, -1),
-                hovered ? Color.White : accent,
+                enabled ? (hovered ? Color.White : accent) : Color.FromArgb(112, 116, 121),
                 TextFormatFlags.HorizontalCenter | TextFormatFlags.VerticalCenter | TextFormatFlags.NoPadding | TextFormatFlags.EndEllipsis);
         }
 
@@ -5072,7 +5122,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             if (clearanceStatusLabel == null)
             {
                 clearanceStatusLabel = CreateMainStatusBadge(BuildClearanceBadgeText(), Cursors.Hand);
-                clearanceStatusLabel.MouseEnter += (_, __) => ShowClearanceTimelinePopup(false);
+                clearanceStatusLabel.MouseEnter += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        ShowClearanceTimelinePopup(false);
+                    }
+                };
                 clearanceStatusLabel.MouseLeave += (_, __) =>
                 {
                     if (!clearanceTimelinePopupPinned)
@@ -5080,7 +5136,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         HideClearanceTimelinePopup();
                     }
                 };
-                clearanceStatusLabel.Click += (_, __) => ToggleClearanceTimelinePopup();
+                clearanceStatusLabel.Click += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        ToggleClearanceTimelinePopup();
+                    }
+                };
                 screenPanel.Controls.Add(clearanceStatusLabel);
             }
 
@@ -5091,7 +5153,17 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 // Hover only repaints the badge; it must not open/close the action.
                 datalinkStatusLabel.MouseEnter += (_, __) => datalinkStatusLabel.Invalidate();
                 datalinkStatusLabel.MouseLeave += (_, __) => datalinkStatusLabel.Invalidate();
-                datalinkStatusLabel.Click += (_, __) => TogglePdcQuickActionButton();
+                datalinkStatusLabel.Click += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        TogglePdcQuickActionButton();
+                    }
+                    else
+                    {
+                        HidePdcQuickActionButton();
+                    }
+                };
                 screenPanel.Controls.Add(datalinkStatusLabel);
             }
 
@@ -5111,7 +5183,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             if (atisStatusLabel == null)
             {
                 atisStatusLabel = CreateMainStatusBadge(atisStatusText, Cursors.Hand);
-                atisStatusLabel.MouseEnter += (_, __) => ShowAtisAvailabilityPopup(false);
+                atisStatusLabel.MouseEnter += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        ShowAtisAvailabilityPopup(false);
+                    }
+                };
                 atisStatusLabel.MouseLeave += (_, __) =>
                 {
                     if (!atisAvailabilityPopupPinned)
@@ -5119,7 +5197,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         HideAtisAvailabilityPopup();
                     }
                 };
-                atisStatusLabel.Click += (_, __) => ToggleAtisAvailabilityPopup();
+                atisStatusLabel.Click += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        ToggleAtisAvailabilityPopup();
+                    }
+                };
                 atisStatusLabel.MouseUp += AtisStatusLabel_MouseUp;
                 screenPanel.Controls.Add(atisStatusLabel);
             }
@@ -5127,7 +5211,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             if (atisAutoStatusLabel == null)
             {
                 atisAutoStatusLabel = CreateMainStatusBadge(BuildAtisAutoBadgeText(), Cursors.Hand);
-                atisAutoStatusLabel.MouseEnter += (_, __) => ShowAtisAutoPopup(false);
+                atisAutoStatusLabel.MouseEnter += (_, __) =>
+                {
+                    if (CanUseA220StatusActions())
+                    {
+                        ShowAtisAutoPopup(false);
+                    }
+                };
                 atisAutoStatusLabel.MouseLeave += (_, __) =>
                 {
                     if (!atisAutoPopupPinned)
@@ -5137,6 +5227,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 };
                 atisAutoStatusLabel.Click += (_, __) =>
                 {
+                    if (!CanUseA220StatusActions())
+                    {
+                        HideAtisAutoPopup();
+                        return;
+                    }
+
                     if (IsAtisAutoRefreshEnabled())
                     {
                         SetAtisAutoRefresh(string.Empty, false);
@@ -5154,7 +5250,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 quickWxStatusLabel.MouseLeave += (_, __) => quickWxStatusLabel.Invalidate();
                 quickWxStatusLabel.Click += (_, __) =>
                 {
-                    if (!Connected && !DebugUiPreviewMode)
+                    if (!CanUseA220StatusActions())
                     {
                         HideQuickWxPopup();
                         return;
@@ -5599,13 +5695,9 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             if (quickWxStatusLabel != null)
             {
                 quickWxStatusLabel.Visible = true;
-                quickWxStatusLabel.Enabled = DebugUiPreviewMode || Connected;
-                quickWxStatusLabel.Cursor = (DebugUiPreviewMode || Connected) ? Cursors.Hand : Cursors.Default;
-                if (!Connected && !DebugUiPreviewMode)
-                {
-                    HideQuickWxPopup();
-                }
             }
+
+            UpdateA220StatusActionAvailability();
 
             clearanceStatusLabel.BringToFront();
             datalinkStatusLabel.BringToFront();
@@ -13456,6 +13548,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ShowAtisAvailabilityPopup(bool pin)
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideAtisAvailabilityPopup();
+                return;
+            }
+
             HideClearanceTimelinePopup();
             HideAtisAutoPopup();
             HideQuickWxPopup();
@@ -13485,6 +13583,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ToggleAtisAvailabilityPopup()
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideAtisAvailabilityPopup();
+                return;
+            }
+
             if (atisAvailabilityPopupPanel != null && atisAvailabilityPopupPanel.Visible && atisAvailabilityPopupPinned)
             {
                 HideAtisAvailabilityPopup();
@@ -13659,6 +13763,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ShowAtisAutoPopup(bool pin)
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideAtisAutoPopup();
+                return;
+            }
+
             HideClearanceTimelinePopup();
             HideAtisAvailabilityPopup();
             HideQuickWxPopup();
@@ -13688,6 +13798,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ToggleAtisAutoPopup()
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideAtisAutoPopup();
+                return;
+            }
+
             if (atisAutoPopupPanel != null && atisAutoPopupPanel.Visible && atisAutoPopupPinned)
             {
                 HideAtisAutoPopup();
@@ -13960,7 +14076,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ShowQuickWxPopup(bool pin)
         {
-            if (!Connected && !DebugUiPreviewMode)
+            if (!CanUseA220StatusActions())
             {
                 HideQuickWxPopup();
                 return;
@@ -14012,7 +14128,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private void ToggleQuickWxPopup()
         {
-            if (!Connected && !DebugUiPreviewMode)
+            if (!CanUseA220StatusActions())
             {
                 HideQuickWxPopup();
                 return;
@@ -28350,6 +28466,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void ShowClearanceTimelinePopup(bool pin)
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideClearanceTimelinePopup();
+                return;
+            }
+
             HideAtisAvailabilityPopup();
             ConfigureClearanceTimelinePopup();
 
@@ -28378,6 +28500,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void ToggleClearanceTimelinePopup()
         {
+            if (!CanUseA220StatusActions())
+            {
+                HideClearanceTimelinePopup();
+                return;
+            }
+
             if (clearanceTimelinePopupPanel != null && clearanceTimelinePopupPanel.Visible && clearanceTimelinePopupPinned)
             {
                 HideClearanceTimelinePopup();
