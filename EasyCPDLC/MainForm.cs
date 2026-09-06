@@ -1184,6 +1184,19 @@ private TelexForm tForm;
         private const string MessagePreviewTextTag = "EASYCPDLC_MESSAGE_PREVIEW_TEXT";
         private const string A220PhysicalLayoutTag = "EASYCPDLC_A220_PHYSICAL_LAYOUT";
 
+        // EasyCPDLC uses WQHD as its fixed design reference. Windows DPI is
+        // deliberately not part of this calculation: AutoScaleMode remains None
+        // and every UI dimension is derived only from monitor resolution plus the
+        // user's EasyCPDLC 100/110/120 percent setting.
+        private const int ReferenceScreenWidth = 2560;
+        private const int ReferenceScreenHeight = 1440;
+        private const float MinimumAutomaticResolutionScale = 0.60f;
+        private static float automaticResolutionScaleFactor = 1.0f;
+
+        private Rectangle resolutionScaleScreenBounds = Rectangle.Empty;
+        private bool refreshingResolutionScale;
+        private float appliedWindowScaleFactor = 1.0f;
+
         public static int WindowScalePercent
         {
             get
@@ -1209,9 +1222,223 @@ private TelexForm tForm;
             return supported.OrderBy(item => Math.Abs(item - percent)).First();
         }
 
-        private static float WindowScaleFactor()
+        private static float UserWindowScaleFactor()
         {
             return Math.Max(1.0f, Math.Min(1.20f, WindowScalePercent / 100.0f));
+        }
+
+        private static float WindowScaleFactor()
+        {
+            return automaticResolutionScaleFactor * UserWindowScaleFactor();
+        }
+
+        private static float CalculateAutomaticResolutionScale(Rectangle screenBounds)
+        {
+            if (screenBounds.Width <= 0 || screenBounds.Height <= 0)
+            {
+                return 1.0f;
+            }
+
+            float widthFactor = screenBounds.Width / (float)ReferenceScreenWidth;
+            float heightFactor = screenBounds.Height / (float)ReferenceScreenHeight;
+            float resolutionFactor = Math.Min(widthFactor, heightFactor);
+
+            // Higher resolutions never enlarge EasyCPDLC automatically. Users can
+            // enlarge it explicitly with the program's 110/120 percent setting.
+            return Math.Max(
+                MinimumAutomaticResolutionScale,
+                Math.Min(1.0f, resolutionFactor));
+        }
+
+        private Screen ResolveResolutionScaleScreen()
+        {
+            try
+            {
+                if (IsHandleCreated)
+                {
+                    return Screen.FromHandle(Handle);
+                }
+
+                if (Location != Point.Empty)
+                {
+                    return Screen.FromPoint(Location);
+                }
+            }
+            catch
+            {
+            }
+
+            return Screen.PrimaryScreen ?? Screen.AllScreens.FirstOrDefault();
+        }
+
+        private bool UpdateAutomaticResolutionScaleFactor(bool refreshUi)
+        {
+            Screen screen = ResolveResolutionScaleScreen();
+            Rectangle screenBounds = screen?.Bounds ?? new Rectangle(
+                0,
+                0,
+                ReferenceScreenWidth,
+                ReferenceScreenHeight);
+
+            float newFactor = CalculateAutomaticResolutionScale(screenBounds);
+            bool changed =
+                resolutionScaleScreenBounds != screenBounds ||
+                Math.Abs(automaticResolutionScaleFactor - newFactor) > 0.0001f;
+
+            resolutionScaleScreenBounds = screenBounds;
+
+            if (!changed)
+            {
+                return false;
+            }
+
+            automaticResolutionScaleFactor = newFactor;
+            Logger.Debug(
+                DiagnosticLogMessage(
+                    "Resolution UI scale updated: screen=" +
+                    screenBounds.Width.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "x" +
+                    screenBounds.Height.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    ", automatic=" +
+                    automaticResolutionScaleFactor.ToString("0.000", System.Globalization.CultureInfo.InvariantCulture) +
+                    ", user=" +
+                    WindowScalePercent.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "%, effective=" +
+                    WindowScaleFactor().ToString("0.000", System.Globalization.CultureInfo.InvariantCulture)));
+
+            if (refreshUi &&
+                !refreshingResolutionScale &&
+                IsHandleCreated &&
+                !IsDisposed &&
+                !Disposing)
+            {
+                try
+                {
+                    refreshingResolutionScale = true;
+                    RefreshWindowScaleUi();
+                }
+                finally
+                {
+                    refreshingResolutionScale = false;
+                }
+            }
+
+            return true;
+        }
+
+        private void MainForm_ResolutionScaleLocationChanged(object sender, EventArgs e)
+        {
+            if (refreshingResolutionScale || !IsHandleCreated || IsDisposed)
+            {
+                return;
+            }
+
+            UpdateAutomaticResolutionScaleFactor(true);
+        }
+
+        private void MainForm_ResolutionScaleShown(object sender, EventArgs e)
+        {
+            UpdateAutomaticResolutionScaleFactor(true);
+        }
+
+        private IEnumerable<Control> EnumerateControlTreeIncludingRoot(Control root)
+        {
+            if (root == null)
+            {
+                yield break;
+            }
+
+            yield return root;
+
+            foreach (Control child in root.Controls)
+            {
+                foreach (Control descendant in EnumerateControlTreeIncludingRoot(child))
+                {
+                    yield return descendant;
+                }
+            }
+        }
+
+        private void RescaleExistingControlFonts(
+            float previousScaleFactor,
+            float currentScaleFactor)
+        {
+            if (previousScaleFactor <= 0.0f ||
+                currentScaleFactor <= 0.0f ||
+                Math.Abs(previousScaleFactor - currentScaleFactor) < 0.0001f)
+            {
+                return;
+            }
+
+            float ratio = currentScaleFactor / previousScaleFactor;
+            if (ratio <= 0.0f || Math.Abs(ratio - 1.0f) < 0.0001f)
+            {
+                return;
+            }
+
+            // Capture inheritance before changing any parent fonts. A child that
+            // inherits its parent's Font must not receive a second explicit scale.
+            List<(Control Control, Font Font, bool InheritsParentFont)> snapshots =
+                new();
+
+            foreach (Control control in EnumerateControlTreeIncludingRoot(this))
+            {
+                if (control == null || control.IsDisposed || control.Font == null)
+                {
+                    continue;
+                }
+
+                bool inheritsParentFont =
+                    control.Parent != null &&
+                    ReferenceEquals(control.Font, control.Parent.Font);
+
+                snapshots.Add((control, control.Font, inheritsParentFont));
+            }
+
+            SuspendLayout();
+
+            try
+            {
+                foreach ((Control control, Font oldFont, bool inheritsParentFont) in snapshots)
+                {
+                    if (control == null ||
+                        control.IsDisposed ||
+                        oldFont == null ||
+                        inheritsParentFont)
+                    {
+                        continue;
+                    }
+
+                    float newSize = Math.Max(1.0f, oldFont.Size * ratio);
+                    if (Math.Abs(newSize - oldFont.Size) < 0.05f)
+                    {
+                        continue;
+                    }
+
+                    try
+                    {
+                        control.Font = new Font(
+                            oldFont.FontFamily,
+                            newSize,
+                            oldFont.Style,
+                            oldFont.Unit,
+                            oldFont.GdiCharSet,
+                            oldFont.GdiVerticalFont);
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Debug(
+                            "Control font rescale skipped for " +
+                            control.GetType().Name +
+                            ": " +
+                            ex.Message);
+                    }
+                }
+            }
+            finally
+            {
+                ResumeLayout(false);
+            }
         }
 
         private static int ScaleUi(int value)
@@ -1939,6 +2166,13 @@ private TelexForm tForm;
         public int messageOutCounter = 1;
         private bool _connected;
 
+        // A single client must never be able to create overlapping VATSIM logon
+        // checks by double-clicking CONN or by invoking another style's handler.
+        private bool connectionAttemptInProgress;
+        private DateTime nextConnectionAttemptUtc = DateTime.MinValue;
+        private int connectionRetryCooldownGeneration;
+        private static readonly TimeSpan connectionFailureRetryCooldown = TimeSpan.FromSeconds(30);
+
         [System.ComponentModel.Browsable(false)]
         [System.ComponentModel.DesignerSerializationVisibility(System.ComponentModel.DesignerSerializationVisibility.Hidden)]
         public bool Connected
@@ -1973,6 +2207,20 @@ private TelexForm tForm;
         private void UpdateConnectionGatedControls()
         {
             bool connected = _connected || DebugUiPreviewMode;
+            bool connectCooldownActive =
+                !DebugUiPreviewMode &&
+                !_connected &&
+                DateTime.UtcNow < nextConnectionAttemptUtc;
+            bool connectionControlEnabled =
+                DebugUiPreviewMode ||
+                (!connectionAttemptInProgress && (_connected || !connectCooldownActive));
+
+            if (retrieveButton != null)
+            {
+                retrieveButton.Enabled = connectionControlEnabled;
+                retrieveButton.Cursor = connectionControlEnabled ? Cursors.Hand : Cursors.Default;
+            }
+
             bool interactiveEnabled = DebugUiPreviewMode || (connected && IsHoppieCallsignReadyForInteractiveMenus());
 
             Control[] interactiveControls =
@@ -2034,6 +2282,292 @@ private TelexForm tForm;
                 lastCpdlcStationDetectedNotificationKey = string.Empty;
                 lastCpdlcStationDetectedNotificationUtc = DateTime.MinValue;
             }
+        }
+
+        private int RemainingConnectionRetrySeconds()
+        {
+            TimeSpan remaining = nextConnectionAttemptUtc - DateTime.UtcNow;
+            return Math.Max(0, (int)Math.Ceiling(remaining.TotalSeconds));
+        }
+
+        private void ClearConnectionRetryCooldown()
+        {
+            connectionRetryCooldownGeneration++;
+            nextConnectionAttemptUtc = DateTime.MinValue;
+            UpdateConnectionGatedControls();
+        }
+
+        private void StartConnectionRetryCooldown(string reason)
+        {
+            nextConnectionAttemptUtc = DateTime.UtcNow + connectionFailureRetryCooldown;
+            int generation = ++connectionRetryCooldownGeneration;
+
+            Logger.Debug(
+                "VATSIM connection retry cooldown started for " +
+                connectionFailureRetryCooldown.TotalSeconds.ToString(
+                    "0",
+                    System.Globalization.CultureInfo.InvariantCulture) +
+                " seconds: " +
+                (reason ?? "unspecified"));
+
+            UpdateConnectionGatedControls();
+            _ = RestoreConnectionButtonAfterCooldownAsync(generation);
+        }
+
+        private async Task RestoreConnectionButtonAfterCooldownAsync(int generation)
+        {
+            TimeSpan delay = nextConnectionAttemptUtc - DateTime.UtcNow;
+            if (delay > TimeSpan.Zero)
+            {
+                await Task.Delay(delay);
+            }
+
+            SafeUi(() =>
+            {
+                if (generation != connectionRetryCooldownGeneration)
+                {
+                    return;
+                }
+
+                if (DateTime.UtcNow >= nextConnectionAttemptUtc)
+                {
+                    nextConnectionAttemptUtc = DateTime.MinValue;
+                    UpdateConnectionGatedControls();
+                }
+            });
+        }
+
+        private static bool IsVatsimRetryCooldownMessageText(string messageText)
+        {
+            string upper = (messageText ?? string.Empty)
+                .Replace("⌛", string.Empty)
+                .Replace("⏳", string.Empty)
+                .Replace("✓", string.Empty)
+                .Trim()
+                .ToUpperInvariant();
+
+            return upper.StartsWith("VATSIM: PILOT NOT FOUND", StringComparison.Ordinal) ||
+                   (upper.StartsWith("VATSIM: ERROR", StringComparison.Ordinal) &&
+                    (upper.Contains("WAIT 30 SECONDS AND RETRY") ||
+                     upper.Contains("RETRY AVAILABLE")));
+        }
+
+        private static string BuildVatsimRetryReadyMessage(string originalText)
+        {
+            string clean = (originalText ?? string.Empty)
+                .Replace("⌛", string.Empty)
+                .Replace("⏳", string.Empty)
+                .Replace("✓", string.Empty)
+                .Trim();
+
+            clean = Regex.Replace(
+                clean,
+                @"\s*WAIT\s+\d+\s+SECONDS?\s+AND\s+RETRY\s*\.?\s*$",
+                string.Empty,
+                RegexOptions.IgnoreCase).Trim();
+
+            clean = clean.TrimEnd('.');
+            return string.IsNullOrWhiteSpace(clean)
+                ? "VATSIM: RETRY AVAILABLE."
+                : clean + ". RETRY AVAILABLE.";
+        }
+
+        private TimerLabel FindOverviewActionLabel(CPDLCMessage message)
+        {
+            if (message == null ||
+                message.IsDisposed ||
+                outputTable == null ||
+                outputTable.IsDisposed)
+            {
+                return null;
+            }
+
+            try
+            {
+                TableLayoutPanelCellPosition position =
+                    outputTable.GetPositionFromControl(message);
+
+                if (position.Row >= 0 &&
+                    outputTable.GetControlFromPosition(2, position.Row) is TimerLabel menuLabel)
+                {
+                    return menuLabel;
+                }
+            }
+            catch
+            {
+                // Cosmetic lookup only.
+            }
+
+            return null;
+        }
+
+        private void HideVatsimRetryMessageActions(CPDLCMessage message)
+        {
+            TimerLabel menuLabel = FindOverviewActionLabel(message);
+            if (menuLabel == null || menuLabel.IsDisposed)
+            {
+                return;
+            }
+
+            menuLabel.Paint -= OpenMessageIndicator_Paint;
+            menuLabel.Paint -= AutoDeleteRequestIndicator_Paint;
+            menuLabel.Tag = null;
+            menuLabel.Text = string.Empty;
+            menuLabel.CanFlash = false;
+            menuLabel.Enabled = false;
+            menuLabel.Cursor = Cursors.Default;
+            menuLabel.Visible = false;
+            menuLabel.Invalidate();
+        }
+
+        private void StartVatsimRetryReadyAutoDelete(CPDLCMessage message)
+        {
+            if (message == null || message.IsDisposed)
+            {
+                return;
+            }
+
+            // Keep this special status row free of action/countdown icons. The
+            // normal configured auto-delete duration is used, but its countdown is
+            // intentionally not painted in the overview.
+            HideVatsimRetryMessageActions(message);
+            StopAutoDeleteRequestMessage(message, false);
+
+            DateTime dueUtc = DateTime.UtcNow + RequestMessageAutoDeleteDelay;
+            System.Windows.Forms.Timer deleteTimer = new()
+            {
+                Interval = 250
+            };
+
+            deleteTimer.Tick += (_, __) =>
+            {
+                if (message.IsDisposed ||
+                    outputTable == null ||
+                    outputTable.IsDisposed)
+                {
+                    StopAutoDeleteRequestMessage(message, false);
+                    return;
+                }
+
+                if (IsMessageProtectedFromAutoDelete(message))
+                {
+                    StopAutoDeleteRequestMessage(message, true);
+                    return;
+                }
+
+                if (DateTime.UtcNow < dueUtc)
+                {
+                    return;
+                }
+
+                StopAutoDeleteRequestMessage(message, false);
+                AutoDeleteMessageRow(message);
+            };
+
+            autoDeleteRequestTimers[message] = deleteTimer;
+            deleteTimer.Start();
+        }
+
+        private void StartVatsimRetryHourglassAnimation(
+            CPDLCMessage message,
+            string originalText)
+        {
+            if (message == null || message.IsDisposed)
+            {
+                return;
+            }
+
+            StopVatsimRetryHourglassAnimation(message);
+            StopAutoDeleteRequestMessage(message, false);
+            HideVatsimRetryMessageActions(message);
+
+            string cleanOriginalText = (originalText ?? string.Empty).Trim();
+            string listText = BuildSystemListSummary(cleanOriginalText);
+            DateTime dueUtc = nextConnectionAttemptUtc > DateTime.UtcNow
+                ? nextConnectionAttemptUtc
+                : DateTime.UtcNow + connectionFailureRetryCooldown;
+
+            int frameIndex = 0;
+            string[] frames = { "⌛", "⏳" };
+
+            void ApplyWaitingFrame()
+            {
+                if (message.IsDisposed)
+                {
+                    return;
+                }
+
+                message.Text = frames[frameIndex] + " " + listText;
+                message.ForeColor = DcduTheme.Amber;
+                message.Invalidate();
+                frameIndex = (frameIndex + 1) % frames.Length;
+            }
+
+            System.Windows.Forms.Timer animationTimer = new()
+            {
+                Interval = 420
+            };
+
+            animationTimer.Tick += (_, __) =>
+            {
+                if (message.IsDisposed ||
+                    outputTable == null ||
+                    outputTable.IsDisposed)
+                {
+                    StopVatsimRetryHourglassAnimation(message);
+                    return;
+                }
+
+                if (DateTime.UtcNow >= dueUtc)
+                {
+                    StopVatsimRetryHourglassAnimation(message);
+
+                    string readyText = BuildVatsimRetryReadyMessage(cleanOriginalText);
+                    message.message = readyText;
+                    message.Text = "✓ " + BuildSystemListSummary(readyText);
+                    message.ForeColor = DcduTheme.Green;
+                    message.Invalidate();
+                    outputTable.PerformLayout();
+
+                    // The waiting notice itself never expires. Auto-delete begins
+                    // only now, after RETRY AVAILABLE has been displayed.
+                    StartVatsimRetryReadyAutoDelete(message);
+                    return;
+                }
+
+                ApplyWaitingFrame();
+            };
+
+            vatsimRetryMessageAnimationTimers[message] = animationTimer;
+            ApplyWaitingFrame();
+            animationTimer.Start();
+        }
+
+        private void StopVatsimRetryHourglassAnimation(CPDLCMessage message)
+        {
+            if (message == null ||
+                !vatsimRetryMessageAnimationTimers.TryGetValue(
+                    message,
+                    out System.Windows.Forms.Timer animationTimer))
+            {
+                return;
+            }
+
+            animationTimer.Stop();
+            animationTimer.Dispose();
+            vatsimRetryMessageAnimationTimers.Remove(message);
+        }
+
+        private void StopAllVatsimRetryHourglassAnimations()
+        {
+            foreach (System.Windows.Forms.Timer animationTimer in
+                     vatsimRetryMessageAnimationTimers.Values.ToList())
+            {
+                animationTimer.Stop();
+                animationTimer.Dispose();
+            }
+
+            vatsimRetryMessageAnimationTimers.Clear();
         }
 
         public string pendingLogon = null;
@@ -3647,6 +4181,15 @@ private TelexForm tForm;
         private DateTime lastVatsimOnlineRefreshUtc = DateTime.MinValue;
         private bool vatsimOnlineRefreshInProgress = false;
         private static readonly TimeSpan vatsimOnlineRefreshInterval = TimeSpan.FromSeconds(60);
+
+        // Network failures are backed off globally for this EasyCPDLC instance.
+        // Force-refresh callers (hover, manual checks, page actions) may not bypass
+        // this window. Jitter prevents many clients from retrying simultaneously.
+        private DateTime vatsimRequestBackoffUntilUtc = DateTime.MinValue;
+        private int consecutiveVatsimRequestFailures;
+        private static readonly TimeSpan vatsimFailureBackoffBase = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan vatsimFailureBackoffMaximum = TimeSpan.FromMinutes(5);
+        private static readonly TimeSpan vatsimForcedRefreshMinimumInterval = TimeSpan.FromSeconds(15);
         private readonly Dictionary<string, List<long>> vatsimTransceiverFrequencies = new(StringComparer.OrdinalIgnoreCase);
         // AFV transceiver id 0 is the primary pilot radio (VHF1/COM1).
         // Keep it separately so array ordering can never make VHF2 look like VHF1.
@@ -3655,7 +4198,10 @@ private TelexForm tForm;
         private DateTime lastVatsimTransceiverRefreshAttemptUtc = DateTime.MinValue;
         private bool vatsimTransceiverRefreshInProgress = false;
         private static readonly TimeSpan vatsimTransceiverRefreshInterval = TimeSpan.FromSeconds(20);
+        private static readonly TimeSpan vatsimTransceiverForcedMinimumInterval = TimeSpan.FromSeconds(10);
         private static readonly TimeSpan vatsimTransceiverValidLifetime = TimeSpan.FromSeconds(60);
+        private DateTime vatsimTransceiverRetryAfterUtc = DateTime.MinValue;
+        private int consecutiveVatsimTransceiverFailures;
         private const string VatsimTransceiversDataUrl = "https://data.vatsim.net/v3/transceivers-data.json";
         private readonly HashSet<string> hoppieOnlineStations = new(StringComparer.OrdinalIgnoreCase);
         private bool hoppieOnlineStationsLoaded = false;
@@ -3663,6 +4209,15 @@ private TelexForm tForm;
         private readonly Dictionary<string, DateTime> cpdlcLogonNotOnlineNoticeUtc = new(StringComparer.OrdinalIgnoreCase);
         private static readonly TimeSpan cpdlcLogonNotOnlineNoticeCooldown = TimeSpan.FromSeconds(60);
         private static readonly TimeSpan cpdlcManualLogonFailureDelay = TimeSpan.FromSeconds(10);
+
+        // PDC requests use the same verified Hoppie station list as CPDLC LOGON.
+        // A short post-send watch prevents CLR WAITING from remaining indefinitely
+        // when the requested station has gone offline between discovery and send.
+        private readonly Dictionary<string, DateTime> pdcStationUnavailableNoticeUtc = new(StringComparer.OrdinalIgnoreCase);
+        private static readonly TimeSpan pdcStationUnavailableNoticeCooldown = TimeSpan.FromSeconds(30);
+        private static readonly TimeSpan pdcStationOfflineWatchInitialDelay = TimeSpan.FromSeconds(12);
+        private static readonly TimeSpan pdcStationOfflineWatchRetryDelay = TimeSpan.FromSeconds(15);
+        private CancellationTokenSource pdcStationOfflineWatchCancellationTokenSource;
 
         private enum CpdlcLogonStationAvailability
         {
@@ -3714,6 +4269,9 @@ private TelexForm tForm;
         private AccessibleLabel[] replyOptionsList;
 
         private CPDLCMessage previewMessage;
+        private CPDLCMessage styledPreviewPagedMessage;
+        private int styledPreviewPageIndex;
+        private int styledPreviewTotalPages = 1;
         private bool styledMessageReplySendInProgress;
 
         private readonly SoundPlayer startupPlayer = new();
@@ -3723,6 +4281,24 @@ private TelexForm tForm;
         private readonly System.Windows.Forms.Timer unreadReminderTimer = new();
         private readonly System.Windows.Forms.Timer routeBlinkTimer = new();
         private readonly System.Windows.Forms.Timer clearanceAutoConfirmTimer = new();
+
+        // A WinForms timer runs on the UI thread. If a tick arrives much later
+        // than expected, the previous interval was blocked by synchronous work.
+        // This is diagnostic only; it never changes application behaviour.
+        private readonly System.Windows.Forms.Timer uiThreadWatchdogTimer = new();
+        private System.Threading.Timer uiThreadBackgroundWatchdogTimer;
+        private DateTime uiThreadWatchdogLastTickUtc = DateTime.MinValue;
+        private long uiThreadHeartbeatUtcTicks;
+        private int uiThreadStallReported;
+        private static readonly TimeSpan uiThreadStallLogThreshold = TimeSpan.FromSeconds(5);
+        private static readonly TimeSpan diagnosticSlowOperationThreshold = TimeSpan.FromSeconds(3);
+
+        private readonly object uiThreadDiagnosticSync = new();
+        private string uiThreadLastDiagnosticActivity = "startup";
+        private DateTime uiThreadLastDiagnosticActivityUtc = DateTime.UtcNow;
+        private string uiThreadActiveDiagnosticOperation = "idle";
+        private DateTime uiThreadActiveDiagnosticOperationUtc = DateTime.MinValue;
+        private int uiThreadDiagnosticOperationToken;
         private DateTime clearanceAutoConfirmDueUtc = DateTime.MinValue;
         private string clearanceAutoConfirmReason = string.Empty;
         private static readonly TimeSpan clearanceAutoConfirmDelay = TimeSpan.FromMinutes(3);
@@ -3730,6 +4306,7 @@ private TelexForm tForm;
         private bool routeBlinkAmber = false;
         private readonly List<CPDLCMessage> unreadMessages = new();
         private readonly Dictionary<CPDLCMessage, System.Windows.Forms.Timer> autoDeleteRequestTimers = new();
+        private readonly Dictionary<CPDLCMessage, System.Windows.Forms.Timer> vatsimRetryMessageAnimationTimers = new();
 
         private TimeSpan RequestMessageAutoDeleteDelay
         {
@@ -3987,6 +4564,305 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         private const string AirbusAocInputWcwType = "wcwType";
         private const string AirbusAocInputWcwValue = "wcwValue";
 
+        private static string DiagnosticLogTimestamp()
+        {
+            return DateTimeOffset.Now.ToString(
+                "yyyy-MM-dd HH:mm:ss.fff zzz",
+                System.Globalization.CultureInfo.InvariantCulture);
+        }
+
+        private static string DiagnosticLogMessage(string message)
+        {
+            return "[" + DiagnosticLogTimestamp() + "] " + (message ?? string.Empty);
+        }
+
+        private void RecordUiDiagnosticActivity(string activity)
+        {
+            lock (uiThreadDiagnosticSync)
+            {
+                uiThreadLastDiagnosticActivity =
+                    string.IsNullOrWhiteSpace(activity) ? "unknown" : activity;
+                uiThreadLastDiagnosticActivityUtc = DateTime.UtcNow;
+            }
+        }
+
+        private int BeginUiDiagnosticOperation(string operation)
+        {
+            lock (uiThreadDiagnosticSync)
+            {
+                uiThreadDiagnosticOperationToken++;
+                uiThreadActiveDiagnosticOperation =
+                    string.IsNullOrWhiteSpace(operation) ? "unknown" : operation;
+                uiThreadActiveDiagnosticOperationUtc = DateTime.UtcNow;
+                uiThreadLastDiagnosticActivity = uiThreadActiveDiagnosticOperation;
+                uiThreadLastDiagnosticActivityUtc = uiThreadActiveDiagnosticOperationUtc;
+                return uiThreadDiagnosticOperationToken;
+            }
+        }
+
+        private void EndUiDiagnosticOperation(int token)
+        {
+            string operation = null;
+            TimeSpan elapsed = TimeSpan.Zero;
+
+            lock (uiThreadDiagnosticSync)
+            {
+                if (token != uiThreadDiagnosticOperationToken)
+                {
+                    return;
+                }
+
+                operation = uiThreadActiveDiagnosticOperation;
+                if (uiThreadActiveDiagnosticOperationUtc != DateTime.MinValue)
+                {
+                    elapsed = DateTime.UtcNow - uiThreadActiveDiagnosticOperationUtc;
+                }
+
+                uiThreadActiveDiagnosticOperation = "idle";
+                uiThreadActiveDiagnosticOperationUtc = DateTime.MinValue;
+            }
+
+            if (!string.IsNullOrWhiteSpace(operation) &&
+                !string.Equals(operation, "idle", StringComparison.OrdinalIgnoreCase) &&
+                elapsed >= diagnosticSlowOperationThreshold)
+            {
+                Logger.Warn(
+                    DiagnosticLogMessage(
+                        "SLOW UI OPERATION: " +
+                        operation +
+                        " took " +
+                        elapsed.TotalSeconds.ToString(
+                            "0.0",
+                            System.Globalization.CultureInfo.InvariantCulture) +
+                        "s."));
+            }
+        }
+
+        private void LogAsyncOperationDuration(string operation, Stopwatch stopwatch)
+        {
+            if (stopwatch == null)
+            {
+                return;
+            }
+
+            stopwatch.Stop();
+            string message =
+                "ASYNC OPERATION: " +
+                operation +
+                " took " +
+                stopwatch.Elapsed.TotalSeconds.ToString(
+                    "0.0",
+                    System.Globalization.CultureInfo.InvariantCulture) +
+                "s.";
+
+            if (stopwatch.Elapsed >= diagnosticSlowOperationThreshold)
+            {
+                Logger.Warn(
+                    DiagnosticLogMessage(
+                        message + " UI should remain responsive while awaiting it."));
+            }
+            else
+            {
+                Logger.Debug(DiagnosticLogMessage(message));
+            }
+        }
+
+        private string BuildUiThreadDiagnosticSnapshot()
+        {
+            string lastActivity;
+            string activeOperation;
+            DateTime lastActivityUtc;
+            DateTime activeOperationUtc;
+
+            lock (uiThreadDiagnosticSync)
+            {
+                lastActivity = uiThreadLastDiagnosticActivity;
+                lastActivityUtc = uiThreadLastDiagnosticActivityUtc;
+                activeOperation = uiThreadActiveDiagnosticOperation;
+                activeOperationUtc = uiThreadActiveDiagnosticOperationUtc;
+            }
+
+            DateTime nowUtc = DateTime.UtcNow;
+            double lastActivityAge = Math.Max(
+                0.0,
+                (nowUtc - lastActivityUtc).TotalSeconds);
+            double activeOperationAge =
+                activeOperationUtc == DateTime.MinValue
+                    ? 0.0
+                    : Math.Max(0.0, (nowUtc - activeOperationUtc).TotalSeconds);
+
+            string style = DcduStyleManager.IsA220
+                ? "A220"
+                : (DcduStyleManager.IsBoeing ? "BOEING" : "AIRBUS");
+
+            return
+                "active-ui-operation=" +
+                activeOperation +
+                " (" +
+                activeOperationAge.ToString(
+                    "0.0",
+                    System.Globalization.CultureInfo.InvariantCulture) +
+                "s), last-activity=" +
+                lastActivity +
+                " (" +
+                lastActivityAge.ToString(
+                    "0.0",
+                    System.Globalization.CultureInfo.InvariantCulture) +
+                "s ago), connected=" +
+                Connected.ToString() +
+                ", style=" +
+                style +
+                ", fsuipc-enabled=" +
+                UseFSUIPC.ToString() +
+                ", fsuipc-open=" +
+                fsConnectionOpen.ToString() +
+                ", connection-attempt=" +
+                connectionAttemptInProgress.ToString() +
+                ", vatsim-refresh=" +
+                vatsimOnlineRefreshInProgress.ToString() +
+                ", setup-page=" +
+                embeddedSetupPage.ToString() +
+                ", airbus-page=" +
+                airbusAocPage.ToString() +
+                ", boeing-page=" +
+                boeingTelexPage.ToString();
+        }
+
+        private async Task RefreshFsuipcDataWithDiagnosticsAsync(string context)
+        {
+            Stopwatch totalStopwatch = Stopwatch.StartNew();
+            Task refreshTask;
+            int uiOperationToken = BeginUiDiagnosticOperation(
+                "FSUIPC RefreshData invocation [" + context + "]");
+
+            try
+            {
+                // If the third-party library blocks before returning its Task, the
+                // background watchdog can now identify this exact operation.
+                refreshTask = fsuipc.RefreshData();
+            }
+            finally
+            {
+                EndUiDiagnosticOperation(uiOperationToken);
+            }
+
+            await refreshTask;
+            LogAsyncOperationDuration(
+                "FSUIPC RefreshData [" + context + "]",
+                totalStopwatch);
+        }
+
+        private async Task<bool> OpenFsuipcConnectionWithDiagnosticsAsync(
+            string context,
+            CancellationToken cancellationToken = default)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            RecordUiDiagnosticActivity("FSUIPC OpenConnection [" + context + "]");
+
+            bool result = await Task.Run(
+                () => FSUIPCData.OpenConnection(),
+                cancellationToken);
+
+            LogAsyncOperationDuration(
+                "FSUIPC OpenConnection [" + context + "]",
+                stopwatch);
+            return result;
+        }
+
+        private async Task<bool> CloseFsuipcConnectionWithDiagnosticsAsync(
+            string context,
+            CancellationToken cancellationToken = default)
+        {
+            Stopwatch stopwatch = Stopwatch.StartNew();
+            RecordUiDiagnosticActivity("FSUIPC CloseConnection [" + context + "]");
+
+            bool result = await Task.Run(
+                () => FSUIPCData.CloseConnection(),
+                cancellationToken);
+
+            LogAsyncOperationDuration(
+                "FSUIPC CloseConnection [" + context + "]",
+                stopwatch);
+            return result;
+        }
+
+        private void ConfigureUiThreadWatchdog()
+        {
+            uiThreadWatchdogTimer.Interval = 1000;
+            uiThreadWatchdogLastTickUtc = DateTime.UtcNow;
+            Interlocked.Exchange(
+                ref uiThreadHeartbeatUtcTicks,
+                uiThreadWatchdogLastTickUtc.Ticks);
+
+            uiThreadWatchdogTimer.Tick += (_, __) =>
+            {
+                DateTime nowUtc = DateTime.UtcNow;
+                TimeSpan elapsed = nowUtc - uiThreadWatchdogLastTickUtc;
+                uiThreadWatchdogLastTickUtc = nowUtc;
+
+                Interlocked.Exchange(ref uiThreadHeartbeatUtcTicks, nowUtc.Ticks);
+                Interlocked.Exchange(ref uiThreadStallReported, 0);
+
+                if (elapsed >= uiThreadStallLogThreshold)
+                {
+                    Logger.Warn(
+                        DiagnosticLogMessage(
+                            "UI THREAD STALL RECOVERED: " +
+                            elapsed.TotalSeconds.ToString(
+                                "0.0",
+                                System.Globalization.CultureInfo.InvariantCulture) +
+                            "s between UI watchdog ticks. " +
+                            BuildUiThreadDiagnosticSnapshot()));
+                }
+            };
+
+            // This timer is intentionally NOT a WinForms timer. It keeps running
+            // when the WinForms message pump is blocked and can therefore record
+            // the diagnostic context while the freeze is actually happening.
+            uiThreadBackgroundWatchdogTimer = new System.Threading.Timer(
+                _ =>
+                {
+                    long heartbeatTicks = Interlocked.Read(
+                        ref uiThreadHeartbeatUtcTicks);
+                    if (heartbeatTicks <= 0)
+                    {
+                        return;
+                    }
+
+                    TimeSpan elapsed =
+                        DateTime.UtcNow - new DateTime(
+                            heartbeatTicks,
+                            DateTimeKind.Utc);
+
+                    if (elapsed < uiThreadStallLogThreshold)
+                    {
+                        return;
+                    }
+
+                    if (Interlocked.CompareExchange(
+                            ref uiThreadStallReported,
+                            1,
+                            0) != 0)
+                    {
+                        return;
+                    }
+
+                    Logger.Warn(
+                        DiagnosticLogMessage(
+                            "UI THREAD STALL IN PROGRESS: no UI heartbeat for " +
+                            elapsed.TotalSeconds.ToString(
+                                "0.0",
+                                System.Globalization.CultureInfo.InvariantCulture) +
+                            "s. " +
+                            BuildUiThreadDiagnosticSnapshot()));
+                },
+                null,
+                1000,
+                1000);
+
+            uiThreadWatchdogTimer.Start();
+        }
+
         public MainForm()
         {
             string easyCpdlcLogFilePath = ResolveEasyCpdlcLogFilePath();
@@ -4012,6 +4888,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
 
             AutoScaleMode = AutoScaleMode.None;
+
+            // Establish the resolution-only base scale before any fonts or controls
+            // are created. Windows DPI is intentionally not consulted.
+            UpdateAutomaticResolutionScaleFactor(false);
+            appliedWindowScaleFactor = WindowScaleFactor();
+
             textFont = CreateDpiStablePointFont("Consolas", 10.5f, FontStyle.Regular);
             textFontBold = CreateDpiStablePointFont("Consolas", 11.5f, FontStyle.Bold);
             RefreshMessageTextFonts();
@@ -4030,6 +4912,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             ConfigureNextAtcUnitBlinkTimer();
             ConfigureVatsimOnlineRefresh();
             ConfigureAtisAutoRefresh();
+            ConfigureUiThreadWatchdog();
             if (!string.IsNullOrWhiteSpace(startupPlayer.SoundLocation) || startupPlayer.Stream != null)
             {
                 startupPlayer.Play();
@@ -4058,6 +4941,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             ClearNextAtcUnitDisplay();
             ConfigureMsfsClickGuard();
             InitialiseDebugUiPreviewMode();
+
+            // Recalculate only when the form is first displayed or moved to a
+            // monitor with different pixel dimensions. Location changes on the same
+            // monitor do not trigger a rebuild.
+            Shown += MainForm_ResolutionScaleShown;
+            LocationChanged += MainForm_ResolutionScaleLocationChanged;
 
             // Prime VATSpy FIR/ARTCC boundaries at startup.
             // This is an in-memory fetch only. Nothing is written to the user's disk.
@@ -4197,6 +5086,41 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         "EDGG");
 
                     WriteMessage("DEPART REQUEST STATUS\nFSM 1302 250727 EDMM\nDLH06F RCD REQUEST\nBEING PROCESSED\nSTANDBY", "TELEX", "EDMM", false, null);
+
+                    // Intentionally oversized debug clearance. This is long enough
+                    // to require several pages even in the roomier A220 message
+                    // view, so PREV PAGE / NEXT PAGE and PAGE X/Y can be inspected
+                    // in every DCDU style without waiting for a real long clearance.
+                    string debugLongClearance =
+                        "DEBUG LONG CLEARANCE - PAGING TEST\n" +
+                        "CLEARED TO @EDDM@ VIA @ANEKI ONE NOVEMBER@ DEPARTURE, " +
+                        "THEN @DCT DONAD DCT AKANU DCT TULSI DCT MASEK DCT NAPSA DCT ROKIL DCT BETOS DCT LANDU@. " +
+                        "CLIMB INITIALLY TO @FL090@. EXPECT @FL230@ TEN MINUTES AFTER DEPARTURE. " +
+                        "MAINTAIN @250 KNOTS@ OR LESS BELOW @FL100@. " +
+                        "CONTACT DEPARTURE ON @120.155@ AFTER AIRBORNE. " +
+                        "SQUAWK @4271@. " +
+                        "AFTER PASSING @5000 FEET@ PROCEED DIRECT @DONAD@ UNLESS OTHERWISE INSTRUCTED. " +
+                        "CROSS @AKANU@ AT OR ABOVE @FL120@ AND CROSS @TULSI@ AT OR BELOW @FL180@. " +
+                        "EXPECT FURTHER CLIMB FROM MUNICH CONTROL. " +
+                        "IN CASE OF RADIO FAILURE CONTINUE VIA THE CLEARED ROUTE, MAINTAIN THE LAST ASSIGNED LEVEL FOR SEVEN MINUTES, " +
+                        "THEN CLIMB TO THE FLIGHT PLAN LEVEL. " +
+                        "WHEN ABLE REPORT PASSING @FL150@ AND ESTIMATE @MASEK@. " +
+                        "DUE TRAFFIC, SPEED @MACH 0.74@ MAY BE REQUIRED AFTER LEVEL OFF. " +
+                        "DO NOT EXCEED @MACH 0.78@ UNTIL ADVISED. " +
+                        "EXPECT POSSIBLE REROUTE AFTER @BETOS@ VIA @NATOR DCT GUPIN DCT INPUD@. " +
+                        "DESTINATION WEATHER MAY REQUIRE HOLDING; EXPECT HOLD AT @LANDU@, RIGHT TURNS, INBOUND TRACK @184 DEGREES@, " +
+                        "ONE MINUTE LEGS, EXPECT FURTHER CLEARANCE @35 MINUTES AFTER THE HOUR@. " +
+                        "IF UNABLE TO COMPLY WITH ANY PART OF THIS CLEARANCE, ADVISE ATC BEFORE DEPARTURE. " +
+                        "READ BACK RUNWAY, SID, INITIAL LEVEL, SQUAWK AND ANY SPEED OR LEVEL RESTRICTIONS. " +
+                        "THIS FINAL SENTENCE EXISTS ONLY TO MAKE THE DEBUG MESSAGE LONG ENOUGH TO VERIFY THAT NO TEXT IS CUT OFF " +
+                        "AND THAT THE LAST PAGE IS REACHABLE USING THE NEW PAGING CONTROLS.";
+
+                    WriteMessage(
+                        debugLongClearance,
+                        "CPDLC",
+                        "EDMM",
+                        false,
+                        null);
                 }
             }
             catch (Exception ex)
@@ -5884,6 +6808,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 StopClearanceAutoConfirmTimer();
             }
 
+            // Any real response/failure finishes the temporary station-offline
+            // watch. CLR REQ is the only state in which that watch may continue.
+            if (!clearanceStatusText.Contains("REQ"))
+            {
+                CancelPdcStationOfflineWatch();
+            }
+
             SafeUi(() =>
             {
                 UpdateClearanceStatusLabel();
@@ -6486,7 +7417,14 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 if (!IsCpdlcHandoverFrequencyPending())
                 {
                     cpdlcHandoverBlinkTimer.Stop();
-                    if (IsCpdlcUnitVerifiedOnActiveFrequency(GetActiveCpdlcVerificationCode()))
+
+                    bool confirmedConnectionActive =
+                        cpdlcSessionEstablished &&
+                        !string.IsNullOrWhiteSpace(_currentATCUnit) &&
+                        string.IsNullOrWhiteSpace(pendingLogon);
+
+                    if (confirmedConnectionActive ||
+                        IsCpdlcUnitVerifiedOnActiveFrequency(GetActiveCpdlcVerificationCode()))
                     {
                         cpdlcHandoverTargetCode = string.Empty;
                         cpdlcHandoverStartedUtc = DateTime.MinValue;
@@ -6516,6 +7454,36 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             cpdlcHandoverStartedUtc = DateTime.MinValue;
             cpdlcHandoverBlinkTimer.Stop();
             UpdateCpdlcDiscoveryLabel();
+        }
+
+        private void CompleteCpdlcHandoverAfterConfirmedConnection(
+            string connectedUnit,
+            string confirmationSource)
+        {
+            string confirmedUnit = (connectedUnit ?? string.Empty)
+                .Trim()
+                .ToUpperInvariant();
+
+            if (string.IsNullOrWhiteSpace(confirmedUnit) ||
+                string.IsNullOrWhiteSpace(cpdlcHandoverTargetCode))
+            {
+                return;
+            }
+
+            Logger.Debug(
+                "CPDLC handover completed: target=" +
+                cpdlcHandoverTargetCode +
+                ", connected=" +
+                confirmedUnit +
+                ", source=" +
+                (confirmationSource ?? "unknown") +
+                ". Frequency-watch blink stopped after confirmed CPDLC connection.");
+
+            // A positive LOGON/CONNECTED/CURRENT ATS UNIT confirmation is the
+            // authoritative end of the CPDLC handover. VATSIM transceiver data can
+            // lag behind the actual radio change and must not keep the satellite
+            // icon blinking after the datalink session is already established.
+            StopCpdlcHandoverFrequencyWatch();
         }
 
         private static string NormalizeCpdlcCooldownKey(string value)
@@ -6692,6 +7660,16 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return false;
             }
 
+            // The radio-frequency watch is only a pre-connection handover aid.
+            // Once CPDLC itself confirms a current unit, the satellite indicator
+            // must be solid green even if the VATSIM transceiver feed is delayed.
+            if (cpdlcSessionEstablished &&
+                !string.IsNullOrWhiteSpace(_currentATCUnit) &&
+                string.IsNullOrWhiteSpace(pendingLogon))
+            {
+                return false;
+            }
+
             return !IsCpdlcUnitVerifiedOnActiveFrequency(targetCode);
         }
 
@@ -6759,12 +7737,97 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return false;
         }
 
+        private bool IsVatsimRequestBackoffActive(out TimeSpan remaining)
+        {
+            remaining = vatsimRequestBackoffUntilUtc - DateTime.UtcNow;
+            if (remaining <= TimeSpan.Zero)
+            {
+                remaining = TimeSpan.Zero;
+                return false;
+            }
+
+            return true;
+        }
+
+        private static bool IsVatsimBackoffWorthyFailure(Exception ex)
+        {
+            if (ex is TaskCanceledException || ex is TimeoutException)
+            {
+                return true;
+            }
+
+            if (ex is HttpRequestException httpError)
+            {
+                if (!httpError.StatusCode.HasValue)
+                {
+                    return true;
+                }
+
+                int statusCode = (int)httpError.StatusCode.Value;
+                return statusCode == 429 || statusCode >= 500;
+            }
+
+            // A malformed or incomplete service response should not be retried in
+            // a tight loop either.
+            return ex is JsonException || ex is FormatException;
+        }
+
+        private void ResetVatsimRequestBackoff()
+        {
+            consecutiveVatsimRequestFailures = 0;
+            vatsimRequestBackoffUntilUtc = DateTime.MinValue;
+        }
+
+        private void RegisterVatsimRequestFailure(Exception ex, string operation)
+        {
+            if (!IsVatsimBackoffWorthyFailure(ex))
+            {
+                return;
+            }
+
+            consecutiveVatsimRequestFailures =
+                Math.Min(consecutiveVatsimRequestFailures + 1, 16);
+
+            int exponent = Math.Min(consecutiveVatsimRequestFailures - 1, 5);
+            double calculatedSeconds =
+                vatsimFailureBackoffBase.TotalSeconds * Math.Pow(2.0, exponent);
+            double cappedSeconds = Math.Min(
+                calculatedSeconds,
+                vatsimFailureBackoffMaximum.TotalSeconds);
+            int jitterSeconds = Random.Shared.Next(0, 11);
+
+            DateTime proposedUntilUtc =
+                DateTime.UtcNow +
+                TimeSpan.FromSeconds(cappedSeconds + jitterSeconds);
+
+            if (proposedUntilUtc > vatsimRequestBackoffUntilUtc)
+            {
+                vatsimRequestBackoffUntilUtc = proposedUntilUtc;
+            }
+
+            Logger.Debug(
+                DiagnosticLogMessage(
+                    "VATSIM request backoff: operation=" +
+                    (operation ?? "unknown") +
+                    ", failures=" +
+                    consecutiveVatsimRequestFailures.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                    ", retry-in=" +
+                    Math.Max(
+                        0,
+                        (int)Math.Ceiling(
+                            (vatsimRequestBackoffUntilUtc - DateTime.UtcNow).TotalSeconds))
+                        .ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "s, error=" +
+                    ex.Message));
+        }
+
         private void ConfigureVatsimOnlineRefresh()
         {
             // Dedicated background refresh for CPDLC/PDC/ATIS helper data.
             // The timer ticks often, but RefreshVatsimOnlineStatusAsync(false) throttles
             // actual VATSIM/Hoppie downloads to vatsimOnlineRefreshInterval.
-            vatsimOnlineTimer.Interval = 15000;
+            vatsimOnlineTimer.Interval = 10000;
             vatsimOnlineTimer.Tick += async (_, __) =>
             {
                 if (!Connected)
@@ -6772,6 +7835,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     return;
                 }
 
+                // Frequency changes must not wait for the complete 60-second
+                // VATSIM/Hoppie refresh. The transceiver method has its own 20-second
+                // throttle and failure backoff, so this remains request-safe.
+                await RefreshVatsimTransceiversAsync(false);
                 await RefreshVatsimOnlineStatusAsync(false);
             };
             vatsimOnlineTimer.Start();
@@ -6811,8 +7878,38 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
         }
 
+        private async Task PrimeCpdlcDiscoveryAfterConnectionAsync()
+        {
+            if (!Connected)
+            {
+                return;
+            }
+
+            // vatsim-data.json was already downloaded by the CONN handler. Only
+            // load the additional helper sources here; do not download the main
+            // VATSIM feed a second time.
+            try
+            {
+                await RefreshHoppieOnlineStationsAsync();
+            }
+            catch (Exception ex)
+            {
+                hoppieOnlineStationsLoaded = false;
+                Logger.Debug("Initial Hoppie station refresh failed: " + ex.Message);
+            }
+
+            await RefreshVatsimAtcOnlineAsync();
+            await RefreshVatsimTransceiversAsync(true);
+
+            lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
+            SafeUi(UpdateOnlineStatusLabel);
+        }
+
         private async Task RefreshVatsimOnlineStatusAsync(bool force)
         {
+            RecordUiDiagnosticActivity(
+                force ? "VATSIM status refresh [forced]" : "VATSIM status refresh");
+
             if (DebugUiPreviewMode)
             {
                 // DEBUG UI preview must not periodically rebuild/reset the current Airbus AOC page.
@@ -6827,13 +7924,31 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
+            // No helper/status request may run before the VATSIM pilot and flight
+            // plan checks have completed and EasyCPDLC is actually connected.
+            if (!Connected)
+            {
+                return;
+            }
+
             if (vatsimOnlineRefreshInProgress)
             {
                 UpdateOnlineStatusLabel();
                 return;
             }
 
-            if (!force && DateTime.UtcNow - lastVatsimOnlineRefreshUtc < vatsimOnlineRefreshInterval)
+            if (IsVatsimRequestBackoffActive(out _))
+            {
+                UpdateOnlineStatusLabel();
+                return;
+            }
+
+            TimeSpan elapsedSinceRefresh = DateTime.UtcNow - lastVatsimOnlineRefreshUtc;
+            TimeSpan minimumInterval = force
+                ? vatsimForcedRefreshMinimumInterval
+                : vatsimOnlineRefreshInterval;
+
+            if (elapsedSinceRefresh < minimumInterval)
             {
                 UpdateOnlineStatusLabel();
                 return;
@@ -6868,10 +7983,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 await RefreshVatsimTransceiversAsync(false);
 
                 lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
+                ResetVatsimRequestBackoff();
                 UpdateOnlineStatusLabel();
             }
             catch (Exception ex)
             {
+                RegisterVatsimRequestFailure(ex, "online status refresh");
                 Logger.Debug("Online status refresh failed: " + ex.Message);
                 if (onlineStatusLabel != null)
                 {
@@ -6889,6 +8006,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         private async Task RefreshCurrentVatsimPilotDataForPhaseAsync(bool force = false)
         {
             if (!Connected)
+            {
+                return;
+            }
+
+            if (IsVatsimRequestBackoffActive(out _))
             {
                 return;
             }
@@ -6924,6 +8046,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
                 await RefreshVatsimTransceiversAsync(false);
 
+                ResetVatsimRequestBackoff();
+
                 SafeUi(() =>
                 {
                     UpdateCallsignDisplay();
@@ -6933,6 +8057,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
             catch (Exception ex)
             {
+                RegisterVatsimRequestFailure(ex, "pilot/phase refresh");
                 Logger.Debug("VATSIM pilot/phase refresh failed: " + ex.Message);
             }
         }
@@ -6971,6 +8096,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             var content = new FormUrlEncodedContent(connectionValues);
             var response = await webclient.PostAsync(HoppieConnectUrl, content);
+            response.EnsureSuccessStatusCode();
             string responseString = await response.Content.ReadAsStringAsync();
 
             if (IsHoppieNetworkLoadResponse(responseString))
@@ -6979,16 +8105,37 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
-            hoppieOnlineStations.Clear();
+            string upperResponse = (responseString ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(upperResponse) || upperResponse.Contains("ERROR"))
+            {
+                throw new HttpRequestException(
+                    "Hoppie ALL-CALLSIGNS did not return a verifiable station list.");
+            }
 
-            foreach (Match match in Regex.Matches(responseString.ToUpperInvariant(), @"\b[A-Z0-9]{3,10}(?:_[A-Z0-9]{1,10})?\b"))
+            HashSet<string> refreshedStations = new(StringComparer.OrdinalIgnoreCase);
+
+            foreach (Match match in Regex.Matches(upperResponse, @"\b[A-Z0-9]{3,10}(?:_[A-Z0-9]{1,10})?\b"))
             {
                 string token = match.Value.Trim();
 
                 if (IsUsefulHoppieStationToken(token))
                 {
-                    hoppieOnlineStations.Add(token);
+                    refreshedStations.Add(token);
                 }
+            }
+
+            // An empty/invalid response must never be treated as proof that every
+            // station is offline. Keep the previous cache and report UNKNOWN.
+            if (refreshedStations.Count == 0)
+            {
+                throw new FormatException(
+                    "Hoppie ALL-CALLSIGNS returned no usable station entries.");
+            }
+
+            hoppieOnlineStations.Clear();
+            foreach (string station in refreshedStations)
+            {
+                hoppieOnlineStations.Add(station);
             }
 
             hoppieOnlineStationsLoaded = true;
@@ -7243,11 +8390,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 nextFlightPlanPromptPanel.Controls.Add(reloadButton);
                 nextFlightPlanPromptPanel.Controls.Add(ignoreButton);
 
-                outputTable.Controls.Add(CreateLabel(DateTime.Now.ToString("HH:mm")), 0, outputTable.RowCount - 1);
-                outputTable.Controls.Add(nextFlightPlanPromptPanel, 1, outputTable.RowCount - 1);
-                outputTable.Controls.Add(CreateTimerLabel(">>", true), 2, outputTable.RowCount - 1);
-                outputTable.RowCount += 1;
-                outputTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                TableLayoutHelper.InsertArbitraryRow(outputTable, 0);
+                outputTable.Controls.Add(CreateLabel(DateTime.Now.ToString("HH:mm")), 0, 0);
+                outputTable.Controls.Add(nextFlightPlanPromptPanel, 1, 0);
+                outputTable.Controls.Add(CreateTimerLabel(">>", true), 2, 0);
                 ApplyMessageFilter();
                 outputTable.ScrollControlIntoView(nextFlightPlanPromptPanel);
                 HideNativeOutputScrollbars();
@@ -8491,14 +9637,25 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 return;
             }
 
-            if (!force &&
-                DateTime.UtcNow - lastVatsimTransceiverRefreshAttemptUtc < vatsimTransceiverRefreshInterval &&
-                !IsVatsimTransceiverDataStale())
+            DateTime now = DateTime.UtcNow;
+            if (now < vatsimTransceiverRetryAfterUtc)
             {
                 return;
             }
 
-            lastVatsimTransceiverRefreshAttemptUtc = DateTime.UtcNow;
+            TimeSpan minimumInterval = force
+                ? vatsimTransceiverForcedMinimumInterval
+                : vatsimTransceiverRefreshInterval;
+
+            // Even forced UI/helper calls may not repeatedly bypass the minimum
+            // interval. This prevents stale-data discovery loops from hammering the
+            // endpoint during an outage.
+            if (now - lastVatsimTransceiverRefreshAttemptUtc < minimumInterval)
+            {
+                return;
+            }
+
+            lastVatsimTransceiverRefreshAttemptUtc = now;
             vatsimTransceiverRefreshInProgress = true;
 
             try
@@ -8587,11 +9744,37 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 }
 
                 vatsimTransceiversLoadedUtc = DateTime.UtcNow;
+                consecutiveVatsimTransceiverFailures = 0;
+                vatsimTransceiverRetryAfterUtc = DateTime.MinValue;
                 Logger.Debug("Loaded VATSIM transceivers: " + vatsimTransceiverFrequencies.Count + " clients.");
+
+                // Re-run CPDLC discovery immediately with the newly received VHF1
+                // frequency. Without this, a tuned-frequency change could remain
+                // invisible until the next complete status refresh.
+                SafeUi(() =>
+                {
+                    if (Connected)
+                    {
+                        UpdateOnlineStatusLabel();
+                    }
+                });
             }
             catch (Exception ex)
             {
-                Logger.Debug("VATSIM transceiver refresh failed: " + ex.Message);
+                consecutiveVatsimTransceiverFailures =
+                    Math.Min(consecutiveVatsimTransceiverFailures + 1, 6);
+
+                int exponent = Math.Min(consecutiveVatsimTransceiverFailures - 1, 4);
+                double retrySeconds = Math.Min(300.0, 30.0 * Math.Pow(2.0, exponent));
+                retrySeconds += Random.Shared.Next(0, 11);
+                vatsimTransceiverRetryAfterUtc =
+                    DateTime.UtcNow + TimeSpan.FromSeconds(retrySeconds);
+
+                Logger.Debug(
+                    "VATSIM transceiver refresh failed; retry in " +
+                    Math.Ceiling(retrySeconds).ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                    "s: " + ex.Message);
             }
             finally
             {
@@ -11097,6 +12280,212 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return CpdlcLogonStationAvailability.NotOnline;
         }
 
+        private async Task<CpdlcLogonStationAvailability> CheckPdcStationAvailabilityFreshAsync(string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return CpdlcLogonStationAvailability.NotOnline;
+            }
+
+            if (DebugUiPreviewMode)
+            {
+                return IsPossibleHoppieLogonCode(clean)
+                    ? CpdlcLogonStationAvailability.Online
+                    : CpdlcLogonStationAvailability.NotOnline;
+            }
+
+            // PDC verification must never trust a previously cached ONLINE result.
+            // The station may have disconnected after the button became available.
+            DateTime refreshStartedUtc = DateTime.UtcNow;
+
+            try
+            {
+                await RefreshHoppieOnlineStationsAsync();
+                UpdateOnlineStatusLabel();
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug(
+                    "Fresh PDC station verification failed for " + clean + ": " +
+                    ex.Message);
+            }
+
+            if (!WasHoppieOnlineStationListFreshlyVerified(refreshStartedUtc))
+            {
+                return CpdlcLogonStationAvailability.Unknown;
+            }
+
+            return IsHoppieLogonOnline(clean)
+                ? CpdlcLogonStationAvailability.Online
+                : CpdlcLogonStationAvailability.NotOnline;
+        }
+
+        private void CancelPdcStationOfflineWatch()
+        {
+            CancellationTokenSource cancellation = pdcStationOfflineWatchCancellationTokenSource;
+            pdcStationOfflineWatchCancellationTokenSource = null;
+
+            if (cancellation == null)
+            {
+                return;
+            }
+
+            try
+            {
+                cancellation.Cancel();
+            }
+            catch
+            {
+            }
+            finally
+            {
+                cancellation.Dispose();
+            }
+        }
+
+        private bool IsPdcRequestStillWaiting()
+        {
+            string status = (clearanceStatusText ?? string.Empty).Trim().ToUpperInvariant();
+            return status.Contains("REQ") &&
+                   !status.Contains("ACC") &&
+                   !status.Contains("REJ") &&
+                   !status.Contains("RX");
+        }
+
+        private void WritePdcStationUnavailableMessage(
+            string station,
+            CpdlcLogonStationAvailability availability)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return;
+            }
+
+            string noticeKey = availability.ToString() + "_" + clean;
+            DateTime now = DateTime.UtcNow;
+            if (pdcStationUnavailableNoticeUtc.TryGetValue(noticeKey, out DateTime lastNotice) &&
+                now - lastNotice < pdcStationUnavailableNoticeCooldown)
+            {
+                return;
+            }
+
+            pdcStationUnavailableNoticeUtc[noticeKey] = now;
+
+            StopClearanceAutoConfirmTimer();
+
+            string message;
+            if (availability == CpdlcLogonStationAvailability.NotOnline)
+            {
+                message =
+                    "PDC REQUEST FAILED\nSTATION " + clean +
+                    " NOT ONLINE ON HOPPIE";
+                lastClearanceHoverText = message;
+                SetClearanceStatus("CLR REJ");
+            }
+            else
+            {
+                message =
+                    "PDC REQUEST STATUS UNKNOWN\nCOULD NOT VERIFY HOPPIE STATION " +
+                    clean + "\nTRY AGAIN SHORTLY";
+                lastClearanceHoverText = message;
+                SetClearanceStatus("CLR --");
+            }
+
+            WriteMessage(message, "SYSTEM", "SYSTEM");
+        }
+
+        private async Task<CpdlcLogonStationAvailability> VerifyPdcStationAvailabilityBeforeSendAsync(string station)
+        {
+            CancelPdcStationOfflineWatch();
+
+            CpdlcLogonStationAvailability availability =
+                await CheckPdcStationAvailabilityFreshAsync(station);
+
+            if (availability != CpdlcLogonStationAvailability.Online)
+            {
+                WritePdcStationUnavailableMessage(station, availability);
+            }
+
+            return availability;
+        }
+
+        private void StartPdcStationOfflineWatch(string station)
+        {
+            string clean = (station ?? string.Empty).Trim().ToUpperInvariant();
+            if (string.IsNullOrWhiteSpace(clean))
+            {
+                return;
+            }
+
+            CancelPdcStationOfflineWatch();
+            CancellationTokenSource cancellation = new();
+            pdcStationOfflineWatchCancellationTokenSource = cancellation;
+            _ = MonitorPdcStationAvailabilityAfterRequestAsync(clean, cancellation);
+        }
+
+        private async Task MonitorPdcStationAvailabilityAfterRequestAsync(
+            string station,
+            CancellationTokenSource owner)
+        {
+            try
+            {
+                await Task.Delay(pdcStationOfflineWatchInitialDelay, owner.Token);
+
+                for (int attempt = 0; attempt < 2; attempt++)
+                {
+                    if (owner.IsCancellationRequested || !IsPdcRequestStillWaiting())
+                    {
+                        return;
+                    }
+
+                    CpdlcLogonStationAvailability availability =
+                        await CheckPdcStationAvailabilityFreshAsync(station);
+
+                    if (owner.IsCancellationRequested || !IsPdcRequestStillWaiting())
+                    {
+                        return;
+                    }
+
+                    if (availability == CpdlcLogonStationAvailability.NotOnline)
+                    {
+                        SafeUi(() => WritePdcStationUnavailableMessage(
+                            station,
+                            CpdlcLogonStationAvailability.NotOnline));
+                        return;
+                    }
+
+                    // Online means the station is still reachable; waiting for its
+                    // actual clearance reply remains valid. Unknown gets one more
+                    // delayed verification instead of producing a false offline alert.
+                    if (availability == CpdlcLogonStationAvailability.Online)
+                    {
+                        return;
+                    }
+
+                    await Task.Delay(pdcStationOfflineWatchRetryDelay, owner.Token);
+                }
+            }
+            catch (OperationCanceledException)
+            {
+            }
+            catch (Exception ex)
+            {
+                Logger.Debug(
+                    "PDC station offline watch failed for " + station + ": " +
+                    ex.Message);
+            }
+            finally
+            {
+                if (ReferenceEquals(pdcStationOfflineWatchCancellationTokenSource, owner))
+                {
+                    pdcStationOfflineWatchCancellationTokenSource = null;
+                    owner.Dispose();
+                }
+            }
+        }
+
         private async Task<bool> VerifyCpdlcLogonStationOnlineBeforeSendAsync(string station, bool requireHoppieOnline)
         {
             if (!requireHoppieOnline)
@@ -12574,7 +13963,17 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 string.IsNullOrWhiteSpace(atisLetter) ? "A" : atisLetter);
 
             HideQuickActionButtons();
+
+            CpdlcLogonStationAvailability quickPdcAvailability =
+                await VerifyPdcStationAvailabilityBeforeSendAsync(recipient);
+
+            if (quickPdcAvailability != CpdlcLogonStationAvailability.Online)
+            {
+                return;
+            }
+
             await SendCPDLCMessage(recipient, "TELEX", message.Trim());
+            StartPdcStationOfflineWatch(recipient);
         }
 
         private async Task QuickCpdlcLogoffAsync()
@@ -14150,12 +15549,24 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return !DcduStyleManager.IsBoeing && airbusAocPage != AirbusAocPage.None;
         }
 
+        // The left Airbus LSK bank in the current bezel artwork was moved down.
+        // Only the physical click targets need the +18 logical px correction.
+        // Visible left/right captions share the same row coordinates so paired
+        // labels and values remain perfectly level on every Airbus page.
+        private const int AirbusLeftLskHitboxVerticalOffset = 18;
+        private const int AirbusLeftLskTextVerticalOffset = 0;
+
         private Rectangle AirbusAocLeftLskBounds(int index)
         {
-            // Physical Airbus side-key hitboxes, tuned to DCDU_Main_V15.png.
+            // Physical Airbus side-key hitboxes, tuned to the lowered left LSK
+            // bank in the current DCDU bezel artwork.
             int[] y = { 46, 88, 130, 172, 214 };
             int i = Math.Max(0, Math.Min(index - 1, y.Length - 1));
-            return SR(new Rectangle(8, y[i], 64, 36));
+            return SR(new Rectangle(
+                8,
+                y[i] + AirbusLeftLskHitboxVerticalOffset,
+                64,
+                36));
         }
 
         private Rectangle AirbusAocRightLskBounds(int index)
@@ -15999,8 +17410,24 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         break;
 
                     case BoeingTelexPendingSendKind.PreDepClearance:
+                        CpdlcLogonStationAvailability boeingPdcAvailability =
+                            await VerifyPdcStationAvailabilityBeforeSendAsync(recipient);
+
+                        if (boeingPdcAvailability != CpdlcLogonStationAvailability.Online)
+                        {
+                            ClearStoredBoeingTelexPage(BoeingTelexPage.AtcPreDepClearance);
+                            ShowBoeingTelexInlineSendStatus(
+                                boeingPdcAvailability == CpdlcLogonStationAvailability.NotOnline
+                                    ? "STATION OFFLINE"
+                                    : "STATUS UNKNOWN");
+                            await Task.Delay(1800);
+                            CloseBoeingTelexPages();
+                            return;
+                        }
+
                         // The full outbound request is written once by SendCPDLCMessage after Hoppie accepts it.
                         await SendCPDLCMessage(recipient, "TELEX", message.Trim());
+                        StartPdcStationOfflineWatch(recipient);
                         ClearStoredBoeingTelexPage(BoeingTelexPage.AtcPreDepClearance);
                         break;
 
@@ -16088,7 +17515,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             SetAirbusAocChromeVisible(true);
             if (DcduStyleManager.IsA220)
             {
+                // The normal message/status display is the A220 CONN home page.
+                // Whenever any embedded menu, setup page or message preview is
+                // closed, restore CONN as the highlighted navigation button.
+                a220ActiveNavigationKey = "CONN";
                 SetA220MainGuideLinesVisible(true);
+                UpdateA220NavigationVisuals();
             }
             // Do not call SetSmartWidgetsVisible(true) here: that forces all top badges/actions on,
             // which differs from the normal startup main screen. Restore via normal status updates below.
@@ -16309,13 +17741,17 @@ airbusAocSendLabel = null;
 
         private int AirbusAocLskTextY(Control parent, int index)
         {
-            // Physical Airbus DCDU line-select rows for DCDU_Main_V15.
-            // Left LSK text is intentionally a few pixels higher than the old generic row table;
-            // this lines the captions up with the centres of the left hardware keys.
+            // Left and right captions intentionally use the same visual row.
+            // The physical left-side button correction belongs only to hit-testing.
             int[] preferred = { 20, 62, 104, 146, 196 };
             int i = Math.Max(0, Math.Min(index - 1, preferred.Length - 1));
             int baseHeight = BaseLogicalHeight(parent);
-            return Math.Min(preferred[i], Math.Max(0, (baseHeight > 0 ? baseHeight : parent.Height) - 34));
+            int availableBottom =
+                Math.Max(0, (baseHeight > 0 ? baseHeight : parent.Height) - 34);
+
+            return Math.Min(
+                preferred[i] + AirbusLeftLskTextVerticalOffset,
+                availableBottom);
         }
 
         private int AirbusAocRightLskTextY(Control parent, int index)
@@ -20078,8 +21514,27 @@ airbusAocSendLabel = null;
                 switch (kind)
                 {
                     case AirbusAocPendingSendKind.PreDepClearance:
+                        CpdlcLogonStationAvailability airbusPdcAvailability =
+                            await VerifyPdcStationAvailabilityBeforeSendAsync(recipient);
+
+                        if (airbusPdcAvailability != CpdlcLogonStationAvailability.Online)
+                        {
+                            ClearStoredAirbusAocPage(AirbusAocPage.PreDepClearance);
+                            ShowAirbusAocSendStatusPage(
+                                airbusPdcAvailability == CpdlcLogonStationAvailability.NotOnline
+                                    ? "STATION OFFLINE"
+                                    : "STATUS UNKNOWN",
+                                recipient,
+                                title,
+                                previewText);
+                            await Task.Delay(1800);
+                            CloseAirbusAocPages();
+                            return;
+                        }
+
                         // The full outbound request is written once by SendCPDLCMessage after Hoppie accepts it.
                         await SendCPDLCMessage(recipient, "TELEX", message.Trim());
+                        StartPdcStationOfflineWatch(recipient);
                         ClearStoredAirbusAocPage(AirbusAocPage.PreDepClearance);
                         break;
 
@@ -20879,6 +22334,10 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             foreach (string key in new[] { "CONN", "AOC", "ATC", "RLD FP", "SETUP" })
             {
                 Button button = a220NavigationButtons[key];
+                button.Font = CreateDpiStablePointFont(
+                    "Consolas",
+                    9.8f,
+                    FontStyle.Regular);
                 button.Location = new Point(x, 0);
                 button.Size = new Size(buttonWidth, navHeight);
                 x += buttonWidth + gap;
@@ -20886,6 +22345,10 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
             if (a220MinimizeButton != null)
             {
+                a220MinimizeButton.Font = CreateDpiStablePointFont(
+                    "Consolas",
+                    9.6f,
+                    FontStyle.Regular);
                 a220MinimizeButton.Location = new Point(
                     a220NavigationPanel.Width - closeWidth - gap - minimizeWidth,
                     0);
@@ -20895,6 +22358,10 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
             if (a220CloseButton != null)
             {
+                a220CloseButton.Font = CreateDpiStablePointFont(
+                    "Consolas",
+                    9.6f,
+                    FontStyle.Regular);
                 a220CloseButton.Location = new Point(a220NavigationPanel.Width - closeWidth, 0);
                 a220CloseButton.Size = new Size(closeWidth, navHeight);
                 a220CloseButton.BringToFront();
@@ -23970,6 +25437,9 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
             HideManualDeleteConfirmPopup();
             styledMessageReplySendInProgress = false;
             previewMessage = null;
+            styledPreviewPagedMessage = null;
+            styledPreviewPageIndex = 0;
+            styledPreviewTotalPages = 1;
             RestoreMainScreenFromEmbeddedPage();
         }
 
@@ -24795,6 +26265,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 }
 
                 Logger.Debug("Attempting to poll Hoppie for new messages");
+                RecordUiDiagnosticActivity("Hoppie message poll");
 
                 await SendCPDLCMessage("NONE", "poll", "");
 
@@ -24811,7 +26282,8 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 {
                     try
                     {
-                        await fsuipc.RefreshData();
+                        await RefreshFsuipcDataWithDiagnosticsAsync(
+                            "periodic refresh");
                         fsuipcErrorCount = 1;
                     }
                     catch (FSUIPCException)
@@ -24820,16 +26292,43 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         {
                             try
                             {
-                                fsConnectionOpen = FSUIPCData.OpenConnection();
+                                fsConnectionOpen =
+                                    await OpenFsuipcConnectionWithDiagnosticsAsync(
+                                        "periodic reconnect",
+                                        cancellationToken);
                             }
-                            catch { }
+                            catch (OperationCanceledException)
+                            {
+                                break;
+                            }
+                            catch
+                            {
+                                fsConnectionOpen = false;
+                            }
+
                             WriteMessage(String.Format("UNABLE TO CHECK FLIGHT SIM DATA. RETRYING (ATTEMPT {0} OF 3)", fsuipcErrorCount), "SYSTEM", "SYSTEM");
                             fsuipcErrorCount += 1;
                         }
                         else
                         {
                             WriteMessage("FLIGHT SIM DATA RETRIEVAL FAILED 3 TIMES CONSECUTIVELY. DISCONNECTING FROM FLIGHT SIM", "SYSTEM", "SYSTEM");
-                            fsConnectionOpen = FSUIPCData.CloseConnection();
+
+                            try
+                            {
+                                fsConnectionOpen =
+                                    await CloseFsuipcConnectionWithDiagnosticsAsync(
+                                        "periodic disconnect",
+                                        cancellationToken);
+                            }
+                            catch (OperationCanceledException)
+                            {
+                                break;
+                            }
+                            catch
+                            {
+                                fsConnectionOpen = false;
+                            }
+
                             fsuipcErrorCount = 1;
                         }
 
@@ -26830,6 +28329,14 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             string type = (message.type ?? string.Empty).Trim().ToUpperInvariant();
             string text = (message.message ?? string.Empty).Trim().ToUpperInvariant();
 
+            // The animated VATSIM retry notice is a persistent status message.
+            // Its hourglass timer is cosmetic only and must never be replaced by
+            // the generic request-message auto-delete countdown.
+            if (IsVatsimRetryCooldownMessageText(text))
+            {
+                return false;
+            }
+
             if (IsCpdlcLogonFailedLocalNoticeText(text))
             {
                 return false;
@@ -27167,6 +28674,20 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private bool IsAutoDeleteRequestTimerActive(CPDLCMessage message)
         {
             return message != null && autoDeleteRequestTimers.ContainsKey(message);
+        }
+
+        private bool IsMessageProtectedFromAutoDelete(CPDLCMessage message)
+        {
+            if (message == null)
+            {
+                return false;
+            }
+
+            // Opening the message itself or either overview action popup is an
+            // explicit user interaction. Auto-delete must never win afterwards.
+            return ReferenceEquals(previewMessage, message) ||
+                   ReferenceEquals(autoDeleteActionPopupMessage, message) ||
+                   ReferenceEquals(manualDeleteConfirmPopupMessage, message);
         }
 
         private void HideAutoDeleteActionPopup()
@@ -27511,6 +29032,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 return;
             }
 
+            // Any click on a message action is a deliberate "keep this message"
+            // interaction, even when the user only opens the delete confirmation.
+            StopAutoDeleteRequestMessage(message, true);
             HideAutoDeleteActionPopup();
             manualDeleteConfirmPopupMessage = message;
 
@@ -27656,6 +29180,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return;
                 }
 
+                if (IsMessageProtectedFromAutoDelete(message))
+                {
+                    StopAutoDeleteRequestMessage(message, true);
+                    return;
+                }
+
                 int actualRemaining = ClampAutoDeleteSeconds((int)Math.Ceiling((countdownState.DueUtc - DateTime.UtcNow).TotalSeconds));
                 int displayRemaining = countdownState.DisplayedSeconds;
 
@@ -27786,11 +29316,20 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                 try
                 {
+                    // Defensive last check for a timer tick and a UI interaction
+                    // arriving in the same message-loop cycle.
+                    if (IsMessageProtectedFromAutoDelete(message))
+                    {
+                        StopAutoDeleteRequestMessage(message, true);
+                        return;
+                    }
+
                     if (autoDeleteActionPopupMessage == message)
                     {
                         HideAutoDeleteActionPopup();
                     }
 
+                    StopVatsimRetryHourglassAnimation(message);
                     MarkMessageRead(message);
                     TableLayoutPanelCellPosition pos = outputTable.GetPositionFromControl(message);
                     int row = pos.Row;
@@ -27817,7 +29356,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         outputTable.RowStyles[row].Height = 0F;
                     }
 
-                    ClearPreview();
+                    // Delete only this overview row. Do not call ClearPreview():
+                    // another message, ATIS page, setup page or action menu may
+                    // currently be open and must remain completely untouched.
                     ApplyMessageFilter();
                     HideNativeOutputScrollbars();
                 }
@@ -27869,6 +29410,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             }
 
             StopAutoDeleteRequestMessage(control, false);
+            StopVatsimRetryHourglassAnimation(control);
             HideManualDeleteConfirmPopup();
             HideAutoDeleteActionPopup();
             MarkMessageRead(control);
@@ -27903,6 +29445,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             HideAutoDeleteActionPopup();
             HideManualDeleteConfirmPopup();
             StopAllAutoDeleteRequestTimers();
+            StopAllVatsimRetryHourglassAnimations();
             ClearUnreadMessages();
             outputTable.Controls.Clear();
             UpdateMessageFilterLabel();
@@ -28663,11 +30206,49 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             return label;
         }
 
-        private void AddStyledPreviewBody(Control parent, string text, int x, int y, int width, int height, Font font)
+        private int StyledPreviewLineHeight()
         {
-            if (parent == null || string.IsNullOrEmpty(text))
+            return DcduStyleManager.IsBoeing ? 23 : 24;
+        }
+
+        private static string[] StyledPreviewLines(string text)
+        {
+            string normalized = (text ?? string.Empty)
+                .Replace("\r\n", "\n")
+                .Replace("\r", "\n");
+
+            if (normalized.Length == 0)
             {
-                return;
+                return new[] { string.Empty };
+            }
+
+            return normalized.Split('\n');
+        }
+
+        private int GetStyledPreviewPageCount(string text, int height)
+        {
+            int lineHeight = StyledPreviewLineHeight();
+            int linesPerPage = Math.Max(1, Math.Max(1, height) / Math.Max(1, lineHeight));
+            int lineCount = Math.Max(1, StyledPreviewLines(text).Length);
+            return Math.Max(1, (lineCount + linesPerPage - 1) / linesPerPage);
+        }
+
+        private int AddStyledPreviewBody(
+            Control parent,
+            string text,
+            int x,
+            int y,
+            int width,
+            int height,
+            Font font,
+            int requestedPageIndex,
+            out int totalPages)
+        {
+            totalPages = 1;
+
+            if (parent == null)
+            {
+                return 0;
             }
 
             Color baseColor = DcduStyleManager.IsBoeing ? MainPrimaryTextColor() : DcduTheme.CyanWhite;
@@ -28679,24 +30260,25 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 Margin = Padding.Empty,
                 Padding = Padding.Empty,
                 Location = new Point(x, y),
-                Size = new Size(width, height)
+                Size = new Size(Math.Max(1, width), Math.Max(1, height))
             };
             parent.Controls.Add(bodyHost);
             bodyHost.BringToFront();
 
-            string normalized = (text ?? string.Empty).Replace("\r\n", "\n").Replace("\r", "\n");
-            string[] lines = normalized.Split('\n');
-            int lineHeight = DcduStyleManager.IsBoeing ? 23 : 24;
+            string[] lines = StyledPreviewLines(text);
+            int lineHeight = StyledPreviewLineHeight();
+            int linesPerPage = Math.Max(1, bodyHost.Height / Math.Max(1, lineHeight));
+            totalPages = Math.Max(1, (Math.Max(1, lines.Length) + linesPerPage - 1) / linesPerPage);
 
-            for (int lineIndex = 0; lineIndex < lines.Length; lineIndex++)
+            int pageIndex = Math.Max(0, Math.Min(requestedPageIndex, totalPages - 1));
+            int firstLine = pageIndex * linesPerPage;
+            int lastLineExclusive = Math.Min(lines.Length, firstLine + linesPerPage);
+
+            for (int sourceLineIndex = firstLine; sourceLineIndex < lastLineExclusive; sourceLineIndex++)
             {
-                string line = lines[lineIndex] ?? string.Empty;
+                string line = lines[sourceLineIndex] ?? string.Empty;
                 int currentX = 0;
-                int currentY = lineIndex * lineHeight;
-                if (currentY + lineHeight > bodyHost.Height)
-                {
-                    break;
-                }
+                int currentY = (sourceLineIndex - firstLine) * lineHeight;
 
                 foreach (Match match in Regex.Matches(line, "@[^@]+@|[^@]+"))
                 {
@@ -28706,8 +30288,13 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         continue;
                     }
 
-                    bool isHighlighted = rawSegment.Length >= 2 && rawSegment.StartsWith("@") && rawSegment.EndsWith("@");
-                    string visibleSegment = isHighlighted ? rawSegment.Substring(1, rawSegment.Length - 2) : rawSegment;
+                    bool isHighlighted = rawSegment.Length >= 2 &&
+                        rawSegment.StartsWith("@") &&
+                        rawSegment.EndsWith("@");
+                    string visibleSegment = isHighlighted
+                        ? rawSegment.Substring(1, rawSegment.Length - 2)
+                        : rawSegment;
+
                     if (visibleSegment.Length == 0)
                     {
                         continue;
@@ -28717,7 +30304,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         visibleSegment,
                         font,
                         new Size(int.MaxValue, lineHeight),
-                        TextFormatFlags.NoPadding | TextFormatFlags.NoPrefix | TextFormatFlags.SingleLine);
+                        TextFormatFlags.NoPadding |
+                        TextFormatFlags.NoPrefix |
+                        TextFormatFlags.SingleLine);
 
                     System.Windows.Forms.Label label = new()
                     {
@@ -28743,6 +30332,135 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         break;
                     }
                 }
+            }
+
+            return pageIndex;
+        }
+
+        private System.Windows.Forms.Label AddStyledPreviewPageControl(
+            Control parent,
+            string text,
+            int x,
+            int y,
+            int width,
+            int height,
+            ContentAlignment alignment,
+            Action click)
+        {
+            _ = click;
+
+            Color normalColor = DcduStyleManager.IsBoeing
+                ? MainPrimaryTextColor()
+                : DcduTheme.Cyan;
+
+            System.Windows.Forms.Label label = new()
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = normalColor,
+                Font = DcduStyleManager.IsBoeing
+                    ? CreateDpiStablePointFont("Consolas", 9.4f, FontStyle.Bold)
+                    : CreateDpiStablePointFont("Consolas", 9.8f, FontStyle.Bold),
+                Text = text ?? string.Empty,
+                TextAlign = alignment,
+                Location = new Point(x, y),
+                Size = new Size(Math.Max(1, width), Math.Max(1, height)),
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+                Cursor = Cursors.Hand,
+                TabStop = true,
+                AccessibleDescription = "DCDU_MESSAGE_PAGE_NAVIGATION"
+            };
+
+            // AIRBUS/BOEING paging is a true line-select-key action, just like
+            // DELETE/CLOSE and the CPDLC reply actions. The caption itself is only
+            // visual; the adjacent physical side-button hotspot performs the page
+            // change. A220 has separate real buttons in its own message view.
+            label.Cursor = Cursors.Default;
+            label.TabStop = false;
+
+            parent.Controls.Add(label);
+            label.BringToFront();
+            return label;
+        }
+
+        private void ChangeStyledPreviewPage(CPDLCMessage message, int delta)
+        {
+            if (message == null ||
+                !ReferenceEquals(previewMessage, message) ||
+                styledPreviewTotalPages <= 1)
+            {
+                return;
+            }
+
+            int nextPage = Math.Max(
+                0,
+                Math.Min(styledPreviewPageIndex + delta, styledPreviewTotalPages - 1));
+
+            if (nextPage == styledPreviewPageIndex)
+            {
+                return;
+            }
+
+            styledPreviewPageIndex = nextPage;
+            ShowStyledMessagePreview(message, new List<System.Windows.Forms.Label>());
+        }
+
+        private void AddStyledPreviewPageNavigation(
+            Control page,
+            CPDLCMessage message,
+            int y,
+            int totalPages,
+            int pageIndex)
+        {
+            if (page == null || totalPages <= 1)
+            {
+                return;
+            }
+
+            int navHeight = 20;
+            int sideWidth = Math.Min(132, Math.Max(96, page.Width / 3));
+            int centreWidth = Math.Max(72, page.Width - (sideWidth * 2) - 24);
+            int centreX = Math.Max(sideWidth + 12, (page.Width - centreWidth) / 2);
+
+            if (pageIndex > 0)
+            {
+                AddStyledPreviewPageControl(
+                    page,
+                    "< PREV PAGE",
+                    20,
+                    y,
+                    sideWidth,
+                    navHeight,
+                    ContentAlignment.MiddleLeft,
+                    () => ChangeStyledPreviewPage(message, -1));
+            }
+
+            AddStyledPreviewText(
+                page,
+                "PAGE " +
+                (pageIndex + 1).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                "/" +
+                totalPages.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                centreX,
+                y,
+                centreWidth,
+                navHeight,
+                DcduStyleManager.IsBoeing ? MainPrimaryTextColor() : DcduTheme.CyanWhite,
+                CreateDpiStablePointFont("Consolas", 9.2f, FontStyle.Bold),
+                ContentAlignment.MiddleCenter);
+
+            if (pageIndex + 1 < totalPages)
+            {
+                AddStyledPreviewPageControl(
+                    page,
+                    "NEXT PAGE >",
+                    Math.Max(20, page.Width - sideWidth - 20),
+                    y,
+                    sideWidth,
+                    navHeight,
+                    ContentAlignment.MiddleRight,
+                    () => ChangeStyledPreviewPage(message, 1));
             }
         }
 
@@ -28810,6 +30528,27 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
             if (DcduStyleManager.IsBoeing)
             {
+                // Boeing message paging uses the free fourth LSK row. Rows 5/6
+                // remain reserved for DELETE/CLOSE or the CPDLC reply actions.
+                if (styledPreviewTotalPages > 1)
+                {
+                    if (styledPreviewPageIndex > 0 &&
+                        BoeingTelexLeftLskBounds(4).Contains(location))
+                    {
+                        rightSide = false;
+                        index = 4;
+                        return true;
+                    }
+
+                    if (styledPreviewPageIndex + 1 < styledPreviewTotalPages &&
+                        BoeingTelexRightLskBounds(4).Contains(location))
+                    {
+                        rightSide = true;
+                        index = 4;
+                        return true;
+                    }
+                }
+
                 // Boeing message page: lower right rows 5/6 for DELETE/CLOSE or STBY/WILCO.
                 if (BoeingTelexRightLskBounds(5).Contains(location))
                 {
@@ -28841,6 +30580,27 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             }
             else
             {
+                // Airbus message paging uses the free third LSK row. Rows 4/5
+                // remain reserved for DELETE/CLOSE or the CPDLC reply actions.
+                if (styledPreviewTotalPages > 1)
+                {
+                    if (styledPreviewPageIndex > 0 &&
+                        AirbusAocLeftLskBounds(3).Contains(location))
+                    {
+                        rightSide = false;
+                        index = 3;
+                        return true;
+                    }
+
+                    if (styledPreviewPageIndex + 1 < styledPreviewTotalPages &&
+                        AirbusAocRightLskBounds(3).Contains(location))
+                    {
+                        rightSide = true;
+                        index = 3;
+                        return true;
+                    }
+                }
+
                 // Airbus message page: lower right rows 4/5 for DELETE/CLOSE or STBY/WILCO.
                 if (AirbusAocRightLskBounds(4).Contains(location))
                 {
@@ -28895,6 +30655,22 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             CPDLCMessage message = previewMessage;
             if (message == null)
             {
+                return;
+            }
+
+            int pagingRow = DcduStyleManager.IsBoeing ? 4 : 3;
+            if (styledPreviewTotalPages > 1 && index == pagingRow)
+            {
+                if (!rightSide && styledPreviewPageIndex > 0)
+                {
+                    ChangeStyledPreviewPage(message, -1);
+                }
+                else if (rightSide &&
+                         styledPreviewPageIndex + 1 < styledPreviewTotalPages)
+                {
+                    ChangeStyledPreviewPage(message, 1);
+                }
+
                 return;
             }
 
@@ -29117,14 +30893,42 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 previewText = previewText.Trim();
             }
 
-            AddStyledPreviewBody(
+            if (!ReferenceEquals(styledPreviewPagedMessage, message))
+            {
+                styledPreviewPagedMessage = message;
+                styledPreviewPageIndex = 0;
+                styledPreviewTotalPages = 1;
+            }
+
+            int fullBodyHeight = Math.Max(40, separatorY - 44);
+            bool needsPaging = GetStyledPreviewPageCount(previewText, fullBodyHeight) > 1;
+            int pageNavHeight = needsPaging ? 24 : 0;
+            int bodyHeight = Math.Max(24, fullBodyHeight - pageNavHeight);
+
+            styledPreviewPageIndex = AddStyledPreviewBody(
                 page,
                 previewText,
                 20,
                 36,
                 Math.Max(1, page.Width - 40),
-                Math.Max(40, separatorY - 44),
-                bodyFont);
+                bodyHeight,
+                bodyFont,
+                styledPreviewPageIndex,
+                out styledPreviewTotalPages);
+
+            if (styledPreviewTotalPages > 1)
+            {
+                int pageNavigationY = DcduStyleManager.IsBoeing
+                    ? Math.Max(36, separatorY - 24)
+                    : Math.Max(36, separatorY - 30);
+
+                AddStyledPreviewPageNavigation(
+                    page,
+                    message,
+                    pageNavigationY,
+                    styledPreviewTotalPages,
+                    styledPreviewPageIndex);
+            }
 
             AddStyledPreviewActions(page, message, separatorY);
 
@@ -29136,6 +30940,8 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void MessageClicked(object sender, EventArgs e)
         {
+            RecordUiDiagnosticActivity("Open message preview");
+
             if (sender is not System.Windows.Forms.Label clickedLabel || outputTable == null)
             {
                 return;
@@ -29166,7 +30972,14 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 {
                     return;
                 }
+
+                // Opening a message permanently cancels its current auto-delete
+                // countdown. It is not restarted when the preview is closed.
+                StopAutoDeleteRequestMessage(_sender, true);
                 previewMessage = _sender;
+                styledPreviewPagedMessage = _sender;
+                styledPreviewPageIndex = 0;
+                styledPreviewTotalPages = 1;
                 MarkMessageRead(_sender);
                 System.Windows.Forms.Label _timeStamp = (System.Windows.Forms.Label)outputTable.Controls[messageIndex - 1];
                 List<System.Windows.Forms.Label> responses = new();
@@ -29698,11 +31511,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 }
 
                 ClearNextAtcUnitDisplay();
-                if (string.Equals(cpdlcHandoverTargetCode, connectedUnit, StringComparison.OrdinalIgnoreCase) &&
-                    IsCpdlcUnitVerifiedOnActiveFrequency(connectedUnit))
-                {
-                    StopCpdlcHandoverFrequencyWatch();
-                }
+                CompleteCpdlcHandoverAfterConfirmedConnection(
+                    connectedUnit,
+                    "CPDLC connection-established message");
 
                 WriteMessage("CPDLC CONNECTED TO: " + CurrentATCUnit, "CPDLC", _sender, false, header);
                 _showUser = false;
@@ -29720,6 +31531,10 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     {
                         ClearNextAtcUnitDisplay();
                     }
+
+                    CompleteCpdlcHandoverAfterConfirmedConnection(
+                        connectedUnit,
+                        "CURRENT ATS UNIT message");
                 }
 
                 _showUser = false;
@@ -29957,7 +31772,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 Task<bool> sendTask = TrySendCpdlcPacketForInlineStatusAsync(message.recipient, message.type, packet);
                 await Task.WhenAll(sendTask, Task.Delay(900));
 
-                bool sent = sendTask.Result;
+                bool sent = await sendTask;
 
                 spinnerTimer.Stop();
                 spinnerTimer.Dispose();
@@ -30048,7 +31863,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 Task<bool> sendTask = TrySendCpdlcPacketForInlineStatusAsync(message.recipient, message.type, packet);
                 await Task.WhenAll(sendTask, Task.Delay(900));
 
-                bool sent = sendTask.Result;
+                bool sent = await sendTask;
 
                 spinnerTimer.Stop();
                 spinnerTimer.Dispose();
@@ -30105,6 +31920,11 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         public CPDLCMessage WriteMessage(string _response, string _type, string _recipient, bool _outbound = false, CPDLCResponse _header = null)
         {
+            RecordUiDiagnosticActivity(
+                "Write message [" +
+                ((_type ?? "UNKNOWN").Trim().ToUpperInvariant()) +
+                "]");
+
             if (_outbound && string.Equals(_type, "ATIS", StringComparison.OrdinalIgnoreCase))
             {
                 RememberAtisRequestTarget(_recipient);
@@ -30198,7 +32018,15 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return;
                 }
 
-                if (IsAutoDeleteRequestTimerActive(message))
+                if (IsVatsimRetryCooldownMessageText(message.message))
+                {
+                    return;
+                }
+
+                bool cancelledAutoDelete =
+                    StopAutoDeleteRequestMessage(message, true);
+
+                if (cancelledAutoDelete)
                 {
                     ShowAutoDeleteActionPopup(message, clickedMenuLabel);
                     return;
@@ -30233,11 +32061,13 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return;
                 }
 
-                outputTable.Controls.Add(CreateOverviewTimeLabel(DateTime.Now.ToString("HH:mm"), message), 0, outputTable.RowCount - 1);
-                outputTable.Controls.Add(message, 1, outputTable.RowCount - 1);
-                outputTable.Controls.Add(menuLabel, 2, outputTable.RowCount - 1);
-                outputTable.RowCount += 1;
-                outputTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                // Newest messages are always shown at the top of the overview.
+                // Insert a real table row at index 0 so all existing message rows
+                // move down together and keep their time/message/action pairing.
+                TableLayoutHelper.InsertArbitraryRow(outputTable, 0);
+                outputTable.Controls.Add(CreateOverviewTimeLabel(DateTime.Now.ToString("HH:mm"), message), 0, 0);
+                outputTable.Controls.Add(message, 1, 0);
+                outputTable.Controls.Add(menuLabel, 2, 0);
                 MarkMessageUnread(message, menuLabel);
                 StartAutoDeleteRequestMessageIfNeeded(message, menuLabel);
                 ApplyMessageFilter();
@@ -30282,7 +32112,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             {
                 unreadReminderTimer?.Stop();
                 vatsimOnlineTimer?.Stop();
+                uiThreadWatchdogTimer?.Stop();
+                uiThreadBackgroundWatchdogTimer?.Dispose();
+                uiThreadBackgroundWatchdogTimer = null;
                 StopAllAutoDeleteRequestTimers();
+                StopAllVatsimRetryHourglassAnimations();
+                CancelPdcStationOfflineWatch();
                 requestCancellationTokenSource?.Cancel();
             }
             catch (NullReferenceException) { }
@@ -30302,6 +32137,9 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         }
         private async void RetrieveButton_Click(object sender, EventArgs e)
         {
+            RecordUiDiagnosticActivity(
+                Connected ? "Disconnect requested" : "Connect requested");
+
             string response = "";
 
             if (DebugUiPreviewMode)
@@ -30311,42 +32149,95 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 return;
             }
 
-            if (!Connected)
+            if (connectionAttemptInProgress)
             {
+                return;
+            }
 
-                try
+            if (!Connected && DateTime.UtcNow < nextConnectionAttemptUtc)
+            {
+                WriteMessage(
+                    "VATSIM: RETRY PAUSED. WAIT " +
+                    RemainingConnectionRetrySeconds().ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                    " SECONDS.",
+                    "SYSTEM",
+                    "SYSTEM");
+                return;
+            }
+
+            if (!Connected && IsVatsimRequestBackoffActive(out TimeSpan vatsimBackoffRemaining))
+            {
+                int waitSeconds = Math.Max(
+                    1,
+                    (int)Math.Ceiling(vatsimBackoffRemaining.TotalSeconds));
+                WriteMessage(
+                    "VATSIM: SERVICE RETRY PAUSED. WAIT " +
+                    waitSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    " SECONDS.",
+                    "SYSTEM",
+                    "SYSTEM");
+                return;
+            }
+
+            connectionAttemptInProgress = true;
+            UpdateConnectionGatedControls();
+
+            try
+            {
+                if (!Connected)
+                {
+
+                    try
                 {
                     using (HttpClient wc = CreateShortTimeoutHttpClient())
                     {
-                        vatsimData = JsonConvert.DeserializeObject<VATSIMRootobject>(wc.GetStringAsync("https://data.vatsim.net/v3/vatsim-data.json").Result);
-                        lastVatsimOnlineRefreshUtc = DateTime.UtcNow;
-                        UpdateOnlineStatusLabel();
-                        Logger.Debug("VATSIM Data Retrieved and Parsed");
+                        RecordUiDiagnosticActivity("Initial VATSIM pilot lookup");
+                        Stopwatch initialVatsimStopwatch = Stopwatch.StartNew();
 
+                        string vatsimJson = await wc.GetStringAsync(
+                            "https://data.vatsim.net/v3/vatsim-data.json");
+
+                        LogAsyncOperationDuration(
+                            "Initial VATSIM pilot lookup",
+                            initialVatsimStopwatch);
+                        vatsimData = JsonConvert.DeserializeObject<VATSIMRootobject>(vatsimJson);
+
+                        if (vatsimData == null)
+                        {
+                            throw new JsonException("VATSIM returned an empty data document.");
+                        }
+
+                        ResetVatsimRequestBackoff();
+                        Logger.Debug("VATSIM Data Retrieved and Parsed");
                     }
 
-                    userVATSIMData = vatsimData.pilots.Where(i => i.cid == cid).FirstOrDefault();
+                    userVATSIMData = vatsimData.pilots?.FirstOrDefault(i => i.cid == cid);
                     if (userVATSIMData is null)
                     {
-                        response += "VATSIM: PILOT NOT FOUND. WAIT 60 SECONDS AND RETRY.\n";
+                        response += "VATSIM: PILOT NOT FOUND. WAIT 30 SECONDS AND RETRY.\n";
                         atcButton.Enabled = false;
                         telexButton.Enabled = false;
                         Connected = false;
-                        WriteMessage(response, "SYSTEM", "SYSTEM");
+                        StartConnectionRetryCooldown("pilot not found");
+                        CPDLCMessage pilotRetryMessage =
+                            WriteMessage(response, "SYSTEM", "SYSTEM");
+                        StartVatsimRetryHourglassAnimation(
+                            pilotRetryMessage,
+                            response);
                         return;
                     }
 
                     callsign = userVATSIMData.callsign;
                     EnsureFlightPhaseSignature(userVATSIMData);
                     UpdateCallsignDisplay();
-                    _ = RefreshVatsimOnlineStatusAsync(true);
-
                     if (userVATSIMData.flight_plan is null)
                     {
                         response += "VATSIM: NO FLIGHT PLAN FILED. FILE A FLIGHT PLAN AND RETRY.\n";
                         atcButton.Enabled = false;
                         telexButton.Enabled = false;
                         Connected = false;
+                        StartConnectionRetryCooldown("no flight plan filed");
                         WriteMessage(response, "SYSTEM", "SYSTEM");
                         return;
                     }
@@ -30367,18 +32258,33 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     HideNextFlightPlanPrompt();
                     UpdateFlightPhaseBadge();
 
+                    ClearConnectionRetryCooldown();
+
                     requestCancellationTokenSource = new CancellationTokenSource();
                     requestCancellationToken = requestCancellationTokenSource.Token;
                     _ = PeriodicCheckMessage(updateTimer, requestCancellationToken);
 
+                    // Initialise Hoppie, ATC-online and VHF1 data immediately after
+                    // the connection succeeds. This reuses the vatsim-data.json
+                    // document already downloaded above and therefore adds no
+                    // duplicate main-feed request.
+                    await PrimeCpdlcDiscoveryAfterConnectionAsync();
+
                 }
-                catch (Exception ex) when (ex is IndexOutOfRangeException || ex is NullReferenceException)
+                catch (Exception ex)
                 {
-                    response += "VATSIM: ERROR. WAIT 60 SECONDS AND RETRY.\n";
+                    RegisterVatsimRequestFailure(ex, "initial connection check");
+                    response += "VATSIM: ERROR. WAIT 30 SECONDS AND RETRY.\n";
                     atcButton.Enabled = false;
                     telexButton.Enabled = false;
                     Connected = false;
-                    WriteMessage(response, "SYSTEM", "SYSTEM");
+                    StartConnectionRetryCooldown("connection check failed");
+                    Logger.Debug("VATSIM initial connection check failed: " + ex.Message);
+                    CPDLCMessage connectionRetryMessage =
+                        WriteMessage(response, "SYSTEM", "SYSTEM");
+                    StartVatsimRetryHourglassAnimation(
+                        connectionRetryMessage,
+                        response);
                     return;
                 }
 
@@ -30388,13 +32294,38 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 {
 
                     using HttpClient wc = CreateShortTimeoutHttpClient();
-                    var simbriefjson = wc.GetStringAsync($"https://www.simbrief.com/api/xml.fetcher.php?userid={Uri.EscapeDataString(SimbriefID)}&json=1").Result;
-                    var simbriefNavlog = JObject.Parse(simbriefjson)["navlog"].ToString();
+
+                    // Never block the WinForms message pump while SimBrief is
+                    // responding. The request may still take up to the configured
+                    // HTTP timeout, but the EasyCPDLC window remains responsive.
+                    RecordUiDiagnosticActivity("SimBrief flight-plan download");
+                    Stopwatch simbriefStopwatch = Stopwatch.StartNew();
+
+                    string simbriefJson = await wc.GetStringAsync(
+                        $"https://www.simbrief.com/api/xml.fetcher.php?userid={Uri.EscapeDataString(SimbriefID)}&json=1");
+
+                    LogAsyncOperationDuration(
+                        "SimBrief flight-plan download",
+                        simbriefStopwatch);
+
+                    string simbriefNavlog = JObject.Parse(simbriefJson)["navlog"]?.ToString();
+                    if (string.IsNullOrWhiteSpace(simbriefNavlog))
+                    {
+                        throw new JsonException("SimBrief response did not contain a navlog.");
+                    }
+
                     simbriefData = JsonConvert.DeserializeObject<Navlog>(simbriefNavlog);
+                    if (simbriefData?.fix == null)
+                    {
+                        throw new JsonException("SimBrief navlog did not contain route fixes.");
+                    }
 
                     Logger.Debug("Simbrief Data Retrieved and Parsed");
 
-                    reportFixes = simbriefData.fix.Where(x => x.is_sid_star == "0" && !new string[] { "apt" }.Contains(x.type)).Select(x => x.ident).ToArray();
+                    reportFixes = simbriefData.fix
+                        .Where(x => x.is_sid_star == "0" && !new string[] { "apt" }.Contains(x.type))
+                        .Select(x => x.ident)
+                        .ToArray();
                     UpdateFlightPhaseBadge();
                     response += " SIMBRIEF OK,";
                 }
@@ -30408,10 +32339,17 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 {
                     try
                     {
-                        fsConnectionOpen = FSUIPCData.OpenConnection();
+                        // FSUIPCClient's OpenConnection is synchronous and may
+                        // wait on the simulator/IPC layer. Run it on a worker
+                        // thread so a slow simulator cannot freeze the UI.
+                        fsConnectionOpen =
+                            await OpenFsuipcConnectionWithDiagnosticsAsync(
+                                "initial connection");
+
                         if (fsConnectionOpen)
                         {
-                            await fsuipc.RefreshData();
+                            await RefreshFsuipcDataWithDiagnosticsAsync(
+                                "initial connection");
                             response += "SIMULATOR OK.";
                         }
                         else
@@ -30505,6 +32443,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                 WriteMessage(response, "SYSTEM", "SYSTEM");
 
+                }
+            }
+            finally
+            {
+                connectionAttemptInProgress = false;
+                UpdateConnectionGatedControls();
             }
         }
         private void TelexButton_Click(object sender, EventArgs e)
@@ -31324,7 +33268,75 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             {
                 previewText = previewText.Trim();
             }
-            AddStyledPreviewBody(bodyFrame, previewText, S(10), S(10), Math.Max(1, bodyFrame.Width - S(20)), Math.Max(1, bodyFrame.Height - S(20)), GetMessageTextFont(true));
+            if (!ReferenceEquals(styledPreviewPagedMessage, message))
+            {
+                styledPreviewPagedMessage = message;
+                styledPreviewPageIndex = 0;
+                styledPreviewTotalPages = 1;
+            }
+
+            int a220FullBodyHeight = Math.Max(1, bodyFrame.Height - S(20));
+            bool a220NeedsPaging =
+                GetStyledPreviewPageCount(previewText, a220FullBodyHeight) > 1;
+            int a220NavReserve = a220NeedsPaging ? S(34) : 0;
+            int a220TextHeight = Math.Max(S(24), a220FullBodyHeight - a220NavReserve);
+
+            styledPreviewPageIndex = AddStyledPreviewBody(
+                bodyFrame,
+                previewText,
+                S(10),
+                S(10),
+                Math.Max(1, bodyFrame.Width - S(20)),
+                a220TextHeight,
+                GetMessageTextFont(true),
+                styledPreviewPageIndex,
+                out styledPreviewTotalPages);
+
+            if (styledPreviewTotalPages > 1)
+            {
+                int a220NavY = Math.Max(S(10), bodyFrame.Height - S(34));
+                int a220NavButtonWidth = S(128);
+                int a220NavButtonHeight = S(26);
+
+                if (styledPreviewPageIndex > 0)
+                {
+                    AddA220SetupButton(
+                        bodyFrame,
+                        "PREV PAGE",
+                        S(10),
+                        a220NavY,
+                        a220NavButtonWidth,
+                        a220NavButtonHeight,
+                        () => ChangeStyledPreviewPage(message, -1));
+                }
+
+                AddAirbusAocLabel(
+                    bodyFrame,
+                    "PAGE " +
+                    (styledPreviewPageIndex + 1).ToString(System.Globalization.CultureInfo.InvariantCulture) +
+                    "/" +
+                    styledPreviewTotalPages.ToString(System.Globalization.CultureInfo.InvariantCulture),
+                    Math.Max(S(148), (bodyFrame.Width - S(120)) / 2),
+                    a220NavY,
+                    S(120),
+                    a220NavButtonHeight,
+                    ContentAlignment.MiddleCenter,
+                    DcduTheme.CyanWhite,
+                    CreateDpiStablePointFont("Consolas", 9.0f, FontStyle.Bold));
+
+                if (styledPreviewPageIndex + 1 < styledPreviewTotalPages)
+                {
+                    AddA220SetupButton(
+                        bodyFrame,
+                        "NEXT PAGE",
+                        Math.Max(S(10), bodyFrame.Width - S(10) - a220NavButtonWidth),
+                        a220NavY,
+                        a220NavButtonWidth,
+                        a220NavButtonHeight,
+                        () => ChangeStyledPreviewPage(message, 1),
+                        true);
+                }
+            }
 
             string responseCode = (message?.header?.Responses ?? "NE").Trim().ToUpperInvariant();
             bool canReply = message != null &&
@@ -31998,8 +34010,24 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void RefreshWindowScaleUi()
         {
+            int diagnosticToken =
+                BeginUiDiagnosticOperation("Window scale/layout rebuild");
+
             try
             {
+                // Keep the automatic base tied to monitor pixel resolution. This
+                // call does not recursively refresh because refreshUi is false.
+                UpdateAutomaticResolutionScaleFactor(false);
+
+                float currentScaleFactor = WindowScaleFactor();
+
+                // AutoScaleMode.None is intentional, so WinForms will not resize
+                // fonts for us. Rescale every persistent explicit Font before the
+                // style-specific layout is rebuilt.
+                RescaleExistingControlFonts(
+                    appliedWindowScaleFactor,
+                    currentScaleFactor);
+
                 textFont = CreateDpiStablePointFont("Consolas", 10.5f, FontStyle.Regular);
                 textFontBold = CreateDpiStablePointFont("Consolas", 11.5f, FontStyle.Bold);
                 RefreshMessageTextFonts();
@@ -32012,31 +34040,41 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                 ApplyDisplayStyle();
                 ApplyMessageFilter();
+                RefreshVisibleMessageColors();
+                ApplyMessageTextSizeSetting();
                 RefreshMainDisplaySurface();
 
-                if (DcduStyleManager.IsA220)
-                {
-                    // A220 pages are generated controls. Rebuild the currently
-                    // visible surface after changing scale instead of stretching
-                    // controls created for the previous percentage.
-                    RebuildActiveA220SurfaceAfterScale();
-                }
+                // Setup, AOC/ATC, TELEX and message-preview pages are generated
+                // controls in every DCDU style. ApplyDisplayStyle resets the shared
+                // messageFormatPanel to its normal message-list bounds, so the
+                // active page must always be recreated after a monitor/scale change.
+                RebuildActiveGeneratedSurfaceAfterScale();
+
+                appliedWindowScaleFactor = currentScaleFactor;
+
+                PerformLayout();
+                Invalidate(true);
+                screenPanel?.PerformLayout();
+                screenPanel?.Invalidate(true);
+                outputTable?.PerformLayout();
+                outputTable?.Invalidate(true);
             }
             catch (Exception ex)
             {
                 Logger.Debug("Window scale refresh failed: " + ex.Message);
             }
+            finally
+            {
+                EndUiDiagnosticOperation(diagnosticToken);
+            }
         }
 
-        private void RebuildActiveA220SurfaceAfterScale()
+        private void RebuildActiveGeneratedSurfaceAfterScale()
         {
-            if (!DcduStyleManager.IsA220)
-            {
-                return;
-            }
-
-            // Scale is changed from the style page, but keep this switch complete
-            // so future callers can safely refresh any active generated page.
+            // ApplyDisplayStyle deliberately restores the normal main-screen
+            // layout first. Recreate whichever generated overlay was active so it
+            // receives the new monitor factor, full screenPanel bounds and fresh
+            // fonts instead of remaining trapped in the message-list rectangle.
             switch (embeddedSetupPage)
             {
                 case EmbeddedSetupPage.MainMenu:
@@ -32082,9 +34120,49 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 case AirbusAocPage.AtcLevelRequest: ShowAirbusAtcLevelRequest(); return;
                 case AirbusAocPage.AtcSpeedRequest: ShowAirbusAtcSpeedRequest(); return;
                 case AirbusAocPage.AtcWhenCanWeRequest: ShowAirbusAtcWhenCanWeRequest(); return;
+                case AirbusAocPage.AtcTextRequest:
+                    ShowAirbusAtcTextRequest(
+                        "ATC REQUEST",
+                        GetStoredAirbusAocInput(
+                            AirbusAocPage.AtcTextRequest,
+                            AirbusAocInputFreeText,
+                            string.Empty));
+                    return;
+                case AirbusAocPage.SendConfirm:
+                    ShowAirbusAocSendConfirmPage();
+                    return;
             }
 
-            ApplyA220MainScreenLayout();
+            switch (boeingTelexPage)
+            {
+                case BoeingTelexPage.Menu: ShowBoeingTelexMenu(); return;
+                case BoeingTelexPage.FreeText: ShowBoeingTelexFreeText(); return;
+                case BoeingTelexPage.Metar: ShowBoeingTelexMetarRequest(); return;
+                case BoeingTelexPage.Atis: ShowBoeingTelexAtisRequest(); return;
+                case BoeingTelexPage.AtcMainMenu: ShowBoeingAtcMainMenu(); return;
+                case BoeingTelexPage.AtcPreDepClearance: ShowBoeingAtcPreDepClearance(); return;
+                case BoeingTelexPage.AtcOceanicClearance: ShowBoeingAtcOceanicClearance(); return;
+                case BoeingTelexPage.AtcDirectRequest: ShowBoeingAtcDirectRequest(); return;
+                case BoeingTelexPage.AtcLevelRequest: ShowBoeingAtcLevelRequest(); return;
+                case BoeingTelexPage.AtcSpeedRequest: ShowBoeingAtcSpeedRequest(); return;
+                case BoeingTelexPage.AtcWhenCanWeRequest: ShowBoeingAtcWhenCanWeRequest(); return;
+                case BoeingTelexPage.AtcConnectionMenu: ShowBoeingAtcConnectionMenu(); return;
+                case BoeingTelexPage.AtcLogonRequest: ShowBoeingAtcLogonRequest(); return;
+                case BoeingTelexPage.SendConfirm: ShowBoeingTelexSendConfirmPage(); return;
+            }
+
+            if (previewMessage != null && !previewMessage.IsDisposed)
+            {
+                ShowStyledMessagePreview(
+                    previewMessage,
+                    new List<System.Windows.Forms.Label>());
+                return;
+            }
+
+            if (DcduStyleManager.IsA220)
+            {
+                ApplyA220MainScreenLayout();
+            }
         }
 
         private void SetEmbeddedSetupDisplayStyle(string style)
@@ -32270,6 +34348,45 @@ along with this program.If not, see <https://www.gnu.org/licenses/>.", String.Fo
     }
     public static class TableLayoutHelper
     {
+        public static void InsertArbitraryRow(TableLayoutPanel panel, int rowIndex)
+        {
+            if (panel == null)
+            {
+                return;
+            }
+
+            rowIndex = Math.Max(0, Math.Min(rowIndex, panel.RowCount));
+            panel.SuspendLayout();
+
+            try
+            {
+                // Snapshot positions before increasing RowCount. Move controls
+                // bottom-up so SetRow cannot collide with an occupied destination.
+                var controlsToMove = panel.Controls
+                    .Cast<Control>()
+                    .Select(control => new
+                    {
+                        Control = control,
+                        Position = panel.GetPositionFromControl(control)
+                    })
+                    .Where(item => item.Position.Row >= rowIndex)
+                    .OrderByDescending(item => item.Position.Row)
+                    .ToList();
+
+                panel.RowCount += 1;
+                panel.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+
+                foreach (var item in controlsToMove)
+                {
+                    panel.SetRow(item.Control, item.Position.Row + 1);
+                }
+            }
+            finally
+            {
+                panel.ResumeLayout(false);
+            }
+        }
+
         public static void RemoveArbitraryRow(TableLayoutPanel panel, int rowIndex)
         {
             if (rowIndex >= panel.RowCount)
