@@ -1,4 +1,4 @@
-﻿/*  EASYCPDLC: CPDLC Client for the VATSIM Network
+/*  EASYCPDLC: CPDLC Client for the VATSIM Network
     Copyright (C) 2021 Joshua Seagrave joshseagrave@googlemail.com
 
     This program is free software: you can redistribute it and/or modify
@@ -1172,6 +1172,259 @@ private TelexForm tForm;
             }
         }
 
+        private const string SimbriefClientIdentifier =
+            "EasyCPDLC-Modernized";
+
+        private static string BuildSimbriefLatestOfpUrl(
+            string pilotId)
+        {
+            string normalizedPilotId =
+                NormalizeSimbriefID(pilotId);
+
+            if (string.IsNullOrWhiteSpace(normalizedPilotId))
+            {
+                throw new InvalidOperationException(
+                    "SimBrief Pilot ID is empty or invalid.");
+            }
+
+            return
+                "https://www.simbrief.com/api/xml.fetcher.php" +
+                "?userid=" +
+                Uri.EscapeDataString(normalizedPilotId) +
+                "&client=" +
+                Uri.EscapeDataString(SimbriefClientIdentifier) +
+                "&json=v2";
+        }
+
+        private static string ExtractSimbriefApiError(
+            string responseBody)
+        {
+            string body = (responseBody ?? string.Empty).Trim();
+
+            if (string.IsNullOrWhiteSpace(body))
+            {
+                return "EMPTY RESPONSE";
+            }
+
+            try
+            {
+                JToken parsed = JToken.Parse(body);
+
+                string status =
+                    parsed["fetch"]?["status"]?.ToString()
+                    ?? parsed["status"]?.ToString()
+                    ?? parsed["error"]?.ToString();
+
+                if (!string.IsNullOrWhiteSpace(status) &&
+                    !string.Equals(
+                        status,
+                        "Success",
+                        StringComparison.OrdinalIgnoreCase))
+                {
+                    return status.Trim();
+                }
+            }
+            catch
+            {
+                // Error responses may be XML even when JSON was requested.
+            }
+
+            try
+            {
+                string withoutTags =
+                    Regex.Replace(
+                        body,
+                        "<[^>]+>",
+                        " ");
+
+                withoutTags =
+                    Regex.Replace(
+                        withoutTags,
+                        @"\s+",
+                        " ").Trim();
+
+                if (!string.IsNullOrWhiteSpace(withoutTags))
+                {
+                    return withoutTags.Length > 120
+                        ? withoutTags.Substring(0, 120)
+                        : withoutTags;
+                }
+            }
+            catch
+            {
+            }
+
+            return "UNKNOWN API ERROR";
+        }
+
+        private static Navlog ParseSimbriefNavlog(
+            string responseBody)
+        {
+            JObject root = JObject.Parse(responseBody);
+
+            string fetchStatus =
+                root["fetch"]?["status"]?.ToString();
+
+            if (!string.IsNullOrWhiteSpace(fetchStatus) &&
+                !string.Equals(
+                    fetchStatus,
+                    "Success",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                throw new InvalidOperationException(
+                    "SimBrief: " + fetchStatus.Trim());
+            }
+
+            JToken navlogToken = root["navlog"];
+
+            if (navlogToken == null ||
+                navlogToken.Type == JTokenType.Null)
+            {
+                throw new JsonException(
+                    "SimBrief response did not contain a navlog.");
+            }
+
+            // JSON v2 returns navlog directly as an array of fixes.
+            // Legacy json=1 returned an object containing navlog.fix.
+            JObject compatibleNavlog;
+
+            if (navlogToken is JArray navlogArray)
+            {
+                compatibleNavlog =
+                    new JObject(
+                        new JProperty(
+                            "fix",
+                            navlogArray.DeepClone()));
+            }
+            else if (navlogToken is JObject navlogObject)
+            {
+                compatibleNavlog =
+                    (JObject)navlogObject.DeepClone();
+            }
+            else
+            {
+                throw new JsonException(
+                    "SimBrief navlog format is not supported.");
+            }
+
+            Navlog parsed =
+                compatibleNavlog.ToObject<Navlog>();
+
+            if (parsed?.fix == null ||
+                !parsed.fix.Any())
+            {
+                throw new JsonException(
+                    "SimBrief navlog did not contain route fixes.");
+            }
+
+            return parsed;
+        }
+
+        private async Task<Navlog> DownloadLatestSimbriefNavlogAsync(
+            string pilotId,
+            string diagnosticContext)
+        {
+            string url =
+                BuildSimbriefLatestOfpUrl(pilotId);
+
+            using HttpClient client =
+                CreateShortTimeoutHttpClient();
+
+            RecordUiDiagnosticActivity(
+                "SimBrief flight-plan download");
+
+            Stopwatch simbriefStopwatch =
+                Stopwatch.StartNew();
+
+            using HttpResponseMessage response =
+                await client.GetAsync(url);
+
+            string responseBody =
+                await response.Content.ReadAsStringAsync();
+
+            LogAsyncOperationDuration(
+                string.IsNullOrWhiteSpace(diagnosticContext)
+                    ? "SimBrief flight-plan download"
+                    : "SimBrief flight-plan download (" +
+                      diagnosticContext +
+                      ")",
+                simbriefStopwatch);
+
+            if (!response.IsSuccessStatusCode)
+            {
+                string apiError =
+                    ExtractSimbriefApiError(responseBody);
+
+                throw new HttpRequestException(
+                    "SimBrief HTTP " +
+                    ((int)response.StatusCode)
+                        .ToString(
+                            System.Globalization.CultureInfo.InvariantCulture) +
+                    ": " +
+                    apiError);
+            }
+
+            return ParseSimbriefNavlog(responseBody);
+        }
+
+        private void ApplySimbriefNavlog(
+            Navlog navlog)
+        {
+            if (navlog?.fix == null ||
+                !navlog.fix.Any())
+            {
+                throw new JsonException(
+                    "SimBrief navlog did not contain route fixes.");
+            }
+
+            simbriefData = navlog;
+
+            reportFixes =
+                simbriefData.fix
+                    .Where(
+                        fix =>
+                            fix.is_sid_star == "0" &&
+                            !new string[] { "apt" }
+                                .Contains(fix.type))
+                    .Select(fix => fix.ident)
+                    .ToArray();
+
+            UpdateFlightPhaseBadge();
+        }
+
+        private static string FormatSimbriefUserFacingError(
+            Exception ex)
+        {
+            string message =
+                (ex?.Message ?? "Unknown error")
+                    .Trim();
+
+            if (string.IsNullOrWhiteSpace(message))
+            {
+                return "UNKNOWN ERROR";
+            }
+
+            message =
+                Regex.Replace(
+                    message,
+                    @"\s+",
+                    " ").Trim();
+
+            if (message.StartsWith(
+                    "SimBrief ",
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                message =
+                    message.Substring("SimBrief ".Length);
+            }
+
+            return (
+                message.Length > 90
+                    ? message.Substring(0, 90)
+                    : message)
+                .ToUpperInvariant();
+        }
+
         private static string NormalizeSimbriefID(string value)
         {
             string cleaned = (value ?? string.Empty).Trim();
@@ -1181,6 +1434,7 @@ private TelexForm tForm;
         private const string MessageTextSizeSettingName = "MessageTextSize";
         private const string AutoDeleteRequestSecondsSettingName = "AutoDeleteRequestSeconds";
         private const string WindowScalePercentSettingName = "WindowScalePercent";
+        private const string MessageOverviewLskModeSettingName = "MessageOverviewLskMode";
         private const string MessagePreviewTextTag = "EASYCPDLC_MESSAGE_PREVIEW_TEXT";
         private const string A220PhysicalLayoutTag = "EASYCPDLC_A220_PHYSICAL_LAYOUT";
 
@@ -1713,6 +1967,24 @@ private TelexForm tForm;
             set
             {
                 SaveFixedStringSetting(MessageTextSizeSettingName, NormalizeMessageTextSize(value));
+            }
+        }
+
+        public static bool MessageOverviewLskModeEnabled
+        {
+            get
+            {
+                string value = ReadFixedStringSetting(MessageOverviewLskModeSettingName, "false");
+                return string.Equals(value, "true", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(value, "1", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(value, "yes", StringComparison.OrdinalIgnoreCase) ||
+                       string.Equals(value, "on", StringComparison.OrdinalIgnoreCase);
+            }
+            set
+            {
+                SaveFixedStringSetting(
+                    MessageOverviewLskModeSettingName,
+                    value ? "true" : "false");
             }
         }
 
@@ -2380,6 +2652,14 @@ private TelexForm tForm;
                 outputTable.IsDisposed)
             {
                 return null;
+            }
+
+            // LSK mode intentionally unparents action cells; this lookup
+            // must keep finding the same live instance for state updates.
+            if (overviewMessageRowParts.TryGetValue(message, out var owned) &&
+                owned.Action != null && !owned.Action.IsDisposed)
+            {
+                return owned.Action;
             }
 
             try
@@ -4140,6 +4420,486 @@ private TelexForm tForm;
         private string lastVatsimAtcOnlineDebugText = string.Empty;
         private readonly ToolTip smartStatusToolTip = new();
         private string activeMessageFilter = "ALL";
+        // Stable newest-first order is independent of WinForms TableLayoutPanel's
+        // control collection/Z-order. One message always owns its timestamp and
+        // action indicator, and all three cells are reconstructed atomically.
+        private readonly Dictionary<CPDLCMessage, (Control Time, TimerLabel Action)>
+            overviewMessageRowParts = new();
+        private readonly List<CPDLCMessage> overviewMessageOrder = new();
+        private bool overviewRowsNeedRebuild = true;
+        private bool rebuildingOverviewRows;
+        private bool? lastOverviewLskMode;
+        private string lastOverviewStyle = string.Empty;
+
+        private void NormalizeOverviewRowCells()
+        {
+            if (outputTable == null || outputTable.IsDisposed || rebuildingOverviewRows)
+            {
+                return;
+            }
+
+            // Disposed/removed rows (including timed auto-delete) must never
+            // reappear when the view is rebuilt after changing style or mode.
+            foreach (CPDLCMessage message in overviewMessageOrder.ToList())
+            {
+                if (message == null || message.IsDisposed ||
+                    !ReferenceEquals(message.Parent, outputTable))
+                {
+                    overviewMessageOrder.Remove(message);
+                    if (message != null &&
+                        overviewMessageRowParts.TryGetValue(message, out var orphanParts) &&
+                        orphanParts.Action != null &&
+                        !orphanParts.Action.IsDisposed &&
+                        orphanParts.Action.Parent == null)
+                    {
+                        // Detached action indicators belong to the message and
+                        // must be disposed when their message is removed.
+                        orphanParts.Action.Dispose();
+                    }
+                    if (message != null)
+                    {
+                        overviewMessageRowParts.Remove(message);
+                    }
+                    overviewRowsNeedRebuild = true;
+                }
+            }
+
+            // Support messages already present when this code is called and
+            // retain their correct chronology if a row was added elsewhere.
+            foreach (CPDLCMessage message in outputTable.Controls.OfType<CPDLCMessage>())
+            {
+                if (!overviewMessageOrder.Contains(message))
+                {
+                    overviewMessageOrder.Add(message);
+                    overviewRowsNeedRebuild = true;
+                }
+
+                if (!overviewMessageRowParts.ContainsKey(message))
+                {
+                    int row = outputTable.GetRow(message);
+                    Control time = outputTable.GetControlFromPosition(0, row);
+                    TimerLabel action = outputTable.GetControlFromPosition(2, row) as TimerLabel;
+                    overviewMessageRowParts[message] = (time, action);
+                }
+            }
+
+            if (!overviewRowsNeedRebuild)
+            {
+                // In hardware LSK mode the action controls are deliberately
+                // detached, NOT hidden. Requiring an action in column 2 here
+                // would re-parent it on every refresh and reintroduce the
+                // missing-envelope bug when switching back to normal mode.
+                bool standardActionsAttached = !ShouldUseMessageOverviewLskMode();
+                foreach (CPDLCMessage message in overviewMessageOrder)
+                {
+                    if (!overviewMessageRowParts.TryGetValue(message, out var parts) ||
+                        parts.Time == null || parts.Action == null ||
+                        parts.Time.IsDisposed || parts.Action.IsDisposed ||
+                        !ReferenceEquals(parts.Time.Parent, outputTable) ||
+                        (standardActionsAttached &&
+                         !ReferenceEquals(parts.Action.Parent, outputTable)) ||
+                        (standardActionsAttached &&
+                         outputTable.GetColumn(parts.Action) != 2) ||
+                        (standardActionsAttached &&
+                         outputTable.GetRow(message) != outputTable.GetRow(parts.Action)) ||
+                        outputTable.GetColumn(message) != 1 ||
+                        outputTable.GetColumn(parts.Time) != 0 ||
+                        outputTable.GetRow(message) != outputTable.GetRow(parts.Time))
+                    {
+                        overviewRowsNeedRebuild = true;
+                        break;
+                    }
+                }
+            }
+
+            if (!overviewRowsNeedRebuild)
+            {
+                return;
+            }
+
+            // Only the flight-plan prompt can add a non-CPDLC row. Preserve
+            // that row as a whole. Never infer message ownership from a cell
+            // after SetCellPosition: that caused the split envelopes/timestamps.
+            Control promptTime = null;
+            TimerLabel promptAction = null;
+            bool havePrompt = nextFlightPlanPromptPanel != null &&
+                !nextFlightPlanPromptPanel.IsDisposed &&
+                ReferenceEquals(nextFlightPlanPromptPanel.Parent, outputTable);
+            if (havePrompt)
+            {
+                int promptRow = outputTable.GetRow(nextFlightPlanPromptPanel);
+                promptTime = outputTable.GetControlFromPosition(0, promptRow);
+                promptAction = outputTable.GetControlFromPosition(2, promptRow) as TimerLabel;
+            }
+
+            rebuildingOverviewRows = true;
+            outputTable.SuspendLayout();
+            try
+            {
+                // Remove all positions in one operation; never move a control
+                // into another occupied cell. Clear detaches but does not
+                // dispose the retained message/indicator controls.
+                outputTable.Controls.Clear();
+                outputTable.RowStyles.Clear();
+                int rows = overviewMessageOrder.Count + (havePrompt ? 1 : 0);
+                outputTable.RowCount = Math.Max(1, rows);
+
+                int row = 0;
+                if (havePrompt)
+                {
+                    outputTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                    if (promptTime != null && !promptTime.IsDisposed)
+                        outputTable.Controls.Add(promptTime, 0, row);
+                    outputTable.Controls.Add(nextFlightPlanPromptPanel, 1, row);
+                    if (promptAction != null && !promptAction.IsDisposed)
+                        outputTable.Controls.Add(promptAction, 2, row);
+                    row++;
+                }
+
+                foreach (CPDLCMessage message in overviewMessageOrder)
+                {
+                    if (!overviewMessageRowParts.TryGetValue(message, out var parts))
+                        continue;
+
+                    outputTable.RowStyles.Add(new RowStyle(SizeType.AutoSize));
+                    if (parts.Time != null && !parts.Time.IsDisposed)
+                        outputTable.Controls.Add(parts.Time, 0, row);
+                    outputTable.Controls.Add(message, 1, row);
+                    if (parts.Action != null && !parts.Action.IsDisposed)
+                        outputTable.Controls.Add(parts.Action, 2, row);
+                    row++;
+                }
+                foreach (Control control in outputTable.Controls)
+                {
+                    control.MouseWheel -= HardwareMessageOverview_MouseWheel;
+                    control.MouseWheel += HardwareMessageOverview_MouseWheel;
+                }
+                overviewRowsNeedRebuild = false;
+            }
+            finally
+            {
+                outputTable.ResumeLayout(false);
+                rebuildingOverviewRows = false;
+            }
+        }
+        // The standard view owns the live envelope / quick-action controls.
+        // TableLayoutPanel can keep their inherited Visible=false state when
+        // the LSK list is hidden behind setup/preview and the same controls
+        // are re-used. Never hide those controls to implement LSK paging:
+        // temporarily UNPARENT them and leave their own visibility, tags,
+        // paint handlers, click handlers and running countdowns untouched.
+        // The row-parts dictionary holds strong references until standard
+        // mode reattaches them during NormalizeOverviewRowCells().
+        private void DetachOverviewActionsForHardwareMode()
+        {
+            if (outputTable == null || outputTable.IsDisposed ||
+                !ShouldUseMessageOverviewLskMode())
+            {
+                return;
+            }
+
+            bool previousRebuilding = rebuildingOverviewRows;
+            rebuildingOverviewRows = true;
+            outputTable.SuspendLayout();
+            try
+            {
+                foreach (var parts in overviewMessageRowParts.Values)
+                {
+                    TimerLabel action = parts.Action;
+                    if (action != null && !action.IsDisposed &&
+                        ReferenceEquals(action.Parent, outputTable))
+                    {
+                        // Removing is not disposing. Do NOT set Visible=false:
+                        // it is that saved state which could survive LSK OFF.
+                        outputTable.Controls.Remove(action);
+                    }
+                }
+            }
+            finally
+            {
+                outputTable.ResumeLayout(false);
+                rebuildingOverviewRows = previousRebuilding;
+            }
+        }
+
+        private int HardwareMessageOverviewPageCapacity()
+        {
+            // Airbus has three message-aligned LSK rows (L3/R3-L5/R5).
+            // Boeing has four (L3/R3-L6/R6).
+            return DcduStyleManager.IsBoeing ? 4 : 3;
+        }
+
+        private int hardwareMessageOverviewPageIndex = 0;
+        private int hardwareMessageOverviewPageCount = 1;
+        private int a220OverviewPageCount = 1;
+        private int a220OverviewPageIndex = 0;
+        private int a220OverviewMaxScroll;
+        private Panel hardwareMessageOverviewPageBar;
+        private bool updatingOutputScrollbarVisibility;
+        private bool previousMessageOverviewUsedHardwarePages;
+        private bool standardOverviewScrollSyncQueued;
+        private bool standardOverviewScrollResetPending;
+        private bool stabilizingStandardOverviewScroll;
+        // Only the measured content, not WinForms' cached DisplayRectangle,
+        // decides whether the standard overview has anything to scroll.
+        private bool standardOverviewExtentValid;
+        private int standardOverviewContentBottom;
+        private int standardOverviewMaximumOffset;
+
+        // A WinForms TableLayoutPanel does not know its final AutoSize row heights
+        // while controls are being reattached or its style-specific bounds are
+        // changing. The custom scrollbar must not measure that intermediate
+        // scroll range: it otherwise takes several wheel events to settle.
+        // Run one coalesced pass on the UI thread after the current layout work
+        // completes. In LSK mode there is no AutoScroll document at all.
+        private void QueueStandardOverviewScrollSynchronization(bool resetToTop)
+        {
+            if (outputTable == null || outputTable.IsDisposed ||
+                IsDisposed || Disposing || !IsHandleCreated)
+            {
+                return;
+            }
+
+            if (ShouldUseMessageOverviewLskMode())
+            {
+                standardOverviewScrollResetPending = false;
+                return;
+            }
+
+            standardOverviewScrollResetPending |= resetToTop;
+            if (standardOverviewScrollSyncQueued)
+            {
+                return;
+            }
+
+            standardOverviewScrollSyncQueued = true;
+            try
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    standardOverviewScrollSyncQueued = false;
+                    if (IsDisposed || Disposing || outputTable == null ||
+                        outputTable.IsDisposed ||
+                        ShouldUseMessageOverviewLskMode())
+                    {
+                        standardOverviewScrollResetPending = false;
+                        return;
+                    }
+
+                    // Setup and the message preview temporarily hide the list.
+                    // Their return path calls ApplyMessageFilter again after
+                    // restoring its actual size and visibility.
+                    if (!outputTable.Visible || !outputTable.Enabled ||
+                        embeddedSetupPage != EmbeddedSetupPage.None ||
+                        airbusAocPage != AirbusAocPage.None ||
+                        boeingTelexPage != BoeingTelexPage.None ||
+                        (messageFormatPanel != null &&
+                         messageFormatPanel.Visible))
+                    {
+                        return;
+                    }
+
+                    bool reset = standardOverviewScrollResetPending;
+                    standardOverviewScrollResetPending = false;
+                    SynchronizeStandardOverviewScrollRange(reset);
+                }));
+            }
+            catch (InvalidOperationException)
+            {
+                standardOverviewScrollSyncQueued = false;
+            }
+        }
+
+        private void SynchronizeStandardOverviewScrollRange(bool resetToTop)
+        {
+            if (stabilizingStandardOverviewScroll ||
+                ShouldUseMessageOverviewLskMode() ||
+                outputTable == null || outputTable.IsDisposed ||
+                !outputTable.Visible || !outputTable.Enabled)
+            {
+                return;
+            }
+
+            stabilizingStandardOverviewScroll = true;
+            try
+            {
+                int previousOffset = resetToTop ? 0 :
+                    Math.Max(0, -outputTable.AutoScrollPosition.Y);
+
+                // Measure from origin after the standard message rows have
+                // finished laying out. The old DisplayRectangle and the sum
+                // of GetRowHeights() can include unused table space and a
+                // previous AutoScrollMinSize, producing a phantom last page.
+                outputTable.AutoScrollMinSize = Size.Empty;
+                if (!outputTable.AutoScroll)
+                {
+                    outputTable.AutoScroll = true;
+                }
+                outputTable.AutoScrollPosition = Point.Empty;
+                outputTable.PerformLayout();
+
+                // Should be zero after the reset; account for a delayed
+                // WinForms origin update if an old scroll offset remains.
+                int remainingOffset = Math.Max(0,
+                    -outputTable.AutoScrollPosition.Y);
+                int contentBottom = outputTable.Padding.Top;
+                foreach (Control child in outputTable.Controls)
+                {
+                    if (child == null || child.IsDisposed || !child.Visible)
+                    {
+                        continue;
+                    }
+
+                    // Last visible pixel is what matters here. A row's
+                    // trailing Margin is not scrollable message content.
+                    contentBottom = Math.Max(contentBottom,
+                        child.Bottom + remainingOffset);
+                }
+                contentBottom += outputTable.Padding.Bottom;
+
+                int viewport = Math.Max(1, outputTable.ClientSize.Height);
+                // A few pixels of WinForms text-layout rounding must not
+                // create a nearly empty extra page.
+                int overrun = contentBottom - viewport;
+                int maximumOffset = overrun > Math.Max(3, S(3))
+                    ? overrun : 0;
+
+                // Publish the measurement once, after the content is stable.
+                standardOverviewContentBottom = contentBottom;
+                standardOverviewMaximumOffset = maximumOffset;
+                standardOverviewExtentValid = true;
+
+                if (maximumOffset == 0)
+                {
+                    // In particular A220 must not respond to the mouse wheel
+                    // when all its messages fit in the visible display.
+                    outputTable.AutoScroll = false;
+                    outputTable.AutoScrollMinSize = Size.Empty;
+                    outputTable.AutoScrollPosition = Point.Empty;
+                }
+                else
+                {
+                    // Do not feed DisplayRectangle back as a minimum: it may
+                    // be bigger than the actual last message's bottom edge.
+                    outputTable.AutoScrollMinSize = new Size(0, contentBottom);
+                    outputTable.PerformLayout();
+                    outputTable.AutoScrollPosition = new Point(0,
+                        Math.Min(previousOffset, maximumOffset));
+                }
+            }
+            finally
+            {
+                stabilizingStandardOverviewScroll = false;
+            }
+
+            HideNativeOutputScrollbars();
+            UpdateHardwareMessageOverviewPageBar();
+            RefreshOutputScrollSurfaceOnly();
+        }
+
+        // In LSK mode the visible rows are an absolute-positioned PAGE, not an
+        // AutoScroll document. WinForms would otherwise retain the old offset
+        // when a new message arrives, a page changes or the style is switched.
+        // That offset can scroll the heading out and clip rows at the top.
+        private void ConfigureMessageOverviewScrollMode()
+        {
+            if (outputTable == null || outputTable.IsDisposed)
+            {
+                return;
+            }
+
+            bool logicalPages = ShouldUseMessageOverviewLskMode();
+
+            if (logicalPages)
+            {
+                standardOverviewExtentValid = false;
+                standardOverviewMaximumOffset = 0;
+                // Hardware overview rows occupy fixed physical LSK positions.
+                // A scrollable child surface would move them out of alignment.
+                if (outputTable.AutoScroll)
+                {
+                    outputTable.AutoScrollPosition = Point.Empty;
+                    outputTable.AutoScroll = false;
+                }
+
+                outputTable.AutoScrollMinSize = Size.Empty;
+            }
+            else
+            {
+                // In particular, returning to A220 must discard the old LSK
+                // page origin. A220 ALWAYS uses the standard action-menu list.
+                if (previousMessageOverviewUsedHardwarePages)
+                {
+                    outputTable.AutoScroll = false;
+                    outputTable.AutoScrollMinSize = Size.Empty;
+                    outputTable.AutoScrollPosition = Point.Empty;
+                }
+
+                // Keep the last measured scroll extent during ordinary
+                // redraws. Clearing it on every ApplyMessageFilter made the
+                // scroll range oscillate until several mouse-wheel events
+                // had forced additional layout passes. The deferred sync
+                // recalculates it after the final row layout instead.
+                if (!outputTable.AutoScroll)
+                {
+                    outputTable.AutoScroll = true;
+                }
+                if (previousMessageOverviewUsedHardwarePages)
+                {
+                    outputTable.AutoScrollPosition = Point.Empty;
+                }
+            }
+
+            previousMessageOverviewUsedHardwarePages = logicalPages;
+        }
+
+        private void KeepMessageOverviewHeaderAboveList()
+        {
+            if (DcduStyleManager.IsA220 ||
+                screenPanel == null || screenPanel.IsDisposed ||
+                messageHeaderLabel == null || messageHeaderLabel.IsDisposed ||
+                messageFilterLabel == null || messageFilterLabel.IsDisposed ||
+                outputTable == null || outputTable.IsDisposed ||
+                !outputTable.Visible ||
+                (messageFormatPanel != null && messageFormatPanel.Visible))
+            {
+                return;
+            }
+
+            // Both are screenPanel siblings of the table. Transparent WinForms
+            // controls still paint over siblings beneath them, so the header
+            // must be above the list, especially on Airbus/Boeing LSK pages.
+            messageHeaderLabel.BringToFront();
+            messageFilterLabel.BringToFront();
+
+            // The paging counter shares the header band with the message table.
+            // Returning from a preview/setup rebuilds the table's Z-order;
+            // without restoring this counter last, the table paints over the
+            // bottom half of its digits (e.g. a clipped "1/2").
+            if (hardwareMessageOverviewPageBar != null &&
+                !hardwareMessageOverviewPageBar.IsDisposed &&
+                hardwareMessageOverviewPageBar.Visible)
+            {
+                hardwareMessageOverviewPageBar.BringToFront();
+                hardwareMessageOverviewPageBar.Invalidate();
+            }
+        }
+
+        private void HardwareMessageOverview_MouseWheel(object sender, MouseEventArgs e)
+        {
+            if (!IsHardwareLskMessageOverviewActive() || e.Delta == 0)
+            {
+                return;
+            }
+
+            if (e is HandledMouseEventArgs handled)
+            {
+                handled.Handled = true;
+            }
+
+            ChangeHardwareMessageOverviewPage(e.Delta > 0 ? -1 : 1);
+        }
+
         private string clearanceStatusText = "CLR --";
         private string datalinkStatusText = "PDC --";
         private string atisStatusText = BuildDotBadgeText("ATIS");
@@ -4191,8 +4951,9 @@ private TelexForm tForm;
         private static readonly TimeSpan vatsimFailureBackoffMaximum = TimeSpan.FromMinutes(5);
         private static readonly TimeSpan vatsimForcedRefreshMinimumInterval = TimeSpan.FromSeconds(15);
         private readonly Dictionary<string, List<long>> vatsimTransceiverFrequencies = new(StringComparer.OrdinalIgnoreCase);
-        // AFV transceiver id 0 is the primary pilot radio (VHF1/COM1).
-        // Keep it separately so array ordering can never make VHF2 look like VHF1.
+        // Current VATSIM transceiver data uses id 1 for the primary pilot radio
+        // (COM1/VHF1) and id 2 for COM2/VHF2. Keep id 0 as a legacy-compatible
+        // fallback only; never infer VHF1 from JSON array order.
         private readonly Dictionary<string, long> vatsimPrimaryVhf1Frequencies = new(StringComparer.OrdinalIgnoreCase);
         private DateTime vatsimTransceiversLoadedUtc = DateTime.MinValue;
         private DateTime lastVatsimTransceiverRefreshAttemptUtc = DateTime.MinValue;
@@ -4280,6 +5041,8 @@ private TelexForm tForm;
 
         private readonly System.Windows.Forms.Timer unreadReminderTimer = new();
         private readonly System.Windows.Forms.Timer routeBlinkTimer = new();
+        private readonly System.Windows.Forms.Timer hardwareMessageOverviewBlinkTimer = new();
+        private bool hardwareMessageOverviewBlinkOn;
         private readonly System.Windows.Forms.Timer clearanceAutoConfirmTimer = new();
 
         // A WinForms timer runs on the UI thread. If a tick arrives much later
@@ -4535,6 +5298,16 @@ private TelexForm tForm;
         private readonly List<Release> embeddedSetupRollbackReleases = new();
         private Release embeddedSetupSelectedRollbackRelease;
         private bool embeddedSetupRollbackLoading;
+
+        // Lightweight visual mask for synchronous WinForms layout/style rebuilds.
+        // It does not make the rebuild artificially slower; it simply gives the UI
+        // a chance to paint a clear transition state before the heavy rebuild starts.
+        private Panel uiTransitionOverlayPanel;
+        private System.Windows.Forms.Label uiTransitionOverlayTitleLabel;
+        private System.Windows.Forms.Label uiTransitionOverlayDetailLabel;
+        private Panel uiTransitionOverlayTrackPanel;
+        private Panel uiTransitionOverlayFillPanel;
+        private bool uiTransitionInProgress;
         private string embeddedSetupRollbackStatus = string.Empty;
         private const string SetupInputCid = "cid";
         private const string SetupInputHoppie = "hoppie";
@@ -5726,6 +6499,14 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             ConfigureA220InteriorBackdrop();
             ConfigureA220Navigation();
             ApplyMainScreenLayout(isBoeing);
+
+            // A style switch can change between hardware LSK paging and the
+            // normal flexible list. Reapply filtering immediately so rows hidden
+            // by Airbus/Boeing paging are restored when entering A220/standard
+            // mode, and so the correct page capacity is applied on Boeing.
+            ApplyMessageFilter();
+            HideNativeOutputScrollbars();
+
             ApplyMainButtonLayout(isBoeing);
             ConfigureInboundMessageSound();
             ApplyMainThemeColors();
@@ -6275,18 +7056,18 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             Font captionFont = isA220
                 ? CreateDpiStablePointFont("Consolas", 11.0f, FontStyle.Regular)
                 : isBoeing
-                ? CreateDpiStablePointFont("Segoe UI Semibold", 10.2f, FontStyle.Regular)
-                : textFontBold;
+                    ? CreateDpiStablePointFont("Segoe UI Semibold", 9.2f, FontStyle.Regular)
+                    : CreateDpiStablePointFont("Consolas", 9.6f, FontStyle.Bold);
             Font valueFont = isA220
                 ? CreateDpiStablePointFont("Consolas", 11.2f, FontStyle.Bold)
                 : isBoeing
-                    ? CreateDpiStablePointFont("Segoe UI Semibold", 10.2f, FontStyle.Regular)
-                    : textFontBold;
+                    ? CreateDpiStablePointFont("Segoe UI Semibold", 9.3f, FontStyle.Regular)
+                    : CreateDpiStablePointFont("Consolas", 9.8f, FontStyle.Bold);
             Font headerFont = isA220
                 ? CreateDpiStablePointFont("Consolas", 11.5f, FontStyle.Bold)
                 : isBoeing
-                    ? CreateDpiStablePointFont("Segoe UI Semibold", 10.4f, FontStyle.Regular)
-                    : textFontBold;
+                    ? CreateDpiStablePointFont("Segoe UI Semibold", 9.4f, FontStyle.Regular)
+                    : CreateDpiStablePointFont("Consolas", 9.8f, FontStyle.Bold);
 
             if (statusCaptionLabel != null)
             {
@@ -6981,6 +7762,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             if (sender is ToolStripMenuItem item && item.Tag is string filter)
             {
                 activeMessageFilter = filter;
+                standardOverviewExtentValid = false;
+                ResetHardwareMessageOverviewPage();
                 ApplyMessageFilter();
             }
         }
@@ -7088,17 +7871,269 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                    Regex.IsMatch(upperContents, @"\b[A-Z][A-Z0-9]{3}\s+\d{6}Z\b");
         }
 
-        private void ApplyMessageFilter()
+        private int A220OverviewMessageMaxWidth()
         {
-            if (outputTable == null || outputTable.IsDisposed)
+            return StandardOverviewMessageMaxWidth();
+        }
+
+        // Percentage columns combined with AutoSize labels can make WinForms
+        // enlarge the *whole table's scrollable area* when a long clearance
+        // arrives. After a hardware -> standard switch that leaves the time
+        // and menu columns off screen, even on A220. Keep all three columns
+        // absolute and fit them within the actual outputTable viewport.
+        private void FitMessageOverviewColumns(bool hardwareMode)
+        {
+            if (outputTable == null || outputTable.IsDisposed ||
+                outputTable.ColumnStyles.Count < 3)
             {
                 return;
+            }
+
+            outputTable.AutoSize = false;
+            int timeWidth = S(DcduStyleManager.IsBoeing ? 74 : 68);
+            int actionWidth = hardwareMode ? 0 : OpenMessageActionsIndicatorWidth();
+            // Keep room for the normal-mode vertical scroll bar even when it
+            // is not currently visible; toggling it must not change line wrap.
+            int scrollbarReserve = hardwareMode ? S(3) :
+                SystemInformation.VerticalScrollBarWidth + S(4);
+            int available = Math.Max(S(150),
+                outputTable.ClientSize.Width - outputTable.Padding.Horizontal -
+                scrollbarReserve);
+            int messageWidth = Math.Max(S(70),
+                available - timeWidth - actionWidth);
+
+            outputTable.ColumnStyles[0].SizeType = SizeType.Absolute;
+            outputTable.ColumnStyles[0].Width = timeWidth;
+            outputTable.ColumnStyles[1].SizeType = SizeType.Absolute;
+            outputTable.ColumnStyles[1].Width = messageWidth;
+            outputTable.ColumnStyles[2].SizeType = SizeType.Absolute;
+            outputTable.ColumnStyles[2].Width = actionWidth;
+        }
+
+        private int StandardOverviewMessageMaxWidth()
+        {
+            if (outputTable == null || outputTable.IsDisposed ||
+                outputTable.ColumnStyles.Count < 3)
+            {
+                return S(300);
+            }
+
+            // The second column's width is fixed by FitMessageOverviewColumns.
+            // No AutoSize label may request more than this bounded cell width.
+            return Math.Max(S(70),
+                (int)Math.Floor(outputTable.ColumnStyles[1].Width) - S(7));
+        }
+
+        private int HardwareOverviewRowHeight(int slot)
+        {
+            if (!DcduStyleManager.IsBoeing)
+            {
+                return S(42);
+            }
+
+            // The physical Boeing LSK3..6 centres are 41/42/41 pixels apart.
+            // A uniform 42px pitch makes the last message drift visibly.
+            return S(slot == 0 || slot == 2 ? 41 :
+                     slot == 1 ? 42 : 44);
+        }
+
+        private int HardwareOverviewTextTopInset(
+            int slot, int precedingRowHeight, int labelHeight)
+        {
+            if (screenPanel == null || outputTable == null)
+            {
+                return S(12);
+            }
+
+            Rectangle physicalLsk = MessageOverviewLeftLskBounds(
+                MessageOverviewFirstLeftLskIndex() + slot);
+
+            // Position all text in a slot from one physical LSK centre and
+            // ONE shared height: measured label.PreferredSize used to differ
+            // between status timestamps and normal text, shifting baselines.
+            int centreInTable = physicalLsk.Top + physicalLsk.Height / 2 -
+                screenPanel.Top - outputTable.Top;
+            int desiredTop = centreInTable - precedingRowHeight -
+                labelHeight / 2;
+            // The Airbus key art is optically centered below the label's
+            // geometric center; the visible text was ~7px above the keys.
+            // Boeing uses the unadjusted measured key center.
+            if (!DcduStyleManager.IsBoeing)
+            {
+                desiredTop += S(7);
+            }
+            return Math.Max(0, Math.Min(desiredTop,
+                HardwareOverviewRowHeight(slot) - Math.Min(
+                    labelHeight, HardwareOverviewRowHeight(slot))));
+        }
+
+        private void RestoreOverviewTimeAndActionColumns(int row, bool lskMode)
+        {
+            if (outputTable.ColumnStyles.Count < 3)
+            {
+                return;
+            }
+
+            int timeWidth = Math.Max(S(48),
+                (int)Math.Floor(outputTable.ColumnStyles[0].Width) - S(7));
+            Control time = outputTable.GetControlFromPosition(0, row);
+            if (time != null)
+            {
+                time.Dock = DockStyle.None;
+                time.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+                // A220 standard list keeps its original auto-sized time text.
+                // On Airbus/Boeing, status and ordinary timestamps share the
+                // same fixed geometry so the reply glyph cannot move a row.
+                if (DcduStyleManager.IsA220 && time is AccessibleLabel)
+                {
+                    time.AutoSize = true;
+                    time.MaximumSize = new Size(timeWidth, 0);
+                }
+                else
+                {
+                    time.AutoSize = false;
+                    time.Width = timeWidth;
+                    time.Height = S(18);
+                    time.MaximumSize = Size.Empty;
+                }
+            }
+
+            if (outputTable.GetControlFromPosition(2, row) is TimerLabel action)
+            {
+                // Indicators were originally created at the OLD style width.
+                // An A220 84px button in a Boeing 74px column can force a
+                // horizontal scroll and misalign every following message.
+                int actionWidth = lskMode ? 0 :
+                    (int)Math.Floor(outputTable.ColumnStyles[2].Width);
+                action.AutoSize = false;
+                action.Dock = DockStyle.None;
+                action.Anchor = AnchorStyles.Top | AnchorStyles.Right;
+                action.Width = Math.Max(1, actionWidth - S(2));
+                action.Height = S(18);
+                action.MinimumSize = Size.Empty;
+                action.MaximumSize = lskMode
+                    ? Size.Empty
+                    : new Size(Math.Max(1, actionWidth - S(2)), 0);
+                action.Margin = new Padding(0, S(3), S(2), 0);
+            }
+        }
+
+        private void RestoreStandardOverviewActionIndicators()
+        {
+            foreach (CPDLCMessage message in overviewMessageOrder)
+            {
+                if (message == null || message.IsDisposed)
+                {
+                    continue;
+                }
+                TimerLabel action = FindMenuLabelForMessage(message);
+                if (action == null || action.IsDisposed || !action.Enabled ||
+                    autoDeleteRequestTimers.ContainsKey(message))
+                {
+                    continue;
+                }
+
+                // New unread messages keep their envelope; only read messages
+                // get the normal open/delete quick actions. Explicitly avoid
+                // overwriting transient spinner/status and countdown states.
+                if (unreadMessages.Contains(message))
+                {
+                    action.Tag = null;
+                    action.Text = UnreadMessageMarkerText;
+                    action.CanFlash = true;
+                }
+                else if (IsOpenMessageActionsIndicator(action) ||
+                         action.Text == UnreadMessageMarkerText)
+                {
+                    if (ShouldUseDeleteOnlyOverviewAction(message))
+                    {
+                        ConfigureDeleteOnlyMessageIndicator(action);
+                    }
+                    else
+                    {
+                        ConfigureOpenMessageIndicator(action);
+                    }
+                    action.CanFlash = ShouldFlashForReply(message) ||
+                        CanDirectWilcoFromOverview(message) ||
+                        CanDirectRogerFromOverview(message);
+                }
+                action.Invalidate();
+            }
+        }
+
+        private void ApplyMessageFilter()
+        {
+            if (outputTable == null || outputTable.IsDisposed ||
+                rebuildingOverviewRows)
+            {
+                return;
+            }
+
+            bool hardwareLskOverview =
+                ShouldUseMessageOverviewLskMode();
+
+            string overviewStyle = DcduStyleManager.IsA220 ? "A220" :
+                (DcduStyleManager.IsBoeing ? "BOEING" : "AIRBUS");
+            bool presentationChanged =
+                lastOverviewLskMode != hardwareLskOverview ||
+                !string.Equals(lastOverviewStyle, overviewStyle, StringComparison.Ordinal);
+            if (presentationChanged)
+            {
+                standardOverviewExtentValid = false;
+                // A220 is permanently standard, regardless of the setting
+                // stored for the Airbus/Boeing bezel.
+                overviewRowsNeedRebuild = true;
+                lastOverviewLskMode = hardwareLskOverview;
+                lastOverviewStyle = overviewStyle;
+            }
+
+            if (overviewRowsNeedRebuild && !hardwareLskOverview)
+            {
+                standardOverviewExtentValid = false;
+            }
+            ConfigureMessageOverviewScrollMode();
+            if (presentationChanged)
+            {
+                // A scroll position from a narrower/shorter style would crop
+                // the first messages in the newly selected standard list.
+                outputTable.AutoScrollPosition = Point.Empty;
+                if (!hardwareLskOverview)
+                {
+                    // Drop the previous style's measured extent once only.
+                    // Ordinary redraws must preserve the stabilized extent.
+                    outputTable.AutoScrollMinSize = Size.Empty;
+                }
+            }
+            FitMessageOverviewColumns(hardwareLskOverview);
+            NormalizeOverviewRowCells();
+            if (hardwareLskOverview)
+            {
+                DetachOverviewActionsForHardwareMode();
+            }
+            if (presentationChanged && !hardwareLskOverview)
+            {
+                RestoreStandardOverviewActionIndicators();
+            }
+
+            HashSet<CPDLCMessage> hardwarePageMessages =
+                hardwareLskOverview
+                    ? GetHardwareMessageOverviewPageMessages()
+                    : null;
+
+            if (!hardwareLskOverview)
+            {
+                hardwareMessageOverviewPageIndex = 0;
+                hardwareMessageOverviewPageCount = 1;
             }
 
             outputTable.SuspendLayout();
 
             try
             {
+                int hardwareSlot = 0;
+                int priorHardwareRowHeight = 0;
+                int standardTextWidth = StandardOverviewMessageMaxWidth();
+
                 for (int row = 0; row < outputTable.RowCount; row++)
                 {
                     CPDLCMessage rowMessage = null;
@@ -7112,21 +8147,234 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         }
                     }
 
-                    bool visible = rowMessage == null || MessageMatchesFilter(rowMessage, activeMessageFilter);
+                    bool visible;
+
+                    if (rowMessage == null)
+                    {
+                        // Special non-message rows (for example NEW FP DETECTED)
+                        // keep their established behaviour.
+                        visible = true;
+                    }
+                    else if (hardwareLskOverview)
+                    {
+                        visible =
+                            hardwarePageMessages.Contains(
+                                rowMessage);
+                    }
+                    else
+                    {
+                        visible =
+                            MessageMatchesFilter(
+                                rowMessage,
+                                activeMessageFilter);
+                    }
 
                     for (int col = 0; col < outputTable.ColumnCount; col++)
                     {
-                        Control control = outputTable.GetControlFromPosition(col, row);
+                        Control control =
+                            outputTable.GetControlFromPosition(
+                                col,
+                                row);
+
                         if (control != null)
                         {
-                            control.Visible = visible;
+                            // Hardware action controls are detached above;
+                            // never set their own Visible flag to false. In
+                            // standard mode always restore each attached
+                            // action's visibility from its message filter.
+                            control.Visible = visible &&
+                                (col != 2 || control.Enabled);
                         }
                     }
 
+                    // Every row must release the old style's fixed time and
+                    // action column sizes, even when that row is filtered out.
+                    // Otherwise hidden rows can later expand the scroll width.
+                    RestoreOverviewTimeAndActionColumns(row, hardwareLskOverview);
+
                     if (row < outputTable.RowStyles.Count)
                     {
-                        outputTable.RowStyles[row].SizeType = visible ? SizeType.AutoSize : SizeType.Absolute;
-                        outputTable.RowStyles[row].Height = 0F;
+                        if (!visible)
+                        {
+                            outputTable.RowStyles[row].SizeType =
+                                SizeType.Absolute;
+                            outputTable.RowStyles[row].Height = 0F;
+                        }
+                        else if (hardwareLskOverview &&
+                                 rowMessage != null)
+                        {
+                            // Give every hardware message exactly one physical
+                            // LSK slot. Airbus exposes three slots; Boeing exposes
+                            // four. One-/two-line source text can therefore never
+                            // push another message away from its physical key.
+                            outputTable.RowStyles[row].SizeType =
+                                SizeType.Absolute;
+
+                            outputTable.RowStyles[row].Height =
+                                HardwareOverviewRowHeight(hardwareSlot);
+
+                            rowMessage.Text =
+                                HardwareMessageOverviewSingleLineText(
+                                    rowMessage);
+
+                            // Every hardware slot is fixed-height and single-line.
+                            // A status label's preferred size or message font
+                            // must not independently move either baseline.
+                            int labelHeight = Math.Min(
+                                HardwareOverviewRowHeight(hardwareSlot),
+                                Math.Max(S(18), TextRenderer.MeasureText(
+                                    "Ag", rowMessage.Font,
+                                    Size.Empty,
+                                    TextFormatFlags.SingleLine |
+                                    TextFormatFlags.NoPadding).Height));
+
+                            rowMessage.MinimumSize = Size.Empty;
+                            rowMessage.MaximumSize = new Size(
+                                Math.Max(S(70), standardTextWidth), labelHeight);
+                            rowMessage.AutoSize = false;
+                            rowMessage.Size = new Size(
+                                Math.Max(S(70), standardTextWidth), labelHeight);
+                            rowMessage.TextAlign = ContentAlignment.MiddleLeft;
+                            rowMessage.Dock = DockStyle.None;
+                            rowMessage.Anchor = AnchorStyles.Top | AnchorStyles.Left;
+
+                            int sharedInset = HardwareOverviewTextTopInset(
+                                hardwareSlot, priorHardwareRowHeight,
+                                labelHeight);
+                            rowMessage.Margin = new Padding(
+                                0, sharedInset, 0, 0);
+
+                            Control timeControl =
+                                outputTable.GetControlFromPosition(0, row);
+
+                            if (timeControl != null)
+                            {
+                                timeControl.AutoSize = false;
+                                timeControl.Height = labelHeight;
+                                timeControl.Margin = new Padding(
+                                    S(5), sharedInset, 0, 0);
+                            }
+
+                            priorHardwareRowHeight +=
+                                HardwareOverviewRowHeight(hardwareSlot);
+                            hardwareSlot++;
+                        }
+                        else if (hardwareLskOverview)
+                        {
+                            // Non-message helper/prompt rows have no physical
+                            // overview LSK assignment and must not consume one
+                            // of the three hardware message slots.
+                            outputTable.RowStyles[row].SizeType =
+                                SizeType.Absolute;
+                            outputTable.RowStyles[row].Height = 0F;
+
+                            for (int col = 0;
+                                 col < outputTable.ColumnCount;
+                                 col++)
+                            {
+                                Control helperControl =
+                                    outputTable.GetControlFromPosition(
+                                        col,
+                                        row);
+
+                                if (helperControl != null)
+                                {
+                                    helperControl.Visible = false;
+                                }
+                            }
+                        }
+                        else
+                        {
+                            // Standard overview (and A220) keeps the original
+                            // flexible list with envelope / quick-menu actions.
+                            outputTable.RowStyles[row].SizeType =
+                                SizeType.AutoSize;
+                            outputTable.RowStyles[row].Height = 0F;
+
+                            // Auxiliary prompts share the same bounded message
+                            // column and must not force horizontal auto-scroll.
+                            if (rowMessage == null &&
+                                outputTable.GetControlFromPosition(1, row)
+                                    is Panel promptPanel)
+                            {
+                                promptPanel.Width = standardTextWidth;
+                                promptPanel.MaximumSize = new Size(
+                                    standardTextWidth, 0);
+                            }
+
+                            if (rowMessage != null)
+                            {
+                                rowMessage.Text = CreateMessageListText(
+                                    rowMessage.message,
+                                    rowMessage.type,
+                                    rowMessage.recipient,
+                                    rowMessage.outbound);
+
+                                // Restore *all* geometry after LSK mode, not
+                                // just the message text. AutoSize is bounded by
+                                // our fixed-width second column, preventing
+                                // horizontal scroll and displaced actions.
+                                // On the A220 keep the original variable-height
+                                // standard message list. Constrain the preferred
+                                // width, but let WinForms measure wrapped text.
+                                rowMessage.AutoSize = DcduStyleManager.IsA220;
+                                rowMessage.Width = standardTextWidth;
+                                rowMessage.TextAlign = ContentAlignment.TopLeft;
+                                rowMessage.Dock = DockStyle.None;
+                                rowMessage.Anchor = AnchorStyles.Top |
+                                    AnchorStyles.Left;
+
+                                // No style is allowed an unbounded AutoSize
+                                // message in a percent-width table column.
+                                // This is the main fix for the scrambled
+                                // timestamps / text / action icons in LSK OFF.
+                                rowMessage.MinimumSize = Size.Empty;
+                                rowMessage.MaximumSize = new Size(
+                                    standardTextWidth, 0);
+                                // Obtain the wrapped height at the actual
+                                // available width, not at the stale LSK width.
+                                // AutoSize=false stops a wide single-line
+                                // message from expanding the table horizontally.
+                                Size wrapped = TextRenderer.MeasureText(
+                                    rowMessage.Text ?? string.Empty,
+                                    rowMessage.Font,
+                                    new Size(Math.Max(1, standardTextWidth), 100000),
+                                    TextFormatFlags.WordBreak |
+                                    TextFormatFlags.NoPadding |
+                                    TextFormatFlags.NoPrefix);
+                                if (!DcduStyleManager.IsA220)
+                                {
+                                    rowMessage.Height = Math.Max(S(19), wrapped.Height + S(3));
+                                }
+                                rowMessage.Margin = SPad(
+                                    new Padding(0, 3, 0, 0));
+
+                                Control timeControl =
+                                    outputTable.GetControlFromPosition(0, row);
+
+                                if (timeControl != null)
+                                {
+                                    timeControl.Dock = DockStyle.None;
+                                    timeControl.Anchor = AnchorStyles.Top |
+                                        AnchorStyles.Left;
+                                    timeControl.Margin = SPad(
+                                        new Padding(5, 3, 0, 0));
+                                }
+                            }
+                        }
+                    }
+                }
+
+                if (hardwareLskOverview)
+                {
+                    try
+                    {
+                        outputTable.AutoScrollPosition =
+                            Point.Empty;
+                    }
+                    catch
+                    {
+                        // Cosmetic only.
                     }
                 }
             }
@@ -7135,9 +8383,31 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 outputTable.ResumeLayout(true);
             }
 
+            // An old horizontal AutoScroll origin may survive a style/mode
+            // switch or ScrollControlIntoView. Never let it shift the time
+            // column, even on a subsequent redraw or content update.
+            if (!hardwareLskOverview && outputTable.AutoScroll)
+            {
+                int currentY = Math.Max(0, -outputTable.AutoScrollPosition.Y);
+                outputTable.AutoScrollPosition = new Point(0, currentY);
+                // A visible false-to-true change can trigger another layout
+                // pass; keep the scrollable width inside the viewport too.
+                outputTable.HorizontalScroll.Value = 0;
+            }
+
             UpdateMessageFilterLabel();
             HideNativeOutputScrollbars();
+            UpdateHardwareMessageOverviewPageBar();
+            UpdateHardwareMessageOverviewBlinkState();
+            KeepMessageOverviewHeaderAboveList();
             RefreshOutputScrollSurfaceOnly();
+            if (!hardwareLskOverview)
+            {
+                // Do this after the table is resumed and the standard
+                // actions are reattached (also when returning to A220).
+                QueueStandardOverviewScrollSynchronization(
+                    presentationChanged);
+            }
         }
 
         private void ConfigureAtisAutoRefresh()
@@ -8390,12 +9660,20 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 nextFlightPlanPromptPanel.Controls.Add(reloadButton);
                 nextFlightPlanPromptPanel.Controls.Add(ignoreButton);
 
-                TableLayoutHelper.InsertArbitraryRow(outputTable, 0);
-                outputTable.Controls.Add(CreateLabel(DateTime.Now.ToString("HH:mm")), 0, 0);
-                outputTable.Controls.Add(nextFlightPlanPromptPanel, 1, 0);
-                outputTable.Controls.Add(CreateTimerLabel(">>", true), 2, 0);
+                // Append first, then normalize the whole table. Inserting at
+                // index 0 with TableLayoutHelper moved occupied cells one at
+                // a time and could disassociate live messages from their icons.
+                int promptAppendRow = outputTable.RowCount;
+                outputTable.RowCount = promptAppendRow + 1;
+                outputTable.Controls.Add(CreateLabel(DateTime.Now.ToString("HH:mm")), 0, promptAppendRow);
+                outputTable.Controls.Add(nextFlightPlanPromptPanel, 1, promptAppendRow);
+                outputTable.Controls.Add(CreateTimerLabel(">>", true), 2, promptAppendRow);
+                overviewRowsNeedRebuild = true;
                 ApplyMessageFilter();
-                outputTable.ScrollControlIntoView(nextFlightPlanPromptPanel);
+                if (outputTable.AutoScroll)
+                {
+                    outputTable.AutoScrollPosition = Point.Empty;
+                }
                 HideNativeOutputScrollbars();
             });
 
@@ -8450,6 +9728,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 }
 
                 nextFlightPlanPromptPanel = null;
+                overviewRowsNeedRebuild = true;
                 ApplyMessageFilter();
                 HideNativeOutputScrollbars();
             });
@@ -8613,6 +9892,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             public string FrequencyText { get; set; } = string.Empty;
             public bool Possible { get; set; } = false;
             public bool IsTunedFrequencyMatch { get; set; } = false;
+            public double DistanceNmFromAircraft { get; set; } = double.MaxValue;
         }
 
         private sealed class GeoPoint
@@ -9131,9 +10411,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                                     !string.IsNullOrWhiteSpace(candidate.Controller) &&
                                     IsHoppieLogonOnline(candidate.Code))
                 .Select(candidate => VerifyCandidateAgainstActiveFrequency(candidate, currentPilotFreqs))
+                .Where(candidate => !IsCpdlcHelperIgnoredControllerCallsign(candidate.Controller))
                 .GroupBy(candidate => candidate.Code.Trim().ToUpperInvariant() + "|" + (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant())
-                .Select(group => group.OrderBy(GetCpdlcCandidateSortScore).First())
-                .OrderBy(GetCpdlcCandidateSortScore)
+                .Select(group => OrderCpdlcCandidates(group).First())
+                .OrderBy(candidate => candidate.IsTunedFrequencyMatch ? 0 : 1)
+                .ThenBy(GetCpdlcCandidateDistanceSortValue)
+                .ThenBy(GetCpdlcCandidateSortScore)
                 .ThenBy(candidate => candidate.Controller ?? string.Empty)
                 .Take(5)
                 .ToList();
@@ -9564,7 +10847,14 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 string coverageAltitudeText = string.Empty;
                 IsControllerCoverageCompatibleWithLiveAltitude(controller, out coverageAltitudeText);
 
-                string matchReason = GetCpdlcControllerMatchReason(controller, code, activeStation, departure, arrival, currentFirs);
+                string matchReason = GetCpdlcControllerMatchReason(
+                    controller,
+                    code,
+                    activeStation,
+                    departure,
+                    arrival,
+                    currentFirs,
+                    out double candidateDistanceNm);
 
                 if (string.IsNullOrWhiteSpace(matchReason) && !tunedFrequencyMatch)
                 {
@@ -9595,7 +10885,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     Code = code,
                     MatchReason = matchReason,
                     FrequencyText = string.IsNullOrWhiteSpace(tunedFrequencyText) ? GetControllerDisplayFrequencyText(controller) : tunedFrequencyText,
-                    IsTunedFrequencyMatch = tunedFrequencyMatch
+                    IsTunedFrequencyMatch = tunedFrequencyMatch,
+                    DistanceNmFromAircraft = candidateDistanceNm
                 });
 
                 Logger.Debug("CPDLC discovery candidate " + callsign + " -> " + code + " (" + matchReason + ")");
@@ -9603,10 +10894,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             if (cpdlcDiscoveryCandidates.Count > 0)
             {
-                return cpdlcDiscoveryCandidates
-                    .OrderBy(GetCpdlcCandidateSortScore)
-                    .ThenBy(candidate => candidate.Controller ?? string.Empty)
-                    .First();
+                return OrderCpdlcCandidates(cpdlcDiscoveryCandidates).First();
             }
 
             string vatglassesDebug;
@@ -9688,8 +10976,10 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                     }
 
                     List<long> freqs = new();
-                    long primaryVhf1 = 0;
-                    bool primaryVhf1Ambiguous = false;
+                    long currentPrimaryVhf1 = 0;
+                    bool currentPrimaryVhf1Ambiguous = false;
+                    long legacyPrimaryVhf1 = 0;
+                    bool legacyPrimaryVhf1Ambiguous = false;
 
                     JArray transceivers = client["transceivers"] as JArray ?? new JArray();
                     foreach (JToken transceiver in transceivers)
@@ -9701,19 +10991,33 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
                         freqs.Add(hz);
 
-                        // VATSIM's AFV data identifies radios by transceiver id.
-                        // id 0 is VHF1/COM1; id 1 and higher are secondary radios.
-                        // Never infer VHF1 from JSON array order.
+                        // Current VATSIM transceiver data numbers COM1/VHF1 as id 1
+                        // and COM2/VHF2 as id 2. Older/alternate payloads may expose
+                        // the primary radio as id 0, so retain id 0 only as a fallback.
+                        // Never fall back to "first array item": that could turn COM2
+                        // into a false active-frequency CPDLC match.
                         int? transceiverId = transceiver["id"]?.Value<int?>();
-                        if (transceiverId == 0)
+
+                        if (transceiverId == 1)
                         {
-                            if (primaryVhf1 == 0)
+                            if (currentPrimaryVhf1 == 0)
                             {
-                                primaryVhf1 = hz;
+                                currentPrimaryVhf1 = hz;
                             }
-                            else if (Math.Abs(primaryVhf1 - hz) > 8000L)
+                            else if (Math.Abs(currentPrimaryVhf1 - hz) > 8000L)
                             {
-                                primaryVhf1Ambiguous = true;
+                                currentPrimaryVhf1Ambiguous = true;
+                            }
+                        }
+                        else if (transceiverId == 0)
+                        {
+                            if (legacyPrimaryVhf1 == 0)
+                            {
+                                legacyPrimaryVhf1 = hz;
+                            }
+                            else if (Math.Abs(legacyPrimaryVhf1 - hz) > 8000L)
+                            {
+                                legacyPrimaryVhf1Ambiguous = true;
                             }
                         }
                     }
@@ -9723,11 +11027,16 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                         parsed[clientCallsign] = freqs.Distinct().ToList();
                     }
 
-                    // Fail closed: if id 0 is missing or contradictory, do not perform
-                    // active-frequency CPDLC verification for this pilot at all.
-                    if (primaryVhf1 > 0 && !primaryVhf1Ambiguous)
+                    // Prefer the current VATSIM COM1 id (1). Only use id 0 if no
+                    // valid id-1 radio exists. id 2+ is deliberately never accepted
+                    // for active-frequency CPDLC verification.
+                    if (currentPrimaryVhf1 > 0 && !currentPrimaryVhf1Ambiguous)
                     {
-                        parsedPrimaryVhf1[clientCallsign] = primaryVhf1;
+                        parsedPrimaryVhf1[clientCallsign] = currentPrimaryVhf1;
+                    }
+                    else if (legacyPrimaryVhf1 > 0 && !legacyPrimaryVhf1Ambiguous)
+                    {
+                        parsedPrimaryVhf1[clientCallsign] = legacyPrimaryVhf1;
                     }
                 }
 
@@ -9746,7 +11055,12 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 vatsimTransceiversLoadedUtc = DateTime.UtcNow;
                 consecutiveVatsimTransceiverFailures = 0;
                 vatsimTransceiverRetryAfterUtc = DateTime.MinValue;
-                Logger.Debug("Loaded VATSIM transceivers: " + vatsimTransceiverFrequencies.Count + " clients.");
+                Logger.Debug(
+                    "Loaded VATSIM transceivers: " +
+                    vatsimTransceiverFrequencies.Count +
+                    " clients, primary VHF1 resolved for " +
+                    vatsimPrimaryVhf1Frequencies.Count +
+                    " clients.");
 
                 // Re-run CPDLC discovery immediately with the newly received VHF1
                 // frequency. Without this, a tuned-frequency change could remain
@@ -9867,21 +11181,32 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
         private List<long> GetPilotTunedFrequencies()
         {
-            string activeCallsign = GetConnectedPilotCallsign();
-
-            if (string.IsNullOrWhiteSpace(activeCallsign))
+            // The Hoppie callsign can temporarily differ from the live VATSIM callsign
+            // after a callsign update/reconnect. AFV transceiver data is keyed by the
+            // live VATSIM callsign, so try all authoritative live identifiers before
+            // falling back to the Hoppie session callsign. The parser accepts only
+            // COM1/VHF1 (current id 1, legacy id 0), never COM2/id 2+.
+            IEnumerable<string> candidateCallsigns = new[]
             {
-                return new List<long>();
+                activeVatsimCallsign,
+                userVATSIMData?.callsign,
+                callsign,
+                GetConnectedPilotCallsign()
             }
+            .Where(value => !string.IsNullOrWhiteSpace(value))
+            .Select(value => value.Trim().ToUpperInvariant())
+            .Distinct(StringComparer.OrdinalIgnoreCase);
 
-            string normalizedCallsign = activeCallsign.Trim().ToUpperInvariant();
-            if (vatsimPrimaryVhf1Frequencies.TryGetValue(normalizedCallsign, out long primaryVhf1))
+            foreach (string candidateCallsign in candidateCallsigns)
             {
-                // Only AFV transceiver id 0 is accepted here. Never fall back to the
-                // first array element: the feed may list VHF2/COM2 before VHF1/COM1.
+                if (!vatsimPrimaryVhf1Frequencies.TryGetValue(candidateCallsign, out long primaryVhf1))
+                {
+                    continue;
+                }
+
                 if (primaryVhf1 <= 0 || IsCpdlcVerificationBlockedVoiceFrequencyHz(primaryVhf1))
                 {
-                    return new List<long>();
+                    continue;
                 }
 
                 return new List<long> { primaryVhf1 };
@@ -9995,7 +11320,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 Code = candidate.Code,
                 MatchReason = reason,
                 FrequencyText = frequencyText,
-                IsTunedFrequencyMatch = true
+                IsTunedFrequencyMatch = true,
+                DistanceNmFromAircraft = candidate.DistanceNmFromAircraft
             };
         }
 
@@ -10349,8 +11675,9 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return false;
         }
 
-        private string GetCpdlcControllerMatchReason(Controller controller, string code, string activeStation, string departure, string arrival, List<FirBoundaryFeature> currentFirs)
+        private string GetCpdlcControllerMatchReason(Controller controller, string code, string activeStation, string departure, string arrival, List<FirBoundaryFeature> currentFirs, out double distanceNmFromAircraft)
         {
+            distanceNmFromAircraft = double.MaxValue;
             string callsign = (controller?.callsign ?? string.Empty).Trim().ToUpperInvariant();
             code = (code ?? string.Empty).Trim().ToUpperInvariant();
             activeStation = (activeStation ?? string.Empty).Trim().ToUpperInvariant();
@@ -10364,6 +11691,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             {
                 if (!IsAirborneNowForPhase() && AppCallsignMatchesAirport(callsign, departure))
                 {
+                    if (userVATSIMData != null && TryGetSimbriefAirportPosition(departure, out double depLat, out double depLon))
+                    {
+                        distanceNmFromAircraft = DistanceNm(userVATSIMData.latitude, userVATSIMData.longitude, depLat, depLon);
+                    }
+
                     return "APP matches DEP " + departure;
                 }
 
@@ -10377,6 +11709,11 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
                     if (arrivalAppRelevant)
                     {
+                        if (userVATSIMData != null && TryGetSimbriefAirportPosition(arrival, out double arrLat, out double arrLon))
+                        {
+                            distanceNmFromAircraft = DistanceNm(userVATSIMData.latitude, userVATSIMData.longitude, arrLat, arrLon);
+                        }
+
                         return "APP matches ARR " + arrival;
                     }
                 }
@@ -10407,6 +11744,8 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 {
                     return string.Empty;
                 }
+
+                distanceNmFromAircraft = Math.Max(0.0, sectorMatch.DistanceNmFromAircraft);
 
                 string sectorText = string.IsNullOrWhiteSpace(sectorMatch.AirspaceId)
                     ? sectorMatch.PositionId
@@ -11865,10 +13204,20 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return IsCenterLikeControllerCallsign(controller?.callsign);
         }
 
+        private static bool IsCpdlcHelperIgnoredControllerCallsign(string callsign)
+        {
+            string upper = (callsign ?? string.Empty).Trim().ToUpperInvariant();
+
+            // VATSIM cross-coupled/extended X_CTR positions are not independent
+            // CPDLC logon targets and must never appear as helper suggestions.
+            return Regex.IsMatch(upper, @"_X_CTR$");
+        }
+
         private static bool IsCpdlcDiscoveryController(Controller controller)
         {
             string callsign = (controller?.callsign ?? string.Empty).Trim().ToUpperInvariant();
-            return IsCenterLikeControllerCallsign(callsign) || IsAppLikeControllerCallsign(callsign);
+            return !IsCpdlcHelperIgnoredControllerCallsign(callsign) &&
+                   (IsCenterLikeControllerCallsign(callsign) || IsAppLikeControllerCallsign(callsign));
         }
 
         private static string GetControllerInfoText(Controller controller)
@@ -13146,6 +14495,25 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             return 4;
         }
 
+        private static double GetCpdlcCandidateDistanceSortValue(CpdlcDiscoveryResult candidate)
+        {
+            double distance = candidate?.DistanceNmFromAircraft ?? double.MaxValue;
+            return double.IsNaN(distance) || double.IsInfinity(distance) || distance < 0
+                ? double.MaxValue
+                : distance;
+        }
+
+        private static IOrderedEnumerable<CpdlcDiscoveryResult> OrderCpdlcCandidates(IEnumerable<CpdlcDiscoveryResult> candidates)
+        {
+            return (candidates ?? Enumerable.Empty<CpdlcDiscoveryResult>())
+                // A verified active VHF1 match always wins; all other candidates are
+                // ordered strictly nearest-to-farthest before match-type/alphabetic ties.
+                .OrderBy(candidate => candidate?.IsTunedFrequencyMatch == true ? 0 : 1)
+                .ThenBy(GetCpdlcCandidateDistanceSortValue)
+                .ThenBy(GetCpdlcCandidateSortScore)
+                .ThenBy(candidate => candidate?.Controller ?? string.Empty);
+        }
+
         private void ConfigureCpdlcLogonPopup()
         {
             if (screenPanel == null || cpdlcLogonPopupPanel != null)
@@ -13157,7 +14525,24 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             {
                 BackColor = Color.Transparent,
                 Visible = false,
+                TabStop = true,
                 Size = SS(new Size(300, 120))
+            };
+
+            cpdlcLogonPopupPanel.PreviewKeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    e.IsInputKey = true;
+                }
+            };
+            cpdlcLogonPopupPanel.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    HideCpdlcLogonPopup();
+                    e.Handled = true;
+                }
             };
 
             cpdlcLogonPopupPanel.Paint += (_, e) =>
@@ -13298,6 +14683,562 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             }
         }
 
+        private sealed class CpdlcCandidateScrollState
+        {
+            public Panel Viewport;
+            public Panel Content;
+            public Panel Track;
+            public int ContentHeight;
+            public int ScrollOffset;
+            public Rectangle ThumbBounds;
+            public bool Dragging;
+            public int DragStartY;
+            public int DragStartOffset;
+        }
+
+        private CpdlcCandidateScrollState GetCpdlcCandidateScrollState(Panel listPanel)
+        {
+            return listPanel?.Tag as CpdlcCandidateScrollState;
+        }
+
+        private void UpdateCpdlcCandidateScrollbar(CpdlcCandidateScrollState state)
+        {
+            if (state == null ||
+                state.Viewport == null || state.Viewport.IsDisposed ||
+                state.Content == null || state.Content.IsDisposed ||
+                state.Track == null || state.Track.IsDisposed)
+            {
+                return;
+            }
+
+            int viewportHeight = Math.Max(1, state.Viewport.ClientSize.Height);
+            int contentHeight = Math.Max(viewportHeight, state.ContentHeight);
+            int maxScroll = Math.Max(0, contentHeight - viewportHeight);
+
+            state.ScrollOffset = Math.Max(0, Math.Min(state.ScrollOffset, maxScroll));
+            state.Content.Location = new Point(0, -state.ScrollOffset);
+
+            bool needsScroll = maxScroll > 0;
+            state.Track.Visible = needsScroll;
+
+            if (!needsScroll)
+            {
+                state.ThumbBounds = Rectangle.Empty;
+                state.Track.Invalidate();
+                return;
+            }
+
+            int trackHeight = Math.Max(1, state.Track.ClientSize.Height);
+            int minThumbHeight = Math.Max(S(18), 16);
+            int thumbHeight = Math.Max(
+                minThumbHeight,
+                (int)Math.Round(
+                    trackHeight * (viewportHeight / (double)contentHeight)));
+
+            thumbHeight = Math.Min(trackHeight, thumbHeight);
+
+            int travel = Math.Max(0, trackHeight - thumbHeight);
+            int thumbTop = maxScroll <= 0 || travel <= 0
+                ? 0
+                : (int)Math.Round(
+                    travel * (state.ScrollOffset / (double)maxScroll));
+
+            int thumbWidth = Math.Max(S(3), 3);
+            int thumbX = Math.Max(
+                0,
+                (state.Track.ClientSize.Width - thumbWidth) / 2);
+
+            state.ThumbBounds = new Rectangle(
+                thumbX,
+                thumbTop,
+                thumbWidth,
+                thumbHeight);
+
+            state.Track.Invalidate();
+        }
+
+        private void ScrollCpdlcCandidateList(
+            CpdlcCandidateScrollState state,
+            int deltaPixels)
+        {
+            if (state == null)
+            {
+                return;
+            }
+
+            state.ScrollOffset += deltaPixels;
+            UpdateCpdlcCandidateScrollbar(state);
+        }
+
+        private void ConfigureCpdlcCandidateScrollContent(
+            Panel listPanel,
+            int logicalContentHeight)
+        {
+            CpdlcCandidateScrollState state =
+                GetCpdlcCandidateScrollState(listPanel);
+
+            if (state == null)
+            {
+                return;
+            }
+
+            state.ContentHeight = Math.Max(
+                listPanel.ClientSize.Height,
+                S(logicalContentHeight));
+
+            int contentWidth = Math.Max(
+                S(60),
+                listPanel.ClientSize.Width - Math.Max(S(10), 8));
+
+            state.Content.Size = new Size(
+                contentWidth,
+                state.ContentHeight);
+
+            UpdateCpdlcCandidateScrollbar(state);
+        }
+
+        private Panel CreateCpdlcCandidateScrollPanel(
+            int popupWidth,
+            int y,
+            int logicalHeight)
+        {
+            if (cpdlcLogonPopupPanel == null)
+            {
+                return null;
+            }
+
+            Panel listPanel = new Panel
+            {
+                BackColor = Color.Transparent,
+                BorderStyle = BorderStyle.None,
+                AutoScroll = false,
+                TabStop = true,
+                Location = new Point(S(1), S(y)),
+                Size = new Size(
+                    Math.Max(S(80), popupWidth - S(2)),
+                    Math.Max(S(48), S(logicalHeight)))
+            };
+
+            int trackWidth = Math.Max(S(9), 8);
+
+            Panel contentPanel = new Panel
+            {
+                BackColor = Color.Transparent,
+                BorderStyle = BorderStyle.None,
+                Location = Point.Empty,
+                Size = new Size(
+                    Math.Max(S(60), listPanel.Width - trackWidth),
+                    listPanel.Height)
+            };
+
+            Panel trackPanel = new Panel
+            {
+                BackColor = Color.Transparent,
+                BorderStyle = BorderStyle.None,
+                Cursor = Cursors.Hand,
+                Location = new Point(
+                    Math.Max(0, listPanel.Width - trackWidth),
+                    0),
+                Size = new Size(
+                    trackWidth,
+                    listPanel.Height),
+                Visible = false
+            };
+
+            CpdlcCandidateScrollState state = new()
+            {
+                Viewport = listPanel,
+                Content = contentPanel,
+                Track = trackPanel,
+                ContentHeight = listPanel.Height,
+                ScrollOffset = 0
+            };
+
+            listPanel.Tag = state;
+
+            trackPanel.Paint += (_, e) =>
+            {
+                e.Graphics.SmoothingMode =
+                    System.Drawing.Drawing2D.SmoothingMode.AntiAlias;
+
+                int centreX = Math.Max(0, trackPanel.ClientSize.Width / 2);
+
+                using Pen railPen = new(
+                    Color.FromArgb(95, MainPrimaryTextColor()),
+                    Math.Max(1.0f, SF(1.0f)));
+
+                e.Graphics.DrawLine(
+                    railPen,
+                    centreX,
+                    S(3),
+                    centreX,
+                    Math.Max(S(3), trackPanel.ClientSize.Height - S(3)));
+
+                if (!state.ThumbBounds.IsEmpty)
+                {
+                    Rectangle thumb = state.ThumbBounds;
+
+                    using SolidBrush glowBrush = new(
+                        Color.FromArgb(48, MainAccentColor()));
+
+                    Rectangle glow = Rectangle.Inflate(
+                        thumb,
+                        Math.Max(1, S(2)),
+                        0);
+
+                    e.Graphics.FillRectangle(glowBrush, glow);
+
+                    using SolidBrush thumbBrush = new(
+                        MainAccentColor());
+
+                    e.Graphics.FillRectangle(
+                        thumbBrush,
+                        thumb);
+                }
+            };
+
+            trackPanel.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                if (state.ThumbBounds.Contains(e.Location))
+                {
+                    state.Dragging = true;
+                    state.DragStartY = e.Y;
+                    state.DragStartOffset = state.ScrollOffset;
+                    trackPanel.Capture = true;
+                    return;
+                }
+
+                int pageDelta = Math.Max(
+                    S(36),
+                    (int)Math.Round(
+                        listPanel.ClientSize.Height * 0.80));
+
+                ScrollCpdlcCandidateList(
+                    state,
+                    e.Y < state.ThumbBounds.Top
+                        ? -pageDelta
+                        : pageDelta);
+            };
+
+            trackPanel.MouseMove += (_, e) =>
+            {
+                if (!state.Dragging)
+                {
+                    return;
+                }
+
+                int maxScroll = Math.Max(
+                    0,
+                    state.ContentHeight -
+                    listPanel.ClientSize.Height);
+
+                int travel = Math.Max(
+                    1,
+                    trackPanel.ClientSize.Height -
+                    state.ThumbBounds.Height);
+
+                int mouseDelta = e.Y - state.DragStartY;
+                int scrollDelta = (int)Math.Round(
+                    mouseDelta *
+                    (maxScroll / (double)travel));
+
+                state.ScrollOffset =
+                    state.DragStartOffset + scrollDelta;
+
+                UpdateCpdlcCandidateScrollbar(state);
+            };
+
+            trackPanel.MouseUp += (_, e) =>
+            {
+                if (e.Button == MouseButtons.Left)
+                {
+                    state.Dragging = false;
+                    trackPanel.Capture = false;
+                }
+            };
+
+            MouseEventHandler wheelHandler = (_, e) =>
+            {
+                int wheelSteps = e.Delta / 120;
+                if (wheelSteps == 0)
+                {
+                    wheelSteps = Math.Sign(e.Delta);
+                }
+
+                ScrollCpdlcCandidateList(
+                    state,
+                    -wheelSteps * Math.Max(S(30), 24));
+            };
+
+            listPanel.MouseWheel += wheelHandler;
+            contentPanel.MouseWheel += wheelHandler;
+
+            listPanel.MouseEnter += (_, __) =>
+            {
+                if (!listPanel.Focused)
+                {
+                    listPanel.Focus();
+                }
+            };
+
+            contentPanel.MouseEnter += (_, __) =>
+            {
+                if (!listPanel.Focused)
+                {
+                    listPanel.Focus();
+                }
+            };
+
+            listPanel.PreviewKeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    e.IsInputKey = true;
+                }
+            };
+
+            listPanel.KeyDown += (_, e) =>
+            {
+                if (e.KeyCode == Keys.Escape)
+                {
+                    HideCpdlcLogonPopup();
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.Up)
+                {
+                    ScrollCpdlcCandidateList(
+                        state,
+                        -Math.Max(S(26), 20));
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.Down)
+                {
+                    ScrollCpdlcCandidateList(
+                        state,
+                        Math.Max(S(26), 20));
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.PageUp)
+                {
+                    ScrollCpdlcCandidateList(
+                        state,
+                        -Math.Max(
+                            S(40),
+                            listPanel.ClientSize.Height - S(20)));
+                    e.Handled = true;
+                }
+                else if (e.KeyCode == Keys.PageDown)
+                {
+                    ScrollCpdlcCandidateList(
+                        state,
+                        Math.Max(
+                            S(40),
+                            listPanel.ClientSize.Height - S(20)));
+                    e.Handled = true;
+                }
+            };
+
+            listPanel.Controls.Add(contentPanel);
+            listPanel.Controls.Add(trackPanel);
+            trackPanel.BringToFront();
+
+            cpdlcLogonPopupPanel.Controls.Add(listPanel);
+
+            return listPanel;
+        }
+
+        private Panel CpdlcCandidateContentPanel(Panel listPanel)
+        {
+            return GetCpdlcCandidateScrollState(listPanel)?.Content
+                ?? listPanel;
+        }
+
+        private void AddCpdlcCandidateListLabel(
+            Panel listPanel,
+            string text,
+            int y,
+            Color color,
+            Font font)
+        {
+            if (listPanel == null)
+            {
+                return;
+            }
+
+            Panel contentPanel =
+                CpdlcCandidateContentPanel(listPanel);
+
+            System.Windows.Forms.Label label =
+                new System.Windows.Forms.Label
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    ForeColor = color,
+                    Font = font,
+                    Text = text,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Location = new Point(S(7), S(y)),
+                    Size = new Size(
+                        Math.Max(
+                            S(40),
+                            contentPanel.Width - S(14)),
+                        S(18)),
+                    Margin = Padding.Empty,
+                    Padding = Padding.Empty
+                };
+
+            contentPanel.Controls.Add(label);
+        }
+
+        private void AddCpdlcCandidateListAction(
+            Panel listPanel,
+            string caption,
+            string code,
+            string controller,
+            string tooltip,
+            int y)
+        {
+            if (listPanel == null)
+            {
+                return;
+            }
+
+            Panel contentPanel =
+                CpdlcCandidateContentPanel(listPanel);
+
+            string normalCaption =
+                (caption ?? string.Empty).Trim();
+
+            string cleanCode =
+                (code ?? string.Empty)
+                    .Trim()
+                    .ToUpperInvariant();
+
+            string cleanController =
+                (controller ?? string.Empty)
+                    .Trim()
+                    .ToUpperInvariant();
+
+            Font actionFont = PopupRowFont();
+
+            int usableWidth = Math.Max(
+                S(90),
+                contentPanel.Width - S(14));
+
+            int actionWidth = Math.Min(
+                Math.Max(
+                    S(72),
+                    TextRenderer.MeasureText(
+                        normalCaption,
+                        actionFont).Width + S(8)),
+                usableWidth);
+
+            System.Windows.Forms.Label actionLabel =
+                new System.Windows.Forms.Label
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    ForeColor = MainPrimaryTextColor(),
+                    Font = actionFont,
+                    Text = normalCaption,
+                    TextAlign = ContentAlignment.MiddleLeft,
+                    Location = new Point(S(7), S(y)),
+                    Size = new Size(
+                        actionWidth,
+                        S(18)),
+                    Cursor = Cursors.Hand,
+                    Tag = cleanCode
+                };
+
+            smartStatusToolTip.SetToolTip(
+                actionLabel,
+                tooltip);
+
+            actionLabel.MouseEnter += (_, __) =>
+            {
+                actionLabel.ForeColor = DcduTheme.Amber;
+                actionLabel.Text =
+                    normalCaption.StartsWith(
+                        ">",
+                        StringComparison.Ordinal)
+                        ? normalCaption
+                        : "> " + normalCaption;
+
+                if (!listPanel.Focused)
+                {
+                    listPanel.Focus();
+                }
+            };
+
+            actionLabel.MouseLeave += (_, __) =>
+            {
+                actionLabel.ForeColor =
+                    MainPrimaryTextColor();
+                actionLabel.Text = normalCaption;
+            };
+
+            actionLabel.Click += async (_, __) =>
+            {
+                HideCpdlcLogonPopup();
+                await QuickCpdlcLogonAsync(cleanCode);
+            };
+
+            contentPanel.Controls.Add(actionLabel);
+
+            if (!string.IsNullOrWhiteSpace(cleanController) &&
+                !string.Equals(
+                    cleanController,
+                    cleanCode,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                int controllerX =
+                    actionLabel.Right + S(6);
+
+                int controllerWidth = Math.Max(
+                    S(20),
+                    contentPanel.Width -
+                    controllerX -
+                    S(7));
+
+                System.Windows.Forms.Label controllerLabel =
+                    new System.Windows.Forms.Label
+                    {
+                        AutoSize = false,
+                        BackColor = Color.Transparent,
+                        ForeColor = MainPrimaryTextColor(),
+                        Font = actionFont,
+                        Text = cleanController,
+                        TextAlign = ContentAlignment.MiddleLeft,
+                        Location = new Point(
+                            controllerX,
+                            S(y)),
+                        Size = new Size(
+                            controllerWidth,
+                            S(18)),
+                        Cursor = Cursors.Default
+                    };
+
+                smartStatusToolTip.SetToolTip(
+                    controllerLabel,
+                    tooltip);
+
+                controllerLabel.MouseEnter += (_, __) =>
+                {
+                    if (!listPanel.Focused)
+                    {
+                        listPanel.Focus();
+                    }
+                };
+
+                contentPanel.Controls.Add(controllerLabel);
+            }
+        }
+
         private void AddCpdlcPopupLogoffAction(string unit, int y)
         {
             if (cpdlcLogonPopupPanel == null)
@@ -13335,6 +15276,36 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             };
 
             cpdlcLogonPopupPanel.Controls.Add(actionLabel);
+        }
+
+        private void AddCpdlcPopupCloseAction(int popupWidth)
+        {
+            if (cpdlcLogonPopupPanel == null)
+            {
+                return;
+            }
+
+            int closeWidth = S(58);
+            System.Windows.Forms.Label closeLabel = new System.Windows.Forms.Label
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                ForeColor = MainPrimaryTextColor(),
+                Font = PopupRowFont(),
+                Text = "CLOSE*",
+                TextAlign = ContentAlignment.MiddleRight,
+                Location = new Point(Math.Max(S(8), popupWidth - closeWidth - S(8)), S(3)),
+                Size = new Size(closeWidth, S(22)),
+                Cursor = Cursors.Hand
+            };
+
+            closeLabel.MouseEnter += (_, __) => closeLabel.ForeColor = DcduTheme.Amber;
+            closeLabel.MouseLeave += (_, __) => closeLabel.ForeColor = MainPrimaryTextColor();
+            closeLabel.Click += (_, __) => HideCpdlcLogonPopup();
+
+            smartStatusToolTip.SetToolTip(closeLabel, "Close CPDLC Logon Helper");
+            cpdlcLogonPopupPanel.Controls.Add(closeLabel);
+            closeLabel.BringToFront();
         }
 
         private void AddCpdlcHelperHeaderToggle(int popupWidth)
@@ -13408,6 +15379,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             AddCpdlcPopupLabel("CPDLC LOGON HELPER", 8, y, 142, 18, PopupHeaderTextColor(MainAccentColor()), headerFont);
             AddCpdlcHelperHeaderToggle(popupWidth);
+            AddCpdlcPopupCloseAction(popupWidth);
             y += 26;
 
             if (CpdlcHelperPopupDebugPreview)
@@ -13421,6 +15393,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 cpdlcLogonPopupPanel.ResumeLayout();
                 cpdlcLogonPopupPanel.Visible = true;
                 cpdlcLogonPopupPanel.BringToFront();
+                cpdlcLogonPopupPanel.Focus();
                 cpdlcLogonPopupPanel.Invalidate();
                 return;
             }
@@ -13437,6 +15410,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 cpdlcLogonPopupPanel.ResumeLayout();
                 cpdlcLogonPopupPanel.Visible = true;
                 cpdlcLogonPopupPanel.BringToFront();
+                cpdlcLogonPopupPanel.Focus();
                 cpdlcLogonPopupPanel.Invalidate();
                 return;
             }
@@ -13451,6 +15425,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 cpdlcLogonPopupPanel.ResumeLayout();
                 cpdlcLogonPopupPanel.Visible = true;
                 cpdlcLogonPopupPanel.BringToFront();
+                cpdlcLogonPopupPanel.Focus();
                 cpdlcLogonPopupPanel.Invalidate();
                 return;
             }
@@ -13465,6 +15440,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 cpdlcLogonPopupPanel.ResumeLayout();
                 cpdlcLogonPopupPanel.Visible = true;
                 cpdlcLogonPopupPanel.BringToFront();
+                cpdlcLogonPopupPanel.Focus();
                 cpdlcLogonPopupPanel.Invalidate();
                 return;
             }
@@ -13480,11 +15456,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                                     IsHoppieLogonOnline(candidate.Code) &&
                                     !IsCpdlcVerifiedSuggestionCooldownActive(candidate.Code, candidate.Controller, out _))
                 .Select(candidate => VerifyCandidateAgainstActiveFrequency(candidate, currentPilotFreqs))
+                .Where(candidate => !IsCpdlcHelperIgnoredControllerCallsign(candidate.Controller))
                 .GroupBy(candidate => candidate.Code.Trim().ToUpperInvariant() + "|" + (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant())
-                .Select(group => group.OrderBy(GetCpdlcCandidateSortScore).First())
-                .OrderBy(GetCpdlcCandidateSortScore)
+                .Select(group => OrderCpdlcCandidates(group).First())
+                .OrderBy(candidate => candidate.IsTunedFrequencyMatch ? 0 : 1)
+                .ThenBy(GetCpdlcCandidateDistanceSortValue)
+                .ThenBy(GetCpdlcCandidateSortScore)
                 .ThenBy(candidate => candidate.Controller ?? string.Empty)
-                .Take(5)
                 .ToList();
 
             if (candidates.Count == 0 && CanQuickCpdlcLogon())
@@ -13508,14 +15486,16 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 cpdlcLogonPopupPanel.ResumeLayout();
                 cpdlcLogonPopupPanel.Visible = true;
                 cpdlcLogonPopupPanel.BringToFront();
+                cpdlcLogonPopupPanel.Focus();
                 cpdlcLogonPopupPanel.Invalidate();
                 return;
             }
 
             CpdlcDiscoveryResult tuned = candidates.FirstOrDefault(candidate => candidate.IsTunedFrequencyMatch);
             List<CpdlcDiscoveryResult> others = candidates
-                .Where(candidate => tuned == null || !string.Equals(candidate.Code, tuned.Code, StringComparison.OrdinalIgnoreCase) || !string.Equals(candidate.Controller, tuned.Controller, StringComparison.OrdinalIgnoreCase))
-                .Take(tuned == null ? 4 : 3)
+                .Where(candidate => tuned == null ||
+                                    !string.Equals(candidate.Code, tuned.Code, StringComparison.OrdinalIgnoreCase) ||
+                                    !string.Equals(candidate.Controller, tuned.Controller, StringComparison.OrdinalIgnoreCase))
                 .ToList();
 
             if (tuned != null)
@@ -13525,13 +15505,13 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 string frequency = string.IsNullOrWhiteSpace(tuned.FrequencyText) ? "ACTIVE FREQ" : tuned.FrequencyText;
 
                 AddCpdlcPopupLabel("VERIFIED ACTIVE FREQ CPDLC", 8, y, popupWidth - 16, 16, PopupHeaderTextColor(MainAccentColor()), rowFont);
-                y += 26;
+                y += 21;
                 AddCpdlcPopupLabel((string.IsNullOrWhiteSpace(controller) ? "UNKNOWN" : controller) + "   " + frequency, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
-                y += 26;
+                y += 21;
                 AddCpdlcPopupLabel("LOGON: " + code, 8, y, popupWidth - 16, 16, MainPrimaryTextColor(), rowFont);
-                y += 26;
+                y += 21;
                 AddCpdlcPopupAction("> LOGON TO " + code, code, controller, "Verified on your active VATSIM frequency\nController: " + controller + "\nLogon: " + code, y);
-                y += 27;
+                y += 23;
             }
 
             if (others.Count > 0)
@@ -13539,29 +15519,86 @@ private System.Windows.Forms.Label airbusAocSendLabel;
                 if (tuned != null)
                 {
                     AddCpdlcPopupLabel("──────────────────────────────", 8, y, popupWidth - 16, 16, Color.FromArgb(150, MainPrimaryTextColor()), rowFont);
-                    y += 26;
+                    y += 21;
                 }
 
-                bool hasRouteCandidate = others.Any(candidate => (candidate.MatchReason ?? string.Empty).ToUpperInvariant().Contains("FLIGHT PLAN ROUTE FIR"));
+                bool hasRouteCandidate = others.Any(candidate =>
+                    (candidate.MatchReason ?? string.Empty)
+                        .ToUpperInvariant()
+                        .Contains("FLIGHT PLAN ROUTE FIR"));
+
                 string candidatesTitle = tuned == null
-                    ? (hasRouteCandidate ? "POSSIBLE CPDLC ATC / ROUTE" : "POSSIBLE CPDLC ATC NEARBY")
+                    ? (hasRouteCandidate
+                        ? "POSSIBLE CPDLC ATC / ROUTE"
+                        : "POSSIBLE CPDLC ATC NEARBY")
                     : "OTHER CPDLC CANDIDATES";
-                AddCpdlcPopupLabel(candidatesTitle, 8, y, popupWidth - 16, 16, PopupHeaderTextColor(MainAccentColor()), rowFont);
-                y += 26;
 
-                foreach (CpdlcDiscoveryResult candidate in others)
+                const int candidateTitleHeight = 26;
+                const int candidateRowHeight = 26;
+                const int candidateListMaxHeight = 128;
+
+                int candidateContentHeight =
+                    candidateTitleHeight +
+                    (others.Count * candidateRowHeight) +
+                    2;
+
+                int candidateViewportHeight = Math.Min(
+                    candidateListMaxHeight,
+                    Math.Max(52, candidateContentHeight));
+
+                Panel candidateListPanel =
+                    CreateCpdlcCandidateScrollPanel(
+                        popupWidth,
+                        y,
+                        candidateViewportHeight);
+
+                if (candidateListPanel != null)
                 {
-                    string code = candidate.Code.Trim().ToUpperInvariant();
-                    string controller = (candidate.Controller ?? string.Empty).Trim().ToUpperInvariant();
-                    string caption = "> LOGON TO " + code;
+                    int candidateY = 0;
 
-                    string frequency = string.IsNullOrWhiteSpace(candidate.FrequencyText)
-                        ? string.Empty
-                        : "\nFrequency: " + candidate.FrequencyText.Trim();
+                    AddCpdlcCandidateListLabel(
+                        candidateListPanel,
+                        candidatesTitle,
+                        candidateY,
+                        PopupHeaderTextColor(MainAccentColor()),
+                        rowFont);
 
-                    AddCpdlcPopupAction(caption, code, controller, "Controller: " + controller + frequency + "\nLogon: " + code + "\n" + (candidate.MatchReason ?? string.Empty), y);
-                    y += 26;
+                    candidateY += candidateTitleHeight;
+
+                    foreach (CpdlcDiscoveryResult candidate in others)
+                    {
+                        string code = candidate.Code.Trim().ToUpperInvariant();
+                        string controller = (candidate.Controller ?? string.Empty)
+                            .Trim()
+                            .ToUpperInvariant();
+                        string caption = "> LOGON TO " + code;
+
+                        string frequency = string.IsNullOrWhiteSpace(candidate.FrequencyText)
+                            ? string.Empty
+                            : "\nFrequency: " + candidate.FrequencyText.Trim();
+
+                        AddCpdlcCandidateListAction(
+                            candidateListPanel,
+                            caption,
+                            code,
+                            controller,
+                            "Controller: " + controller +
+                            frequency +
+                            "\nLogon: " + code +
+                            "\n" + (candidate.MatchReason ?? string.Empty),
+                            candidateY);
+
+                        candidateY += candidateRowHeight;
+                    }
+
+                    ConfigureCpdlcCandidateScrollContent(
+                        candidateListPanel,
+                        Math.Max(
+                            candidateY,
+                            candidateContentHeight));
                 }
+
+                y += candidateViewportHeight;
             }
             else if (tuned != null)
             {
@@ -13576,6 +15613,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             cpdlcLogonPopupPanel.ResumeLayout();
             cpdlcLogonPopupPanel.Visible = true;
             cpdlcLogonPopupPanel.BringToFront();
+            cpdlcLogonPopupPanel.Focus();
             cpdlcLogonPopupPanel.Invalidate();
         }
 
@@ -15544,6 +17582,698 @@ private System.Windows.Forms.Label airbusAocSendLabel;
         }
 
 
+        private void ResetHardwareMessageOverviewPage()
+        {
+            hardwareMessageOverviewPageIndex = 0;
+        }
+
+        private List<CPDLCMessage> GetFilteredOverviewMessagesInRowOrder()
+        {
+            List<(int Row, CPDLCMessage Message)> ordered = new();
+
+            if (outputTable == null || outputTable.IsDisposed)
+            {
+                return new List<CPDLCMessage>();
+            }
+
+            for (int row = 0; row < outputTable.RowCount; row++)
+            {
+                CPDLCMessage rowMessage = null;
+
+                for (int col = 0; col < outputTable.ColumnCount; col++)
+                {
+                    if (outputTable.GetControlFromPosition(col, row) is CPDLCMessage message)
+                    {
+                        rowMessage = message;
+                        break;
+                    }
+                }
+
+                if (rowMessage != null &&
+                    MessageMatchesFilter(rowMessage, activeMessageFilter))
+                {
+                    ordered.Add((row, rowMessage));
+                }
+            }
+
+            return ordered
+                .OrderBy(item => item.Row)
+                .Select(item => item.Message)
+                .ToList();
+        }
+
+        private List<CPDLCMessage> GetHardwareMessageOverviewPageList()
+        {
+            List<CPDLCMessage> filtered =
+                GetFilteredOverviewMessagesInRowOrder();
+
+            int pageCapacity =
+                HardwareMessageOverviewPageCapacity();
+
+            hardwareMessageOverviewPageCount =
+                Math.Max(
+                    1,
+                    (filtered.Count + pageCapacity - 1) /
+                    pageCapacity);
+
+            hardwareMessageOverviewPageIndex =
+                Math.Max(
+                    0,
+                    Math.Min(
+                        hardwareMessageOverviewPageIndex,
+                        hardwareMessageOverviewPageCount - 1));
+
+            return filtered
+                .Skip(
+                    hardwareMessageOverviewPageIndex *
+                    pageCapacity)
+                .Take(pageCapacity)
+                .ToList();
+        }
+
+        private string HardwareMessageOverviewSingleLineText(
+            CPDLCMessage message)
+        {
+            if (message == null)
+            {
+                return string.Empty;
+            }
+
+            string text = CreateMessageListText(
+                message.message,
+                message.type,
+                message.recipient,
+                message.outbound);
+
+            text = Regex.Replace(
+                    (text ?? string.Empty)
+                        .Replace("\r", " ")
+                        .Replace("\n", " "),
+                    @"\s+",
+                    " ")
+                .Trim();
+
+            if (string.IsNullOrWhiteSpace(text) ||
+                outputTable == null ||
+                outputTable.IsDisposed)
+            {
+                return text;
+            }
+
+            // Use the SAME available width as the actual message column.
+            // A separately estimated width could let the last characters
+            // wrap below an LSK row even after text truncation.
+            int maxWidth = Math.Max(
+                S(80), StandardOverviewMessageMaxWidth() - S(6));
+
+            Font font = message.Font ?? GetMessageTextFont(false);
+            TextFormatFlags flags =
+                TextFormatFlags.SingleLine |
+                TextFormatFlags.NoPadding |
+                TextFormatFlags.NoPrefix;
+
+            if (TextRenderer.MeasureText(text, font, Size.Empty, flags).Width <= maxWidth)
+            {
+                return text;
+            }
+
+            const string suffix = "...";
+            int low = 0;
+            int high = text.Length;
+            int best = 0;
+
+            while (low <= high)
+            {
+                int middle = low + ((high - low) / 2);
+                string candidate =
+                    text.Substring(0, middle).TrimEnd() + suffix;
+
+                int width =
+                    TextRenderer.MeasureText(
+                        candidate,
+                        font,
+                        Size.Empty,
+                        flags).Width;
+
+                if (width <= maxWidth)
+                {
+                    best = middle;
+                    low = middle + 1;
+                }
+                else
+                {
+                    high = middle - 1;
+                }
+            }
+
+            return text.Substring(0, best).TrimEnd() + suffix;
+        }
+
+        private void RestoreHardwareOverviewUnreadColors()
+        {
+            foreach (CPDLCMessage message in unreadMessages.ToList())
+            {
+                if (message == null || message.IsDisposed)
+                {
+                    continue;
+                }
+
+                if (IsCallsignMismatchAlarmText(message.message))
+                {
+                    message.ForeColor = CallsignMismatchAlarmColor();
+                }
+                else if (MessageNeedsOverviewReplyIndicator(
+                             message.type,
+                             message.outbound,
+                             message.header))
+                {
+                    message.ForeColor = MainPrimaryTextColor();
+                }
+                else
+                {
+                    message.ForeColor = DcduTheme.Amber;
+                }
+
+                message.Invalidate();
+            }
+        }
+
+        private void UpdateHardwareMessageOverviewBlinkState()
+        {
+            bool shouldBlink =
+                ShouldUseMessageOverviewLskMode() &&
+                unreadMessages.Any(message =>
+                    message != null &&
+                    !message.IsDisposed &&
+                    !message.outbound);
+
+            if (shouldBlink)
+            {
+                if (!hardwareMessageOverviewBlinkTimer.Enabled)
+                {
+                    hardwareMessageOverviewBlinkOn = true;
+                    hardwareMessageOverviewBlinkTimer.Start();
+                }
+            }
+            else
+            {
+                hardwareMessageOverviewBlinkTimer.Stop();
+                hardwareMessageOverviewBlinkOn = false;
+                RestoreHardwareOverviewUnreadColors();
+            }
+        }
+
+        private void HardwareMessageOverviewBlinkTimer_Tick(
+            object sender,
+            EventArgs e)
+        {
+            if (!ShouldUseMessageOverviewLskMode())
+            {
+                UpdateHardwareMessageOverviewBlinkState();
+                return;
+            }
+
+            hardwareMessageOverviewBlinkOn =
+                !hardwareMessageOverviewBlinkOn;
+
+            HashSet<CPDLCMessage> visiblePage =
+                GetHardwareMessageOverviewPageList().ToHashSet();
+
+            foreach (CPDLCMessage message in unreadMessages.ToList())
+            {
+                if (message == null ||
+                    message.IsDisposed ||
+                    !visiblePage.Contains(message) ||
+                    IsCallsignMismatchAlarmText(message.message))
+                {
+                    continue;
+                }
+
+                message.ForeColor = hardwareMessageOverviewBlinkOn
+                    ? DcduTheme.Amber
+                    : MainPrimaryTextColor();
+
+                message.Invalidate();
+            }
+        }
+
+        private HashSet<CPDLCMessage> GetHardwareMessageOverviewPageMessages()
+        {
+            return GetHardwareMessageOverviewPageList()
+                .ToHashSet();
+        }
+
+        // Unlike the Airbus/Boeing LSK pages, A220 scrolls through its normal
+        // variable-height messages. This indicator reflects the REAL vertical
+        // scroll range, rather than imposing hardware LSK slots on A220.
+        private void CalculateA220OverviewPages()
+        {
+            a220OverviewPageIndex = 0;
+            a220OverviewPageCount = 1;
+            a220OverviewMaxScroll = 0;
+            if (!DcduStyleManager.IsA220 || outputTable == null ||
+                outputTable.IsDisposed || outputTable.ClientSize.Height <= 0 ||
+                !standardOverviewExtentValid)
+            {
+                return;
+            }
+
+            // A220 uses standard scrolling, never physical LSK pages. Both
+            // its indicator and the actual scrollbar share the same measured
+            // content extent, not the self-inflating DisplayRectangle.
+            a220OverviewMaxScroll = standardOverviewMaximumOffset;
+            if (a220OverviewMaxScroll <= 0)
+            {
+                return;
+            }
+
+            int viewport = Math.Max(1, outputTable.ClientSize.Height);
+            a220OverviewPageCount = Math.Max(2,
+                (standardOverviewContentBottom + viewport - 1) / viewport);
+            int scrollY = Math.Max(0, Math.Min(a220OverviewMaxScroll,
+                -outputTable.AutoScrollPosition.Y));
+            a220OverviewPageIndex = Math.Min(a220OverviewPageCount - 1,
+                (int)Math.Round((double)scrollY *
+                    (a220OverviewPageCount - 1) / a220OverviewMaxScroll));
+        }
+
+        private void ChangeA220OverviewPage(int delta)
+        {
+            if (!DcduStyleManager.IsA220 || delta == 0 ||
+                outputTable == null || outputTable.IsDisposed ||
+                !outputTable.Visible || !outputTable.AutoScroll)
+            {
+                return;
+            }
+
+            CalculateA220OverviewPages();
+            if (a220OverviewPageCount <= 1)
+            {
+                return;
+            }
+            int targetPage = Math.Max(0, Math.Min(
+                a220OverviewPageCount - 1, a220OverviewPageIndex + delta));
+            int desiredOffset = (int)Math.Round(
+                (double)targetPage * a220OverviewMaxScroll /
+                (a220OverviewPageCount - 1));
+            outputTable.AutoScrollPosition = new Point(0, desiredOffset);
+            HideNativeOutputScrollbars();
+            UpdateHardwareMessageOverviewPageBar();
+            RefreshOutputScrollSurfaceOnly();
+        }
+
+        private void EnsureHardwareMessageOverviewPageBar()
+        {
+            if (hardwareMessageOverviewPageBar != null &&
+                !hardwareMessageOverviewPageBar.IsDisposed)
+            {
+                return;
+            }
+
+            // The hardware overview scrolls through logical LSK pages, never
+            // through a scrollable message list. Use a small page counter in
+            // the header instead of a misleading vertical scroll bar.
+            hardwareMessageOverviewPageBar = new Panel
+            {
+                BackColor = Color.Transparent,
+                BorderStyle = BorderStyle.None,
+                Visible = false,
+                Cursor = Cursors.Hand,
+                TabStop = false
+            };
+
+            hardwareMessageOverviewPageBar.Paint += (_, e) =>
+            {
+                bool a220 = DcduStyleManager.IsA220;
+                int pageCount = a220 ? a220OverviewPageCount :
+                    hardwareMessageOverviewPageCount;
+                int pageIndex = a220 ? a220OverviewPageIndex :
+                    hardwareMessageOverviewPageIndex;
+                if (pageCount <= 1)
+                {
+                    return;
+                }
+
+                string pageText = "< " +
+                    (pageIndex + 1).ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                    "/" +
+                    pageCount.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                    " >";
+
+                // The counter must stay compact independently of the
+                // user-selectable message font size (including EXTRA LARGE).
+                using Font counterFont = CreateDpiStablePointFont(
+                    "Consolas", 9.5f, FontStyle.Bold);
+                TextRenderer.DrawText(
+                    e.Graphics,
+                    pageText,
+                    counterFont,
+                    hardwareMessageOverviewPageBar.ClientRectangle,
+                    a220 ? DcduTheme.Cyan : DcduTheme.Amber,
+                    TextFormatFlags.HorizontalCenter |
+                    TextFormatFlags.VerticalCenter |
+                    TextFormatFlags.SingleLine |
+                    TextFormatFlags.NoPrefix |
+                    TextFormatFlags.EndEllipsis |
+                    TextFormatFlags.NoPadding);
+            };
+
+            hardwareMessageOverviewPageBar.MouseDown += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                int half = hardwareMessageOverviewPageBar.ClientSize.Width / 2;
+                if (DcduStyleManager.IsA220)
+                    ChangeA220OverviewPage(e.X < half ? -1 : 1);
+                else
+                    ChangeHardwareMessageOverviewPage(e.X < half ? -1 : 1);
+            };
+
+            hardwareMessageOverviewPageBar.MouseWheel += (_, e) =>
+            {
+                if (DcduStyleManager.IsA220)
+                    ChangeA220OverviewPage(e.Delta > 0 ? -1 : 1);
+                else if (hardwareMessageOverviewPageCount > 1)
+                    ChangeHardwareMessageOverviewPage(e.Delta > 0 ? -1 : 1);
+            };
+
+            screenPanel?.Controls.Add(hardwareMessageOverviewPageBar);
+        }
+
+        private void UpdateHardwareMessageOverviewPageBar()
+        {
+            EnsureHardwareMessageOverviewPageBar();
+
+            if (hardwareMessageOverviewPageBar == null ||
+                hardwareMessageOverviewPageBar.IsDisposed)
+            {
+                return;
+            }
+
+            CalculateA220OverviewPages();
+            bool show =
+                (DcduStyleManager.IsA220
+                    ? a220OverviewPageCount > 1 &&
+                      embeddedSetupPage == EmbeddedSetupPage.None &&
+                      airbusAocPage == AirbusAocPage.None &&
+                      boeingTelexPage == BoeingTelexPage.None
+                    : ShouldUseMessageOverviewLskMode() &&
+                      IsHardwareLskMessageOverviewActive() &&
+                      hardwareMessageOverviewPageCount > 1) &&
+                outputTable.Visible &&
+                outputTable.Enabled &&
+                (messageFormatPanel == null ||
+                 messageFormatPanel.IsDisposed ||
+                 !messageFormatPanel.Visible);
+
+            if (!show)
+            {
+                hardwareMessageOverviewPageBar.Visible = false;
+                return;
+            }
+
+            if (!ReferenceEquals(
+                    hardwareMessageOverviewPageBar.Parent,
+                    screenPanel))
+            {
+                hardwareMessageOverviewPageBar.Parent?.Controls.Remove(
+                    hardwareMessageOverviewPageBar);
+
+                screenPanel.Controls.Add(
+                    hardwareMessageOverviewPageBar);
+            }
+
+            // Keep the counter on the MESSAGES / DATA header, well away from
+            // the fixed-position LSK rows (both Boeing and Airbus).
+            int indicatorWidth = Math.Min(S(88),
+                Math.Max(S(44), screenPanel.ClientSize.Width - S(240)));
+            int indicatorX = Math.Max(
+                (messageFilterLabel?.Right ?? messageHeaderLabel.Right) + S(8),
+                screenPanel.ClientSize.Width - indicatorWidth - S(8));
+            indicatorX = Math.Max(0, Math.Min(
+                indicatorX,
+                screenPanel.ClientSize.Width - indicatorWidth - S(2)));
+
+            hardwareMessageOverviewPageBar.Bounds = new Rectangle(
+                indicatorX,
+                messageHeaderLabel.Top + S(1),
+                indicatorWidth,
+                Math.Max(S(20), messageHeaderLabel.Height));
+
+            hardwareMessageOverviewPageBar.Visible = true;
+            hardwareMessageOverviewPageBar.BringToFront();
+
+            smartStatusToolTip.SetToolTip(
+                hardwareMessageOverviewPageBar,
+                "MESSAGES PAGE " +
+                (DcduStyleManager.IsA220 ? a220OverviewPageIndex + 1 :
+                    hardwareMessageOverviewPageIndex + 1)
+                    .ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                "/" +
+                (DcduStyleManager.IsA220 ? a220OverviewPageCount :
+                    hardwareMessageOverviewPageCount)
+                    .ToString(
+                        System.Globalization.CultureInfo.InvariantCulture) +
+                (DcduStyleManager.IsA220 ? " - CLICK TO SCROLL" :
+                    " - CLICK TO CHANGE PAGE"));
+
+            hardwareMessageOverviewPageBar.Invalidate();
+        }
+
+        private void ChangeHardwareMessageOverviewPage(int delta)
+        {
+            if (!ShouldUseMessageOverviewLskMode() ||
+                delta == 0 ||
+                hardwareMessageOverviewPageCount <= 1)
+            {
+                return;
+            }
+
+            int next =
+                Math.Max(
+                    0,
+                    Math.Min(
+                        hardwareMessageOverviewPageCount - 1,
+                        hardwareMessageOverviewPageIndex + delta));
+
+            if (next == hardwareMessageOverviewPageIndex)
+            {
+                return;
+            }
+
+            hardwareMessageOverviewPageIndex = next;
+            ApplyMessageFilter();
+        }
+
+        private bool ShouldUseMessageOverviewLskMode()
+        {
+            return !DcduStyleManager.IsA220 &&
+                   MessageOverviewLskModeEnabled;
+        }
+
+        private void HideMessageOverviewNavigationChrome()
+        {
+            if (outputScrollBar != null && !outputScrollBar.IsDisposed)
+            {
+                outputScrollBar.Visible = false;
+                outputScrollBar.SendToBack();
+            }
+
+            if (hardwareMessageOverviewPageBar != null &&
+                !hardwareMessageOverviewPageBar.IsDisposed)
+            {
+                hardwareMessageOverviewPageBar.Visible = false;
+                hardwareMessageOverviewPageBar.SendToBack();
+            }
+        }
+
+        private bool IsHardwareLskMessageOverviewActive()
+        {
+            if (!ShouldUseMessageOverviewLskMode() ||
+                dcduFrame == null ||
+                dcduFrame.IsDisposed ||
+                outputTable == null ||
+                outputTable.IsDisposed ||
+                !outputTable.Visible ||
+                !outputTable.Enabled)
+            {
+                return false;
+            }
+
+            if (messageFormatPanel != null &&
+                !messageFormatPanel.IsDisposed &&
+                messageFormatPanel.Visible)
+            {
+                return false;
+            }
+
+            return airbusAocPage == AirbusAocPage.None &&
+                   boeingTelexPage == BoeingTelexPage.None &&
+                   embeddedSetupPage == EmbeddedSetupPage.None;
+        }
+
+        private int MessageOverviewFirstRightLskIndex()
+        {
+            return 3;
+        }
+
+        private int MessageOverviewLastRightLskIndex()
+        {
+            return DcduStyleManager.IsBoeing ? 6 : 5;
+        }
+
+        private int MessageOverviewFirstLeftLskIndex()
+        {
+            return 3;
+        }
+
+        private int MessageOverviewLastLeftLskIndex()
+        {
+            return DcduStyleManager.IsBoeing ? 6 : 5;
+        }
+
+        private Rectangle MessageOverviewLeftLskBounds(int index)
+        {
+            return DcduStyleManager.IsBoeing
+                ? BoeingTelexLeftLskBounds(index)
+                : AirbusAocLeftLskBounds(index);
+        }
+
+        private Rectangle MessageOverviewRightLskBounds(int index)
+        {
+            return DcduStyleManager.IsBoeing
+                ? BoeingTelexRightLskBounds(index)
+                : AirbusAocRightLskBounds(index);
+        }
+
+        private List<CPDLCMessage> GetVisibleHardwareOverviewMessages()
+        {
+            if (!IsHardwareLskMessageOverviewActive())
+            {
+                return new List<CPDLCMessage>();
+            }
+
+            // Hardware LSK mapping is logical, not visual: L3/R3 is slot 1,
+            // L4/R4 slot 2, L5/R5 slot 3 and Boeing L6/R6 slot 4.
+            return GetHardwareMessageOverviewPageList();
+        }
+
+        private CPDLCMessage GetHardwareOverviewMessageForRightLsk(
+            int index)
+        {
+            int first = MessageOverviewFirstRightLskIndex();
+            int last = MessageOverviewLastRightLskIndex();
+
+            if (index < first || index > last)
+            {
+                return null;
+            }
+
+            List<CPDLCMessage> messages =
+                GetVisibleHardwareOverviewMessages();
+
+            int slot = index - first;
+
+            return slot >= 0 && slot < messages.Count
+                ? messages[slot]
+                : null;
+        }
+
+        private CPDLCMessage GetHardwareOverviewMessageForLeftLsk(
+            int index)
+        {
+            int first = MessageOverviewFirstLeftLskIndex();
+            int last = MessageOverviewLastLeftLskIndex();
+
+            if (index < first || index > last)
+            {
+                return null;
+            }
+
+            List<CPDLCMessage> messages =
+                GetVisibleHardwareOverviewMessages();
+
+            int slot = index - first;
+
+            return slot >= 0 && slot < messages.Count
+                ? messages[slot]
+                : null;
+        }
+
+        private bool TryGetMessageOverviewLineSelect(
+            Point location,
+            out CPDLCMessage message)
+        {
+            message = null;
+
+            if (!IsHardwareLskMessageOverviewActive())
+            {
+                return false;
+            }
+
+            for (int index = MessageOverviewFirstLeftLskIndex();
+                 index <= MessageOverviewLastLeftLskIndex();
+                 index++)
+            {
+                if (MessageOverviewLeftLskBounds(index)
+                        .Contains(location))
+                {
+                    message =
+                        GetHardwareOverviewMessageForLeftLsk(index);
+
+                    return message != null;
+                }
+            }
+
+            for (int index = MessageOverviewFirstRightLskIndex();
+                 index <= MessageOverviewLastRightLskIndex();
+                 index++)
+            {
+                if (MessageOverviewRightLskBounds(index)
+                        .Contains(location))
+                {
+                    message =
+                        GetHardwareOverviewMessageForRightLsk(index);
+
+                    return message != null;
+                }
+            }
+
+            return false;
+        }
+
+        private bool IsMessageOverviewLineSelectHit(Point location)
+        {
+            return TryGetMessageOverviewLineSelect(
+                location,
+                out _);
+        }
+
+        private bool HandleMessageOverviewLineSelectClick(Point location)
+        {
+            if (!TryGetMessageOverviewLineSelect(
+                    location,
+                    out CPDLCMessage message))
+            {
+                return false;
+            }
+
+            HideAutoDeleteActionPopup();
+            HideManualDeleteConfirmPopup();
+
+            MessageClicked(
+                message,
+                new KeyEventArgs(Keys.Enter));
+
+            return true;
+        }
+
         private bool IsAirbusAocActive()
         {
             return !DcduStyleManager.IsBoeing && airbusAocPage != AirbusAocPage.None;
@@ -16146,6 +18876,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             HideQuickActionButtons();
             HideCpdlcLogonPopup();
             HidePdcQuickActionButton();
+            HideMessageOverviewNavigationChrome();
 
             SetAirbusAocChromeVisible(false);
             if (DcduStyleManager.IsA220)
@@ -17512,6 +20243,7 @@ private System.Windows.Forms.Label airbusAocSendLabel;
 
             ApplyMainScreenLayout(DcduStyleManager.IsBoeing);
             ApplyMainButtonLayout(DcduStyleManager.IsBoeing);
+            ApplyMessageFilter();
             SetAirbusAocChromeVisible(true);
             if (DcduStyleManager.IsA220)
             {
@@ -17601,9 +20333,70 @@ private System.Windows.Forms.Label airbusAocSendLabel;
             UpdateClearanceStatusLabel();
             RefreshVisibleMessageColors();
 
+            // IMPORTANT: the earlier ApplyMessageFilter ran while the main
+            // overview was hidden by Setup / message preview. WinForms can
+            // retain Visible=false on individual TimerLabel action children.
+            // Reapply the FULL state after the overview and its parents are
+            // visible, so LSK OFF immediately restores envelopes, brief/open
+            // icons and their click targets (without switching style).
+            if (outputTable != null && !outputTable.IsDisposed &&
+                outputTable.Visible && outputTable.Enabled)
+            {
+                ApplyMessageFilter();
+
+                if (!ShouldUseMessageOverviewLskMode())
+                {
+                    RestoreStandardOverviewActionIndicators();
+                    foreach (var pair in overviewMessageRowParts)
+                    {
+                        CPDLCMessage overviewMessage = pair.Key;
+                        TimerLabel actionLabel = pair.Value.Action;
+                        if (overviewMessage == null || overviewMessage.IsDisposed ||
+                            actionLabel == null || actionLabel.IsDisposed ||
+                            !ReferenceEquals(actionLabel.Parent, outputTable))
+                        {
+                            continue;
+                        }
+
+                        // Do not force disabled special-status actions enabled:
+                        // retry/status rows intentionally have no action icon.
+                        actionLabel.Visible = actionLabel.Enabled &&
+                            MessageMatchesFilter(overviewMessage,
+                                activeMessageFilter);
+                        actionLabel.Invalidate();
+                    }
+                }
+
+                outputTable.PerformLayout();
+            }
+
+            // Recompute visibility and restore the header counter *after* the
+            // standard controls have been brought forward. This path is used
+            // both when closing a message and when leaving a setup page.
+            UpdateHardwareMessageOverviewPageBar();
+            KeepMessageOverviewHeaderAboveList();
             screenPanel?.PerformLayout();
             screenPanel?.Invalidate(true);
             dcduFrame?.Invalidate(true);
+
+            if (IsHandleCreated && !IsDisposed && !Disposing)
+            {
+                BeginInvoke(new Action(() =>
+                {
+                    if (IsDisposed || outputTable == null ||
+                        outputTable.IsDisposed || !outputTable.Visible ||
+                        (messageFormatPanel != null && messageFormatPanel.Visible) ||
+                        embeddedSetupPage != EmbeddedSetupPage.None)
+                    {
+                        return;
+                    }
+                    // Refit after the final screen restoration and re-show
+                    // both message actions and time status indicators.
+                    ApplyMessageFilter();
+                    outputTable.PerformLayout();
+                    HideNativeOutputScrollbars();
+                }));
+            }
         }
 
 
@@ -17639,6 +20432,7 @@ airbusAocSendLabel = null;
             HideQuickActionButtons();
             HideCpdlcLogonPopup();
             HidePdcQuickActionButton();
+            HideMessageOverviewNavigationChrome();
 
             SetAirbusAocChromeVisible(false);
             if (DcduStyleManager.IsA220)
@@ -21888,24 +24682,24 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             {
                 if (!string.IsNullOrWhiteSpace(SimbriefID))
                 {
-                    using HttpClient wc = CreateShortTimeoutHttpClient();
-                    string simbriefJson = await wc.GetStringAsync($"https://www.simbrief.com/api/xml.fetcher.php?userid={Uri.EscapeDataString(SimbriefID)}&json=1");
-                    string simbriefNavlog = JObject.Parse(simbriefJson)["navlog"]?.ToString();
+                    Navlog latestSimbriefNavlog =
+                        await DownloadLatestSimbriefNavlogAsync(
+                            SimbriefID,
+                            "reload flight plan");
 
-                    if (!string.IsNullOrWhiteSpace(simbriefNavlog))
-                    {
-                        simbriefData = JsonConvert.DeserializeObject<Navlog>(simbriefNavlog);
-                        reportFixes = simbriefData?.fix?
-                            .Where(x => x.is_sid_star == "0" && !new string[] { "apt" }.Contains(x.type))
-                            .Select(x => x.ident)
-                            .ToArray();
-}
+                    ApplySimbriefNavlog(
+                        latestSimbriefNavlog);
+
+                    Logger.Debug(
+                        "Reload flight plan SimBrief data retrieved and parsed.");
                 }
             }
             catch (Exception ex)
             {
-                Logger.Warn(ex, "Reload flight plan SimBrief failed");
-}
+                Logger.Warn(
+                    ex,
+                    "Reload flight plan SimBrief failed");
+            }
 
             // RLD FP success is intentionally silent.
             // Errors and callsign mismatch warnings are still shown.
@@ -21959,6 +24753,7 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             if (isBoeing)
             {
                 // Boeing main layout scaled for the new 656x450 main window asset.
+                bool boeingUseLskOverviewMode = ShouldUseMessageOverviewLskMode();
                 if (outputTable.ColumnStyles.Count >= 3)
                 {
                     outputTable.ColumnStyles[0].SizeType = SizeType.Absolute;
@@ -21966,7 +24761,9 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                     outputTable.ColumnStyles[1].SizeType = SizeType.Percent;
                     outputTable.ColumnStyles[1].Width = 100F;
                     outputTable.ColumnStyles[2].SizeType = SizeType.Absolute;
-                    outputTable.ColumnStyles[2].Width = OpenMessageActionsIndicatorWidth();
+                    outputTable.ColumnStyles[2].Width = boeingUseLskOverviewMode
+                        ? 0F
+                        : OpenMessageActionsIndicatorWidth();
                 }
                 screenPanel.Location = SP(new Point(76, 34));
                 screenPanel.Size = SS(new Size(496, 282));
@@ -21994,31 +24791,56 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                     nextAtcUnitDisplay.Location = SP(new Point(435, 37));
                     nextAtcUnitDisplay.Size = SS(new Size(58, 19));
                 }
-                messageHeaderLabel.Location = SP(new Point(12, 116));
+                messageHeaderLabel.Location = boeingUseLskOverviewMode
+                    ? SP(new Point(12, 99))
+                    : SP(new Point(12, 116));
+                messageHeaderLabel.Size = SS(new Size(172, 20));
                 messageHeaderLabel.Text = "MESSAGES / DATA";
 
-                outputTable.Location = SP(new Point(16, 141));
-                outputTable.Size = SS(new Size(470, 125));
-                outputTable.Padding = SPad(new Padding(0, 4, 2, 4));
+                // Physical Boeing L3-L6 centres are spaced 41/42 px, not
+                // 39 px. Four 42 px rows plus the 10 px text inset align
+                // message baselines with those keys instead of drifting.
+                // The header is separately drawn above this transparent table.
+                outputTable.Location = boeingUseLskOverviewMode
+                    ? SP(new Point(16, 106))
+                    : SP(new Point(16, 141));
+                outputTable.Size = boeingUseLskOverviewMode
+                    ? SS(new Size(470, 168))
+                    : SS(new Size(470, 125));
+                outputTable.Padding = boeingUseLskOverviewMode
+                    ? SPad(new Padding(0, 0, 0, 0))
+                    : SPad(new Padding(0, 4, 2, 4));
                 outputTable.BackColor = Color.Transparent;
 
                 messageFormatPanel.Location = SP(new Point(16, 141));
                 messageFormatPanel.Size = SS(new Size(470, 125));
                 messageFormatPanel.BackColor = Color.Transparent;
 
-                SendingProgress.Location = SP(new Point(16, 271));
-                SendingProgress.Size = SS(new Size(470, 8));
+                SendingProgress.Location = boeingUseLskOverviewMode
+                    ? SP(new Point(16, 277))
+                    : SP(new Point(16, 271));
+                SendingProgress.Size = boeingUseLskOverviewMode
+                    ? SS(new Size(470, 3))
+                    : SS(new Size(470, 8));
 
-                outputScrollBar.Location = SP(new Point(486, 141));
-                outputScrollBar.Size = SS(new Size(12, 125));
+                outputScrollBar.Location = boeingUseLskOverviewMode
+                    ? SP(new Point(486, 106))
+                    : SP(new Point(486, 141));
+                outputScrollBar.Size = boeingUseLskOverviewMode
+                    ? SS(new Size(12, 168))
+                    : SS(new Size(12, 125));
+                ConfigureMessageOverviewScrollMode();
                 outputScrollBar.Target = outputTable;
                 outputScrollBar.Invalidate();
+                UpdateHardwareMessageOverviewPageBar();
                 UpdateMainFrameButtonHotspots(isBoeing);
                 ApplySmartWidgetLayout(isBoeing);
+                KeepMessageOverviewHeaderAboveList();
                 return;
             }
 
             // Airbus layout retuned to the new 700x350 frame artwork.
+            bool useLskOverviewMode = ShouldUseMessageOverviewLskMode();
             if (outputTable.ColumnStyles.Count >= 3)
             {
                 outputTable.ColumnStyles[0].SizeType = SizeType.Absolute;
@@ -22026,7 +24848,9 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                 outputTable.ColumnStyles[1].SizeType = SizeType.Percent;
                 outputTable.ColumnStyles[1].Width = 100F;
                 outputTable.ColumnStyles[2].SizeType = SizeType.Absolute;
-                outputTable.ColumnStyles[2].Width = OpenMessageActionsIndicatorWidth();
+                outputTable.ColumnStyles[2].Width = useLskOverviewMode
+                    ? 0F
+                    : OpenMessageActionsIndicatorWidth();
             }
             screenPanel.Location = SP(new Point(103, 38));
             screenPanel.Size = SS(new Size(493, 282));
@@ -22055,11 +24879,19 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                 nextAtcUnitDisplay.Size = SS(new Size(68, 18));
             }
             messageHeaderLabel.Location = SP(new Point(8, 100));
+            messageHeaderLabel.Size = SS(new Size(172, 20));
             messageHeaderLabel.Text = "MESSAGES / DATA";
 
-            outputTable.Location = SP(new Point(8, 124));
-            outputTable.Size = SS(new Size(476, 132));
-            outputTable.Padding = SPad(new Padding(0, 4, 2, 4));
+            // Airbus LSK3/4/5 frame centres are 166 / 208 / 250.
+            // screenPanel starts at y=38, therefore row centres are exactly
+            // 128 / 170 / 212 inside the screen.
+            outputTable.Location = useLskOverviewMode
+                ? SP(new Point(8, 109))
+                : SP(new Point(8, 124));
+            outputTable.Size = SS(new Size(476, 126));
+            outputTable.Padding = useLskOverviewMode
+                ? SPad(new Padding(0, 0, 0, 0))
+                : SPad(new Padding(0, 4, 2, 4));
             outputTable.BackColor = Color.Transparent;
 
             messageFormatPanel.Location = SP(new Point(8, 124));
@@ -22069,12 +24901,17 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             SendingProgress.Location = SP(new Point(8, 263));
             SendingProgress.Size = SS(new Size(476, 8));
 
-            outputScrollBar.Location = SP(new Point(486, 124));
-            outputScrollBar.Size = SS(new Size(8, 132));
+            outputScrollBar.Location = useLskOverviewMode
+                ? SP(new Point(486, 109))
+                : SP(new Point(486, 124));
+            outputScrollBar.Size = SS(new Size(8, 126));
+            ConfigureMessageOverviewScrollMode();
             outputScrollBar.Target = outputTable;
             outputScrollBar.Invalidate();
+            UpdateHardwareMessageOverviewPageBar();
             UpdateMainFrameButtonHotspots(isBoeing);
             ApplySmartWidgetLayout(isBoeing);
+            KeepMessageOverviewHeaderAboveList();
         }
 
         private void ApplyMainButtonLayout(bool isBoeing)
@@ -22641,6 +25478,8 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             outputTable.Size = SS(new Size(676, 221));
             outputTable.Padding = SPad(new Padding(4, 5, 4, 5));
             outputTable.BackColor = Color.Transparent;
+            outputTable.AutoScroll = true;
+            FitMessageOverviewColumns(false);
 
             messageFormatPanel.Location = SP(new Point(16, 146));
             messageFormatPanel.Size = SS(new Size(676, 221));
@@ -23353,9 +26192,8 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             {
                 if (outputTable != null && !outputTable.IsDisposed)
                 {
-                    int index = outputTable.Controls.GetChildIndex(message);
-                    if (index >= 0 && index + 1 < outputTable.Controls.Count &&
-                        outputTable.Controls[index + 1] is TimerLabel menuLabel)
+                    TimerLabel menuLabel = FindMenuLabelForMessage(message);
+                    if (menuLabel != null)
                     {
                         if (ShouldUseDeleteOnlyOverviewAction(message))
                         {
@@ -23495,6 +26333,11 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
                 return;
             }
 
+            if (HandleMessageOverviewLineSelectClick(e.Location))
+            {
+                return;
+            }
+
             if (HandleAirbusAocLineSelectClick(e.Location))
             {
                 return;
@@ -23565,7 +26408,11 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
         private Control GetDcduButtonAt(Point location)
         {
-            if (IsStyledMessagePreviewLineSelectHit(location) || IsAirbusAocLineSelectHit(location) || IsBoeingTelexLineSelectHit(location) || IsEmbeddedSetupLineSelectHit(location))
+            if (IsMessageOverviewLineSelectHit(location) ||
+                IsStyledMessagePreviewLineSelectHit(location) ||
+                IsAirbusAocLineSelectHit(location) ||
+                IsBoeingTelexLineSelectHit(location) ||
+                IsEmbeddedSetupLineSelectHit(location))
             {
                 return dcduFrame;
             }
@@ -23996,11 +26843,49 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
             outputTable.VerticalScroll.Visible = false;
             outputTable.AutoScroll = true;
             ConfigureTransparentScrollDoubleBuffer();
-            outputTable.Scroll += (scrollSender, scrollArgs) => { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); };
-            outputTable.ControlAdded += (controlSender, controlArgs) => { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); };
-            outputTable.ControlRemoved += (controlSender, controlArgs) => { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); };
+            outputTable.Scroll += (scrollSender, scrollArgs) =>
+            {
+                // WinForms' built-in scroll range may still include unused
+                // TableLayoutPanel row space. Restrict actual user scrolling
+                // to the last visible message, but NEVER intervene during
+                // startup or the deferred layout/scroll measurement.
+                if (standardOverviewExtentValid &&
+                    !stabilizingStandardOverviewScroll &&
+                    !ShouldUseMessageOverviewLskMode() &&
+                    scrollArgs.ScrollOrientation ==
+                        ScrollOrientation.VerticalScroll)
+                {
+                    scrollArgs.NewValue = Math.Max(0, Math.Min(
+                        scrollArgs.NewValue, standardOverviewMaximumOffset));
+                }
+                HideNativeOutputScrollbars();
+                RefreshOutputScrollSurfaceOnly();
+            };
+            outputTable.ControlAdded += (controlSender, controlArgs) =>
+            {
+                if (rebuildingOverviewRows) return;
+                if (controlArgs.Control != null)
+                {
+                    controlArgs.Control.MouseWheel -= HardwareMessageOverview_MouseWheel;
+                    controlArgs.Control.MouseWheel += HardwareMessageOverview_MouseWheel;
+                }
+                HideNativeOutputScrollbars();
+                RefreshOutputScrollSurfaceOnly();
+            };
+            foreach (Control control in outputTable.Controls)
+            {
+                control.MouseWheel -= HardwareMessageOverview_MouseWheel;
+                control.MouseWheel += HardwareMessageOverview_MouseWheel;
+            }
+            outputTable.ControlRemoved += (controlSender, controlArgs) => { if (!rebuildingOverviewRows) { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); } };
             outputTable.SizeChanged += (sizeSender, sizeArgs) => { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); };
-            outputTable.Layout += (layoutSender, layoutArgs) => { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); };
+            outputTable.Layout += (layoutSender, layoutArgs) => { if (!rebuildingOverviewRows) { HideNativeOutputScrollbars(); RefreshOutputScrollSurfaceOnly(); } };
+            outputTable.MouseWheel += HardwareMessageOverview_MouseWheel;
+
+            hardwareMessageOverviewBlinkTimer.Interval = 480;
+            hardwareMessageOverviewBlinkTimer.Tick +=
+                HardwareMessageOverviewBlinkTimer_Tick;
+
             HideNativeOutputScrollbars();
 
             CheckNewVersion();
@@ -24089,11 +26974,26 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
         private void HideNativeOutputScrollbars()
         {
-            if (outputTable == null || outputTable.IsDisposed)
+            if (outputTable == null || outputTable.IsDisposed ||
+                updatingOutputScrollbarVisibility || rebuildingOverviewRows ||
+                stabilizingStandardOverviewScroll)
             {
                 return;
             }
 
+            updatingOutputScrollbarVisibility = true;
+            try
+            {
+                HideNativeOutputScrollbarsCore();
+            }
+            finally
+            {
+                updatingOutputScrollbarVisibility = false;
+            }
+        }
+
+        private void HideNativeOutputScrollbarsCore()
+        {
             try
             {
                 if (outputTable.IsHandleCreated)
@@ -24108,12 +27008,53 @@ string oldCallsign = (callsign ?? string.Empty).Trim().ToUpperInvariant();
 
             if (outputScrollBar != null && !outputScrollBar.IsDisposed)
             {
-                bool hasScrollableContent = outputTable.DisplayRectangle.Height > outputTable.ClientSize.Height ||
-                    outputTable.Controls.Cast<Control>().Any(control => control.Visible && control.Bottom > outputTable.ClientSize.Height);
+                if (ShouldUseMessageOverviewLskMode() ||
+                    embeddedSetupPage != EmbeddedSetupPage.None ||
+                    airbusAocPage != AirbusAocPage.None ||
+                    boeingTelexPage != BoeingTelexPage.None ||
+                    (messageFormatPanel != null && messageFormatPanel.Visible))
+                {
+                    // Only the main standard overview may have the scrollbar.
+                    // Airbus/Boeing LSK overview mode uses logical 3-message
+                    // pages instead of a continuously scrolling list.
+                    outputScrollBar.Visible = false;
+                    UpdateHardwareMessageOverviewPageBar();
+                }
+                else
+                {
+                    bool mainOverviewVisible =
+                        embeddedSetupPage == EmbeddedSetupPage.None &&
+                        airbusAocPage == AirbusAocPage.None &&
+                        boeingTelexPage == BoeingTelexPage.None &&
+                        outputTable.Visible &&
+                        outputTable.Enabled &&
+                        (messageFormatPanel == null ||
+                         messageFormatPanel.IsDisposed ||
+                         !messageFormatPanel.Visible);
 
-                outputScrollBar.Visible = hasScrollableContent;
-                outputScrollBar.BringToFront();
-                outputScrollBar.Invalidate();
+                    // A cached WinForms DisplayRectangle can exceed the
+                    // visible messages by a whole blank page. The scrollbar
+                    // is driven by the measured last visible message only.
+                    bool hasScrollableContent = mainOverviewVisible &&
+                        standardOverviewExtentValid &&
+                        standardOverviewMaximumOffset > 0;
+
+                    if (DcduStyleManager.IsA220)
+                    {
+                        CalculateA220OverviewPages();
+                    }
+                    outputScrollBar.Visible = hasScrollableContent;
+
+                    // The A220 uses standard scrolling and gets a page
+                    // indicator as well, without introducing any LSK mode.
+                    UpdateHardwareMessageOverviewPageBar();
+
+                    if (hasScrollableContent)
+                    {
+                        outputScrollBar.BringToFront();
+                        outputScrollBar.Invalidate();
+                    }
+                }
             }
         }
 
@@ -25667,8 +28608,8 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
                     if (reply != "STANDBY")
                     {
                         message.acknowledged = true;
-                        int index = outputTable.Controls.GetChildIndex(message);
-                        if (index >= 0 && index + 1 < outputTable.Controls.Count && outputTable.Controls[index + 1] is TimerLabel timerLabel)
+                        TimerLabel timerLabel = FindMenuLabelForMessage(message);
+                        if (timerLabel != null)
                         {
                             timerLabel.CanFlash = false;
                             timerLabel.ForeColor = string.Equals(reply, "WILCO", StringComparison.OrdinalIgnoreCase)
@@ -25684,7 +28625,7 @@ private static ReleaseAsset FindUpdateZipAsset(Release release)
 
                         if (string.Equals(reply, "WILCO", StringComparison.OrdinalIgnoreCase))
                         {
-                            SetOriginalOverviewReplyStatus(message, index >= 0 && index + 1 < outputTable.Controls.Count ? outputTable.Controls[index + 1] as TimerLabel : null, "✓", DcduTheme.Green, true);
+                            SetOriginalOverviewReplyStatus(message, timerLabel, "✓", DcduTheme.Green, true);
                         }
                         else
                         {
@@ -27964,6 +30905,12 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             }
 
             _message.AutoSize = true;
+            if (DcduStyleManager.IsA220)
+            {
+                // Apply the width limit BEFORE this control is inserted into
+                // the table, avoiding even one oversized layout/scroll pass.
+                _message.MaximumSize = new Size(A220OverviewMessageMaxWidth(), 0);
+            }
             _message.BackColor = Color.Transparent;
             _message.ForeColor = MainPrimaryTextColor();
             _message.Font = GetMessageTextFont(false);
@@ -27983,36 +30930,45 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             _message.BorderStyle = BorderStyle.None;
             _message.TabStop = true;
             _message.TabIndex = 0;
-            _message.Margin = SPad(new Padding(0, 3, 0, 0));
+            _message.Margin = DcduStyleManager.IsA220
+                ? SPad(new Padding(0, 3, 0, 0))
+                : SPad(new Padding(0, 0, 0, 0));
 
             return _message;
         }
 
         private Control CreateOverviewTimeLabel(string timeText, CPDLCMessage message)
         {
-            if (MessageNeedsOverviewReplyIndicator(message?.type, message?.outbound ?? false, message?.header))
-            {
-                ReplyStatusTimeLabel label = new()
-                {
-                    AutoSize = false,
-                    Width = S(70),
-                    Height = S(18),
-                    BackColor = Color.Transparent,
-                    ForeColor = MainPrimaryTextColor(),
-                    Font = textFont,
-                    Text = timeText,
-                    TimeText = timeText,
-                    StatusMarker = "◷",
-                    StatusMarkerColor = DcduTheme.Amber,
-                    BorderStyle = BorderStyle.None,
-                    Margin = SPad(new Padding(5, 3, 0, 0)),
-                    TabStop = false
-                };
+            // All timestamps share the same renderer and baseline. Previously a
+            // reply-status timestamp used a manually drawn Label while other
+            // rows used AccessibleLabel (different vertical text metrics). The
+            // last reply row therefore looked lower even at identical margins.
+            bool showReplyMarker = MessageNeedsOverviewReplyIndicator(
+                message?.type, message?.outbound ?? false, message?.header);
 
-                return label;
+            // A220 has no LSK paging. Keep its existing classic timestamp
+            // controls untouched; only Airbus/Boeing need unified baselines.
+            if (DcduStyleManager.IsA220 && !showReplyMarker)
+            {
+                return CreateLabel(timeText);
             }
 
-            return CreateLabel(timeText);
+            return new ReplyStatusTimeLabel
+            {
+                AutoSize = false,
+                Width = S(65),
+                Height = S(18),
+                BackColor = Color.Transparent,
+                ForeColor = MainPrimaryTextColor(),
+                Font = textFont,
+                Text = timeText,
+                TimeText = timeText,
+                StatusMarker = showReplyMarker ? "◷" : string.Empty,
+                StatusMarkerColor = DcduTheme.Amber,
+                BorderStyle = BorderStyle.None,
+                Margin = SPad(new Padding(5, DcduStyleManager.IsA220 ? 3 : 0, 0, 0)),
+                TabStop = false
+            };
         }
 
         private ReplyStatusTimeLabel FindReplyStatusTimeLabelForMessage(CPDLCMessage message)
@@ -29262,9 +32218,8 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             {
                 try
                 {
-                    int index = outputTable.Controls.GetChildIndex(message);
-                    if (index >= 0 && index + 1 < outputTable.Controls.Count &&
-                        outputTable.Controls[index + 1] is TimerLabel menuLabel)
+                    TimerLabel menuLabel = FindMenuLabelForMessage(message);
+                    if (menuLabel != null)
                     {
                         if (ShouldUseDeleteOnlyOverviewAction(message))
                         {
@@ -29331,29 +32286,16 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                     StopVatsimRetryHourglassAnimation(message);
                     MarkMessageRead(message);
-                    TableLayoutPanelCellPosition pos = outputTable.GetPositionFromControl(message);
-                    int row = pos.Row;
-
-                    if (row < 0)
+                    overviewMessageRowParts.TryGetValue(message, out var ownedCells);
+                    overviewMessageRowParts.Remove(message);
+                    overviewMessageOrder.Remove(message);
+                    overviewRowsNeedRebuild = true;
+                    foreach (Control item in new Control[] { ownedCells.Time, message, ownedCells.Action })
                     {
-                        return;
-                    }
-
-                    List<Control> rowControls = outputTable.Controls
-                        .Cast<Control>()
-                        .Where(control => outputTable.GetPositionFromControl(control).Row == row)
-                        .ToList();
-
-                    foreach (Control control in rowControls)
-                    {
-                        outputTable.Controls.Remove(control);
-                        control.Dispose();
-                    }
-
-                    if (row < outputTable.RowStyles.Count)
-                    {
-                        outputTable.RowStyles[row].SizeType = SizeType.Absolute;
-                        outputTable.RowStyles[row].Height = 0F;
+                        if (item == null || item.IsDisposed) continue;
+                        if (ReferenceEquals(item.Parent, outputTable))
+                            outputTable.Controls.Remove(item);
+                        item.Dispose();
                     }
 
                     // Delete only this overview row. Do not call ClearPreview():
@@ -29414,7 +32356,20 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             HideManualDeleteConfirmPopup();
             HideAutoDeleteActionPopup();
             MarkMessageRead(control);
-            TableLayoutHelper.RemoveArbitraryRow(outputTable, outputTable.GetPositionFromControl(control).Row);
+            overviewMessageRowParts.TryGetValue(control, out var ownedCells);
+            overviewMessageRowParts.Remove(control);
+            overviewMessageOrder.Remove(control);
+            overviewRowsNeedRebuild = true;
+            // Only dispose this message's own cells. The generic table-row
+            // helper could displace adjacent rows during a hardware/normal
+            // mode transition and break their time/action correspondence.
+            foreach (Control item in new Control[] { ownedCells.Time, control, ownedCells.Action })
+            {
+                if (item == null || item.IsDisposed) continue;
+                if (ReferenceEquals(item.Parent, outputTable))
+                    outputTable.Controls.Remove(item);
+                item.Dispose();
+            }
             ClearPreview();
             ApplyMessageFilter();
             HideNativeOutputScrollbars();
@@ -29447,6 +32402,19 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             StopAllAutoDeleteRequestTimers();
             StopAllVatsimRetryHourglassAnimations();
             ClearUnreadMessages();
+            // Controls.Clear() cannot dispose indicators that are temporarily
+            // detached for hardware paging. Release them explicitly first.
+            foreach (var parts in overviewMessageRowParts.Values)
+            {
+                if (parts.Action != null && !parts.Action.IsDisposed &&
+                    parts.Action.Parent == null)
+                {
+                    parts.Action.Dispose();
+                }
+            }
+            overviewMessageRowParts.Clear();
+            overviewMessageOrder.Clear();
+            overviewRowsNeedRebuild = true;
             outputTable.Controls.Clear();
             UpdateMessageFilterLabel();
         }
@@ -30150,6 +33118,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             HideAtisAutoPopup();
             HideQuickWxPopup();
             HideQuickActionButtons();
+            HideMessageOverviewNavigationChrome();
 
             Control[] controlsToHide =
             {
@@ -30919,7 +33888,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             if (styledPreviewTotalPages > 1)
             {
                 int pageNavigationY = DcduStyleManager.IsBoeing
-                    ? Math.Max(36, separatorY - 24)
+                    ? Math.Max(36, separatorY - 36)
                     : Math.Max(36, separatorY - 30);
 
                 AddStyledPreviewPageNavigation(
@@ -30941,47 +33910,39 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
         private void MessageClicked(object sender, EventArgs e)
         {
             RecordUiDiagnosticActivity("Open message preview");
-
-            if (sender is not System.Windows.Forms.Label clickedLabel || outputTable == null)
+            if (outputTable == null || outputTable.IsDisposed ||
+                sender is not Control clickedControl)
             {
                 return;
             }
 
-            int messageIndex = outputTable.Controls.GetChildIndex(clickedLabel) - 1;
-            try
+            // Keyboard activation requires Enter/Space. Mouse/menu activation
+            // carries EventArgs (or MouseEventArgs) and is accepted directly.
+            if (e is KeyEventArgs keyEvent &&
+                keyEvent.KeyCode != Keys.Enter &&
+                keyEvent.KeyCode != Keys.Space)
             {
-                KeyEventArgs kE = (KeyEventArgs)e;
-                if (kE.KeyCode == Keys.Enter || kE.KeyCode == Keys.Space)
-                {
-                    messageIndex++;
-                    throw new Exception();
-                }
-                else
-                {
-                    return;
-                }
+                return;
             }
-            catch
+
+            TableLayoutPanelCellPosition position =
+                outputTable.GetPositionFromControl(clickedControl);
+            if (position.Row < 0 ||
+                outputTable.GetControlFromPosition(1, position.Row)
+                    is not CPDLCMessage _sender ||
+                _sender.IsDisposed)
             {
-                if (messageIndex < 0 || messageIndex >= outputTable.Controls.Count)
-                {
-                    return;
-                }
+                return;
+            }
 
-                if (outputTable.Controls[messageIndex] is not CPDLCMessage _sender)
-                {
-                    return;
-                }
-
-                // Opening a message permanently cancels its current auto-delete
-                // countdown. It is not restarted when the preview is closed.
-                StopAutoDeleteRequestMessage(_sender, true);
-                previewMessage = _sender;
-                styledPreviewPagedMessage = _sender;
-                styledPreviewPageIndex = 0;
-                styledPreviewTotalPages = 1;
-                MarkMessageRead(_sender);
-                System.Windows.Forms.Label _timeStamp = (System.Windows.Forms.Label)outputTable.Controls[messageIndex - 1];
+            // Opening a message permanently cancels its current auto-delete
+            // countdown. It is not restarted when the preview is closed.
+            StopAutoDeleteRequestMessage(_sender, true);
+            previewMessage = _sender;
+            styledPreviewPagedMessage = _sender;
+            styledPreviewPageIndex = 0;
+            styledPreviewTotalPages = 1;
+            MarkMessageRead(_sender);
                 List<System.Windows.Forms.Label> responses = new();
 
 
@@ -31080,7 +34041,6 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 }
 
                 ShowStyledMessagePreview(_sender, responses);
-            }
         }
         private Task ADSCParser(string _response, string _sender)
         {
@@ -31579,26 +34539,29 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private TimerLabel FindMenuLabelForMessage(CPDLCMessage message)
         {
-            try
+            if (message == null || message.IsDisposed ||
+                outputTable == null || outputTable.IsDisposed)
             {
-                if (message == null || outputTable == null || outputTable.IsDisposed)
-                {
-                    return null;
-                }
-
-                int index = outputTable.Controls.GetChildIndex(message);
-                if (index >= 0 &&
-                    index + 1 < outputTable.Controls.Count &&
-                    outputTable.Controls[index + 1] is TimerLabel menuLabel)
-                {
-                    return menuLabel;
-                }
-            }
-            catch
-            {
-                // Cosmetic lookup only.
+                return null;
             }
 
+            // A message owns this indicator. The Controls collection order is
+            // NOT a row index and changes after Controls.Clear/Add.
+            if (overviewMessageRowParts.TryGetValue(message, out var parts) &&
+                parts.Action != null && !parts.Action.IsDisposed)
+            {
+                return parts.Action;
+            }
+
+            // Backwards compatibility with pre-existing rows added elsewhere.
+            TableLayoutPanelCellPosition position =
+                outputTable.GetPositionFromControl(message);
+            if (position.Row >= 0 &&
+                outputTable.GetControlFromPosition(1, position.Row) == message)
+            {
+                return outputTable.GetControlFromPosition(2, position.Row)
+                    as TimerLabel;
+            }
             return null;
         }
 
@@ -32053,6 +35016,26 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 MessageClicked(sender, e);
             };
             message.KeyDown += MessageClicked;
+            message.MouseClick += (_, e) =>
+            {
+                if (e.Button != MouseButtons.Left)
+                {
+                    return;
+                }
+
+                if (!DcduStyleManager.IsA220 &&
+                    ShouldUseMessageOverviewLskMode())
+                {
+                    return;
+                }
+
+                HideAutoDeleteActionPopup();
+                HideManualDeleteConfirmPopup();
+
+                MessageClicked(
+                    message,
+                    new KeyEventArgs(Keys.Enter));
+            };
 
             SafeUi(() =>
             {
@@ -32061,19 +35044,33 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return;
                 }
 
-                // Newest messages are always shown at the top of the overview.
-                // Insert a real table row at index 0 so all existing message rows
-                // move down together and keep their time/message/action pairing.
-                TableLayoutHelper.InsertArbitraryRow(outputTable, 0);
-                outputTable.Controls.Add(CreateOverviewTimeLabel(DateTime.Now.ToString("HH:mm"), message), 0, 0);
-                outputTable.Controls.Add(message, 1, 0);
-                outputTable.Controls.Add(menuLabel, 2, 0);
+                // Rebuild the complete three-cell row as a unit instead of
+                // inserting cells into an occupied TableLayoutPanel row.
+                Control timestamp = CreateOverviewTimeLabel(
+                    DateTime.Now.ToString("HH:mm"), message);
+                overviewMessageOrder.Remove(message);
+                overviewMessageOrder.Insert(0, message);
+                overviewMessageRowParts[message] = (timestamp, menuLabel);
+                // Attach the new triple in an unused row before normalization.
+                // Parent == outputTable is also required by the existing reply
+                // and delete handlers while a new message is being inserted.
+                int appendRow = outputTable.RowCount;
+                outputTable.RowCount = appendRow + 1;
+                outputTable.Controls.Add(timestamp, 0, appendRow);
+                outputTable.Controls.Add(message, 1, appendRow);
+                outputTable.Controls.Add(menuLabel, 2, appendRow);
+                overviewRowsNeedRebuild = true;
                 MarkMessageUnread(message, menuLabel);
                 StartAutoDeleteRequestMessageIfNeeded(message, menuLabel);
+                ResetHardwareMessageOverviewPage();
                 ApplyMessageFilter();
-                if (message.Visible)
+                if (message.Visible && !ShouldUseMessageOverviewLskMode() &&
+                    outputTable.AutoScroll)
                 {
-                    outputTable.ScrollControlIntoView(message);
+                    // New messages are at row zero. ScrollControlIntoView
+                    // additionally scrolls HORIZONTALLY to a long label and
+                    // breaks the alignment of time and action columns.
+                    outputTable.AutoScrollPosition = Point.Empty;
                 }
                 HideNativeOutputScrollbars();
             });
@@ -32111,6 +35108,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             try
             {
                 unreadReminderTimer?.Stop();
+                hardwareMessageOverviewBlinkTimer?.Stop();
                 vatsimOnlineTimer?.Stop();
                 uiThreadWatchdogTimer?.Stop();
                 uiThreadBackgroundWatchdogTimer?.Dispose();
@@ -32290,49 +35288,38 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
                 response += "LOGON SUCCESSFUL.";
 
-                try
+                if (string.IsNullOrWhiteSpace(SimbriefID))
                 {
-
-                    using HttpClient wc = CreateShortTimeoutHttpClient();
-
-                    // Never block the WinForms message pump while SimBrief is
-                    // responding. The request may still take up to the configured
-                    // HTTP timeout, but the EasyCPDLC window remains responsive.
-                    RecordUiDiagnosticActivity("SimBrief flight-plan download");
-                    Stopwatch simbriefStopwatch = Stopwatch.StartNew();
-
-                    string simbriefJson = await wc.GetStringAsync(
-                        $"https://www.simbrief.com/api/xml.fetcher.php?userid={Uri.EscapeDataString(SimbriefID)}&json=1");
-
-                    LogAsyncOperationDuration(
-                        "SimBrief flight-plan download",
-                        simbriefStopwatch);
-
-                    string simbriefNavlog = JObject.Parse(simbriefJson)["navlog"]?.ToString();
-                    if (string.IsNullOrWhiteSpace(simbriefNavlog))
-                    {
-                        throw new JsonException("SimBrief response did not contain a navlog.");
-                    }
-
-                    simbriefData = JsonConvert.DeserializeObject<Navlog>(simbriefNavlog);
-                    if (simbriefData?.fix == null)
-                    {
-                        throw new JsonException("SimBrief navlog did not contain route fixes.");
-                    }
-
-                    Logger.Debug("Simbrief Data Retrieved and Parsed");
-
-                    reportFixes = simbriefData.fix
-                        .Where(x => x.is_sid_star == "0" && !new string[] { "apt" }.Contains(x.type))
-                        .Select(x => x.ident)
-                        .ToArray();
-                    UpdateFlightPhaseBadge();
-                    response += " SIMBRIEF OK,";
+                    response += " SIMBRIEF SKIPPED: NO PILOT ID,";
                 }
-
-                catch
+                else
                 {
-                    response += "SIMBRIEF ERROR,";
+                    try
+                    {
+                        Navlog latestSimbriefNavlog =
+                            await DownloadLatestSimbriefNavlogAsync(
+                                SimbriefID,
+                                "initial connection");
+
+                        ApplySimbriefNavlog(
+                            latestSimbriefNavlog);
+
+                        Logger.Debug(
+                            "SimBrief data retrieved and parsed using JSON v2.");
+
+                        response += " SIMBRIEF OK,";
+                    }
+                    catch (Exception ex)
+                    {
+                        Logger.Warn(
+                            ex,
+                            "Initial SimBrief download failed");
+
+                        response +=
+                            " SIMBRIEF ERROR: " +
+                            FormatSimbriefUserFacingError(ex) +
+                            ",";
+                    }
                 }
 
                 if (UseFSUIPC)
@@ -32667,23 +35654,14 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     return !rightSide && index == bottom;
 
                 case EmbeddedSetupPage.Options:
-                    if (!rightSide)
-                    {
-                        return index == bottom;
-                    }
-
-                    if (index == 1 || index == 2)
-                    {
-                        return true;
-                    }
-
-                    if (AutoDeleteRequestMessages)
-                    {
-                        int textSizeRow = DcduStyleManager.IsBoeing ? 5 : bottom;
-                        return index == 3 || index == 4 || index == textSizeRow;
-                    }
-
-                    return index == 3 || index == 4;
+                    // A single options screen: three independent settings on
+                    // each side, with a permanent BACK key on the bottom left.
+                    // A220 has its own touch UI and never enters this LSK map.
+                    return rightSide
+                        ? index >= 1 && index <= 3
+                        : index == 1 || index == 3 ||
+                          (index == 2 && AutoDeleteRequestMessages) ||
+                          index == bottom;
 
                 case EmbeddedSetupPage.AutoDeleteTimer:
                     return (index >= 1 && index <= 4) || (!rightSide && index == bottom);
@@ -32751,44 +35729,29 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                     {
                         ShowEmbeddedSetupMainMenu();
                     }
-                    else if (rightSide && index == 1)
+                    else if (!rightSide && index == 1)
                     {
                         ToggleEmbeddedSetupPlaySound();
                     }
-                    else if (rightSide && index == 2)
+                    else if (rightSide && index == 1)
                     {
                         ToggleEmbeddedSetupAutoDelete();
                     }
-                    else if (rightSide)
+                    else if (!rightSide && index == 2 && AutoDeleteRequestMessages)
                     {
-                        if (AutoDeleteRequestMessages)
-                        {
-                            int textSizeRow = DcduStyleManager.IsBoeing ? 5 : bottom;
-
-                            if (index == 3)
-                            {
-                                CycleEmbeddedSetupAutoDeleteSeconds();
-                            }
-                            else if (index == 4)
-                            {
-                                ToggleEmbeddedSetupFsuipc();
-                            }
-                            else if (index == textSizeRow)
-                            {
-                                CycleEmbeddedSetupMessageTextSize();
-                            }
-                        }
-                        else
-                        {
-                            if (index == 3)
-                            {
-                                ToggleEmbeddedSetupFsuipc();
-                            }
-                            else if (index == 4)
-                            {
-                                CycleEmbeddedSetupMessageTextSize();
-                            }
-                        }
+                        CycleEmbeddedSetupAutoDeleteSeconds();
+                    }
+                    else if (rightSide && index == 2)
+                    {
+                        ToggleEmbeddedSetupFsuipc();
+                    }
+                    else if (!rightSide && index == 3)
+                    {
+                        ToggleEmbeddedSetupMessageOverviewLskMode();
+                    }
+                    else if (rightSide && index == 3)
+                    {
+                        CycleEmbeddedSetupMessageTextSize();
                     }
                     break;
 
@@ -32873,6 +35836,7 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             HideQuickActionButtons();
             HideCpdlcLogonPopup();
             HidePdcQuickActionButton();
+            HideMessageOverviewNavigationChrome();
 
             SetAirbusAocChromeVisible(false);
             messageFormatPanel.SuspendLayout();
@@ -33448,6 +36412,827 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             }
         }
 
+        private sealed class UiTransitionSnapshotWindow : Form
+        {
+            private const int WsExToolWindow = 0x00000080;
+            private const int WsExNoActivate = 0x08000000;
+            private readonly Stopwatch aircraftClock = new();
+            private System.Windows.Forms.Timer aircraftTimer;
+            private const int AircraftFlightDurationMs = 900;
+            public Rectangle AnimationCardBounds { get; set; }
+
+            public UiTransitionSnapshotWindow()
+            {
+                SetStyle(ControlStyles.AllPaintingInWmPaint |
+                         ControlStyles.OptimizedDoubleBuffer |
+                         ControlStyles.UserPaint, true);
+            }
+
+            public void StartAircraftAnimation()
+            {
+                StopAircraftAnimation();
+                aircraftClock.Restart();
+                aircraftTimer = new System.Windows.Forms.Timer { Interval = 33 };
+                aircraftTimer.Tick += (_, __) =>
+                {
+                    if (IsDisposed || aircraftClock.ElapsedMilliseconds >=
+                        AircraftFlightDurationMs)
+                    {
+                        StopAircraftAnimation();
+                        return;
+                    }
+                    Invalidate();
+                };
+                aircraftTimer.Start();
+                Invalidate();
+            }
+
+            public void StopAircraftAnimation()
+            {
+                aircraftClock.Stop();
+                if (aircraftTimer != null)
+                {
+                    aircraftTimer.Stop();
+                    aircraftTimer.Dispose();
+                    aircraftTimer = null;
+                }
+            }
+
+            protected override void OnPaint(PaintEventArgs e)
+            {
+                base.OnPaint(e);
+                if (!aircraftClock.IsRunning)
+                {
+                    return;
+                }
+
+                // Animate strictly inside the SAME status card that was
+                // captured. The overlay may be taller than the old style
+                // during a style switch: Height/2 was the source of the
+                // aircraft occasionally flying far below the card.
+                Rectangle card = AnimationCardBounds;
+                if (card.Width < 80 || card.Height < 50)
+                {
+                    return;
+                }
+                double linear = Math.Min(1.0,
+                    aircraftClock.Elapsed.TotalMilliseconds /
+                    AircraftFlightDurationMs);
+                // A subtle smooth departure and arrival.
+                double phase = linear * linear * (3.0 - 2.0 * linear);
+                float y = card.Bottom - MainForm.ScaleUi(17);
+                float right = card.Right - MainForm.ScaleUi(22);
+                float left = card.Left + MainForm.ScaleUi(22);
+                float x = right - (float)phase * (right - left);
+
+                var oldMode = e.Graphics.SmoothingMode;
+                e.Graphics.SmoothingMode = SmoothingMode.AntiAlias;
+                using (Pen trail = new Pen(
+                    Color.FromArgb(130, 54, 202, 232), 1.5f))
+                {
+                    e.Graphics.DrawLine(trail, x + 18f, y, right, y);
+                }
+
+                // Top-down airplane silhouette: nose at left, wing swept back.
+                PointF[] outline =
+                {
+                    new(x - 14f, y), new(x - 2f, y - 2f),
+                    new(x + 4f, y - 11f), new(x + 8f, y - 11f),
+                    new(x + 7f, y - 2f), new(x + 13f, y - 2f),
+                    new(x + 17f, y - 6f), new(x + 19f, y - 6f),
+                    new(x + 17f, y), new(x + 19f, y + 6f),
+                    new(x + 17f, y + 6f), new(x + 13f, y + 2f),
+                    new(x + 7f, y + 2f), new(x + 8f, y + 11f),
+                    new(x + 4f, y + 11f), new(x - 2f, y + 2f)
+                };
+                using (SolidBrush glow = new SolidBrush(
+                    Color.FromArgb(36, 85, 230, 255)))
+                using (SolidBrush fill = new SolidBrush(
+                    Color.FromArgb(240, 120, 246, 255)))
+                using (Pen border = new Pen(
+                    Color.FromArgb(238, 5, 40, 54), 1f))
+                using (Pen highlight = new Pen(
+                    Color.FromArgb(155, Color.White), 1f))
+                {
+                    e.Graphics.FillEllipse(glow, x - 19, y - 16, 42, 32);
+                    e.Graphics.FillPolygon(fill, outline);
+                    e.Graphics.DrawPolygon(border, outline);
+                    e.Graphics.DrawLine(highlight, x - 9, y - 1, x + 10, y - 1);
+                }
+                e.Graphics.SmoothingMode = oldMode;
+            }
+
+            protected override void OnFormClosed(FormClosedEventArgs e)
+            {
+                StopAircraftAnimation();
+                base.OnFormClosed(e);
+            }
+
+            protected override bool ShowWithoutActivation => true;
+
+            protected override CreateParams CreateParams
+            {
+                get
+                {
+                    CreateParams cp = base.CreateParams;
+                    cp.ExStyle |= WsExToolWindow | WsExNoActivate;
+                    return cp;
+                }
+            }
+        }
+
+        private Size GetDcduBaseLogicalWindowSize(string style)
+        {
+            if (string.Equals(
+                    style,
+                    DcduStyleManager.A220,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return new Size(760, 485);
+            }
+
+            if (string.Equals(
+                    style,
+                    DcduStyleManager.Boeing,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                return new Size(660, 450);
+            }
+
+            return new Size(700, 350);
+        }
+
+        private Size GetDcduTransitionTargetWindowSize(
+            string style,
+            int userScalePercent)
+        {
+            Size logical =
+                GetDcduBaseLogicalWindowSize(style);
+
+            int normalizedPercent =
+                NormalizeWindowScalePercent(
+                    userScalePercent.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
+
+            float factor =
+                automaticResolutionScaleFactor *
+                Math.Max(
+                    1.0f,
+                    Math.Min(
+                        1.20f,
+                        normalizedPercent / 100.0f));
+
+            return new Size(
+                Math.Max(
+                    1,
+                    (int)Math.Round(
+                        logical.Width * factor,
+                        MidpointRounding.AwayFromZero)),
+                Math.Max(
+                    1,
+                    (int)Math.Round(
+                        logical.Height * factor,
+                        MidpointRounding.AwayFromZero)));
+        }
+
+        private Bitmap CaptureUiTransitionSnapshot(
+            Size coverageSize,
+            string title,
+            string detail)
+        {
+            int coverageWidth =
+                Math.Max(1, coverageSize.Width);
+            int coverageHeight =
+                Math.Max(1, coverageSize.Height);
+
+            Bitmap canvas =
+                new Bitmap(
+                    coverageWidth,
+                    coverageHeight,
+                    System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+
+            using Graphics graphics =
+                Graphics.FromImage(canvas);
+
+            // Capture the complete area the transition window will cover, not
+            // only the current EasyCPDLC bounds. If the target style is larger,
+            // the reserve area therefore shows the real desktop/window content
+            // that was already behind EasyCPDLC instead of an artificial dark
+            // rectangle.
+            bool captured = false;
+
+            try
+            {
+                graphics.CopyFromScreen(
+                    Location,
+                    Point.Empty,
+                    new Size(
+                        coverageWidth,
+                        coverageHeight),
+                    CopyPixelOperation.SourceCopy);
+
+                captured = true;
+            }
+            catch
+            {
+                // Fall back to a neutral canvas plus DrawToBitmap if screen
+                // capture is unavailable.
+                graphics.Clear(
+                    BackColor);
+            }
+
+            int currentWidth =
+                Math.Max(
+                    1,
+                    Math.Min(
+                        Width,
+                        coverageWidth));
+
+            int currentHeight =
+                Math.Max(
+                    1,
+                    Math.Min(
+                        Height,
+                        coverageHeight));
+
+            if (!captured)
+            {
+                try
+                {
+                    using Bitmap currentFrame =
+                        new Bitmap(
+                            Math.Max(1, Width),
+                            Math.Max(1, Height),
+                            System.Drawing.Imaging.PixelFormat.Format32bppPArgb);
+
+                    DrawToBitmap(
+                        currentFrame,
+                        new Rectangle(
+                            Point.Empty,
+                            currentFrame.Size));
+
+                    graphics.DrawImageUnscaled(
+                        currentFrame,
+                        0,
+                        0);
+                }
+                catch
+                {
+                    // Cosmetic transition only. The neutral form background
+                    // still prevents half-built controls from becoming visible.
+                }
+            }
+
+            int cardWidth = Math.Min(
+                Math.Max(250, S(284)),
+                Math.Max(180, currentWidth - Math.Max(24, S(40))));
+
+            int cardHeight = Math.Min(
+                Math.Max(96, S(104)),
+                Math.Max(86, currentHeight - Math.Max(20, S(30))));
+
+            int cardX =
+                Math.Max(
+                    0,
+                    (currentWidth - cardWidth) / 2);
+
+            int cardY =
+                Math.Max(
+                    0,
+                    (currentHeight - cardHeight) / 2);
+
+            Rectangle card =
+                new Rectangle(
+                    cardX,
+                    cardY,
+                    cardWidth,
+                    cardHeight);
+
+            using SolidBrush cardBrush =
+                new SolidBrush(
+                    Color.FromArgb(236, 5, 12, 20));
+
+            using Pen borderPen =
+                new Pen(
+                    Color.FromArgb(205, DcduTheme.Cyan),
+                    Math.Max(1.0f, SF(1.0f)));
+
+            graphics.FillRectangle(
+                cardBrush,
+                card);
+
+            Rectangle cardBorder = card;
+            cardBorder.Width =
+                Math.Max(1, cardBorder.Width - 1);
+            cardBorder.Height =
+                Math.Max(1, cardBorder.Height - 1);
+
+            graphics.DrawRectangle(
+                borderPen,
+                cardBorder);
+
+            using Font titleFont =
+                CreateDpiStablePointFont(
+                    "Consolas",
+                    10.5f,
+                    FontStyle.Bold);
+
+            using Font detailFont =
+                CreateDpiStablePointFont(
+                    "Consolas",
+                    8.2f,
+                    FontStyle.Bold);
+
+            using SolidBrush titleBrush =
+                new SolidBrush(DcduTheme.Cyan);
+
+            using SolidBrush detailBrush =
+                new SolidBrush(MainPrimaryTextColor());
+
+            StringFormat centered =
+                new StringFormat
+                {
+                    Alignment =
+                        StringAlignment.Center,
+                    LineAlignment =
+                        StringAlignment.Center
+                };
+
+            string cleanTitle =
+                string.IsNullOrWhiteSpace(title)
+                    ? "LOADING..."
+                    : title.Trim().ToUpperInvariant();
+
+            string cleanDetail =
+                string.IsNullOrWhiteSpace(detail)
+                    ? "PLEASE WAIT"
+                    : detail.Trim().ToUpperInvariant();
+
+            RectangleF titleRect =
+                new RectangleF(
+                    card.Left + 8,
+                    card.Top + 8,
+                    Math.Max(1, card.Width - 16),
+                    Math.Max(18, card.Height * 0.29f));
+
+            RectangleF detailRect =
+                new RectangleF(
+                    card.Left + 8,
+                    titleRect.Bottom,
+                    Math.Max(1, card.Width - 16),
+                    Math.Max(15, card.Height * 0.20f));
+
+            graphics.DrawString(
+                cleanTitle,
+                titleFont,
+                titleBrush,
+                titleRect,
+                centered);
+
+            graphics.DrawString(
+                cleanDetail,
+                detailFont,
+                detailBrush,
+                detailRect,
+                centered);
+
+            // No old progress bar. Only the aircraft and fading contrail
+            // communicate the short transition delay.
+
+            centered.Dispose();
+
+            return canvas;
+        }
+
+        private Rectangle GetTransitionAnimationCardBounds(Size coverageSize)
+        {
+            // CaptureUiTransitionSnapshot centers the status card on the
+            // current (not target) form dimensions, both measured in the
+            // shared top-left coordinate system of the snapshot window.
+            int currentWidth = Math.Max(1, Math.Min(Width, coverageSize.Width));
+            int currentHeight = Math.Max(1, Math.Min(Height, coverageSize.Height));
+            int cardWidth = Math.Min(
+                Math.Max(250, S(284)),
+                Math.Max(180, currentWidth - Math.Max(24, S(40))));
+            int cardHeight = Math.Min(
+                Math.Max(96, S(104)),
+                Math.Max(86, currentHeight - Math.Max(20, S(30))));
+            return new Rectangle(
+                Math.Max(0, (currentWidth - cardWidth) / 2),
+                Math.Max(0, (currentHeight - cardHeight) / 2),
+                cardWidth, cardHeight);
+        }
+
+        private UiTransitionSnapshotWindow ShowUiTransitionSnapshotWindow(
+            string title,
+            string detail,
+            Size targetWindowSize)
+        {
+            Size currentSize =
+                new Size(
+                    Math.Max(1, Width),
+                    Math.Max(1, Height));
+
+            Size coverageSize =
+                new Size(
+                    Math.Max(
+                        currentSize.Width,
+                        Math.Max(1, targetWindowSize.Width)),
+                    Math.Max(
+                        currentSize.Height,
+                        Math.Max(1, targetWindowSize.Height)));
+
+            Bitmap snapshot =
+                CaptureUiTransitionSnapshot(
+                    coverageSize,
+                    title,
+                    detail);
+
+            UiTransitionSnapshotWindow overlay =
+                new UiTransitionSnapshotWindow
+                {
+                    FormBorderStyle =
+                        FormBorderStyle.None,
+                    ShowInTaskbar = false,
+                    StartPosition =
+                        FormStartPosition.Manual,
+                    Location = Location,
+                    Size = coverageSize,
+                    MinimumSize = coverageSize,
+                    MaximumSize = coverageSize,
+                    BackColor = BackColor,
+                    BackgroundImage = snapshot,
+                    BackgroundImageLayout =
+                        ImageLayout.None,
+                    TopMost = TopMost,
+                    AnimationCardBounds = GetTransitionAnimationCardBounds(coverageSize)
+                };
+
+            overlay.Show(this);
+            overlay.BringToFront();
+            overlay.StartAircraftAnimation();
+            overlay.Refresh();
+
+            return overlay;
+        }
+
+        private void CloseUiTransitionSnapshotWindow(
+            UiTransitionSnapshotWindow overlay)
+        {
+            if (overlay == null)
+            {
+                return;
+            }
+
+            try
+            {
+                Image snapshot =
+                    overlay.BackgroundImage;
+
+                overlay.BackgroundImage = null;
+
+                if (!overlay.IsDisposed)
+                {
+                    overlay.Hide();
+                    overlay.Close();
+                    overlay.Dispose();
+                }
+
+                snapshot?.Dispose();
+            }
+            catch
+            {
+                // Cosmetic transition cleanup only.
+            }
+        }
+
+        private void UpdateUiTransitionOverlayBounds()
+        {
+            if (uiTransitionOverlayPanel == null ||
+                uiTransitionOverlayPanel.IsDisposed ||
+                screenPanel == null ||
+                screenPanel.IsDisposed)
+            {
+                return;
+            }
+
+            try
+            {
+                if (!ReferenceEquals(
+                        uiTransitionOverlayPanel.Parent,
+                        screenPanel))
+                {
+                    uiTransitionOverlayPanel.Parent?.Controls.Remove(
+                        uiTransitionOverlayPanel);
+
+                    screenPanel.Controls.Add(
+                        uiTransitionOverlayPanel);
+                }
+
+                // Never cover the whole DCDU during a transition. A compact
+                // status card is painted on the current screen and the form's
+                // redraw is then frozen while the actual hierarchy is rebuilt.
+                int cardWidth = Math.Min(
+                    Math.Max(S(230), 190),
+                    Math.Max(S(150), screenPanel.ClientSize.Width - S(36)));
+
+                int cardHeight = Math.Min(
+                    Math.Max(S(66), 54),
+                    Math.Max(S(54), screenPanel.ClientSize.Height - S(28)));
+
+                uiTransitionOverlayPanel.Dock = DockStyle.None;
+                uiTransitionOverlayPanel.Size =
+                    new Size(cardWidth, cardHeight);
+
+                uiTransitionOverlayPanel.Location =
+                    new Point(
+                        Math.Max(
+                            0,
+                            (screenPanel.ClientSize.Width - cardWidth) / 2),
+                        Math.Max(
+                            0,
+                            (screenPanel.ClientSize.Height - cardHeight) / 2));
+
+                int innerMargin = Math.Max(S(10), 8);
+                int contentWidth = Math.Max(
+                    S(80),
+                    cardWidth - (innerMargin * 2));
+
+                int titleHeight = Math.Max(S(25), 20);
+                int detailHeight = Math.Max(S(17), 14);
+                int trackHeight = Math.Max(S(2), 2);
+
+                uiTransitionOverlayTitleLabel.Location =
+                    new Point(innerMargin, S(7));
+
+                uiTransitionOverlayTitleLabel.Size =
+                    new Size(contentWidth, titleHeight);
+
+                uiTransitionOverlayDetailLabel.Location =
+                    new Point(
+                        innerMargin,
+                        uiTransitionOverlayTitleLabel.Bottom);
+
+                uiTransitionOverlayDetailLabel.Size =
+                    new Size(contentWidth, detailHeight);
+
+                int trackWidth = Math.Max(
+                    S(90),
+                    (int)Math.Round(contentWidth * 0.72));
+
+                uiTransitionOverlayTrackPanel.Location =
+                    new Point(
+                        Math.Max(
+                            0,
+                            (cardWidth - trackWidth) / 2),
+                        Math.Min(
+                            cardHeight - trackHeight - S(7),
+                            uiTransitionOverlayDetailLabel.Bottom + S(5)));
+
+                uiTransitionOverlayTrackPanel.Size =
+                    new Size(trackWidth, trackHeight);
+
+                uiTransitionOverlayFillPanel.Location =
+                    Point.Empty;
+
+                uiTransitionOverlayFillPanel.Height =
+                    uiTransitionOverlayTrackPanel.ClientSize.Height;
+            }
+            catch
+            {
+                // Transition UI is cosmetic only.
+            }
+        }
+
+        private void EnsureUiTransitionOverlay()
+        {
+            if (uiTransitionOverlayPanel != null &&
+                !uiTransitionOverlayPanel.IsDisposed)
+            {
+                return;
+            }
+
+            uiTransitionOverlayPanel = new Panel
+            {
+                BackColor = Color.FromArgb(5, 12, 20),
+                Visible = false,
+                Enabled = false,
+                TabStop = false,
+                BorderStyle = BorderStyle.None
+            };
+
+            uiTransitionOverlayPanel.Paint += (_, e) =>
+            {
+                using Pen borderPen = new(
+                    Color.FromArgb(150, DcduTheme.Cyan),
+                    Math.Max(1.0f, SF(1.0f)));
+
+                Rectangle border =
+                    uiTransitionOverlayPanel.ClientRectangle;
+
+                if (border.Width > 1 && border.Height > 1)
+                {
+                    border.Width -= 1;
+                    border.Height -= 1;
+                    e.Graphics.DrawRectangle(borderPen, border);
+                }
+            };
+
+            uiTransitionOverlayTitleLabel =
+                new System.Windows.Forms.Label
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    ForeColor = DcduTheme.Cyan,
+                    Font = CreateDpiStablePointFont(
+                        "Consolas",
+                        11.0f,
+                        FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Text = "LOADING..."
+                };
+
+            uiTransitionOverlayDetailLabel =
+                new System.Windows.Forms.Label
+                {
+                    AutoSize = false,
+                    BackColor = Color.Transparent,
+                    ForeColor = MainPrimaryTextColor(),
+                    Font = CreateDpiStablePointFont(
+                        "Consolas",
+                        8.5f,
+                        FontStyle.Bold),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Text = "PLEASE WAIT"
+                };
+
+            uiTransitionOverlayTrackPanel = new Panel
+            {
+                BackColor = Color.FromArgb(46, 58, 68)
+            };
+
+            uiTransitionOverlayFillPanel = new Panel
+            {
+                BackColor = DcduTheme.Cyan
+            };
+
+            uiTransitionOverlayTrackPanel.Controls.Add(
+                uiTransitionOverlayFillPanel);
+
+            uiTransitionOverlayPanel.Controls.Add(
+                uiTransitionOverlayTitleLabel);
+            uiTransitionOverlayPanel.Controls.Add(
+                uiTransitionOverlayDetailLabel);
+            // No progress track in the in-window fallback either.
+            uiTransitionOverlayTrackPanel.Visible = false;
+
+            if (screenPanel != null && !screenPanel.IsDisposed)
+            {
+                screenPanel.Controls.Add(uiTransitionOverlayPanel);
+                uiTransitionOverlayPanel.Dock = DockStyle.None;
+                uiTransitionOverlayPanel.BringToFront();
+            }
+
+            UpdateUiTransitionOverlayBounds();
+        }
+
+        private void ShowUiTransitionOverlay(
+            string title,
+            string detail)
+        {
+            EnsureUiTransitionOverlay();
+
+            if (uiTransitionOverlayPanel == null ||
+                uiTransitionOverlayPanel.IsDisposed)
+            {
+                return;
+            }
+
+            UpdateUiTransitionOverlayBounds();
+
+            uiTransitionOverlayTitleLabel.Text =
+                string.IsNullOrWhiteSpace(title)
+                    ? "LOADING..."
+                    : title.Trim().ToUpperInvariant();
+
+            uiTransitionOverlayDetailLabel.Text =
+                string.IsNullOrWhiteSpace(detail)
+                    ? "PLEASE WAIT"
+                    : detail.Trim().ToUpperInvariant();
+
+            uiTransitionOverlayFillPanel.Width =
+                Math.Max(
+                    S(24),
+                    (int)Math.Round(
+                        uiTransitionOverlayTrackPanel.ClientSize.Width *
+                        0.34));
+
+            uiTransitionOverlayPanel.Visible = true;
+            uiTransitionOverlayPanel.Dock = DockStyle.None;
+            uiTransitionOverlayPanel.BringToFront();
+            uiTransitionOverlayPanel.Refresh();
+            uiTransitionOverlayTitleLabel.Refresh();
+            uiTransitionOverlayDetailLabel.Refresh();
+            // Flight is painted by the independent snapshot window.
+        }
+
+        private void HideUiTransitionOverlay()
+        {
+            if (uiTransitionOverlayPanel == null ||
+                uiTransitionOverlayPanel.IsDisposed)
+            {
+                return;
+            }
+
+            uiTransitionOverlayPanel.Visible = false;
+        }
+
+        private async Task RunUiTransitionAsync(
+            string title,
+            string detail,
+            Action rebuildAction,
+            Size? targetWindowSize = null)
+        {
+            if (rebuildAction == null)
+            {
+                return;
+            }
+
+            if (uiTransitionInProgress)
+            {
+                return;
+            }
+
+            uiTransitionInProgress = true;
+            UiTransitionSnapshotWindow snapshotWindow = null;
+
+            try
+            {
+                Size targetSize =
+                    targetWindowSize ??
+                    new Size(
+                        Math.Max(1, Width),
+                        Math.Max(1, Height));
+
+                snapshotWindow =
+                    ShowUiTransitionSnapshotWindow(
+                        title,
+                        detail,
+                        targetSize);
+
+                // Allow the independent snapshot window to become visible before
+                // the real MainForm starts rebuilding underneath it.
+                await Task.Delay(35);
+
+                Stopwatch transitionStopwatch =
+                    Stopwatch.StartNew();
+
+                rebuildAction();
+
+                LogAsyncOperationDuration(
+                    "UI transition: " + title,
+                    transitionStopwatch);
+
+                // Fully paint the finished target UI while it is still hidden by
+                // the separate snapshot window.
+                if (!IsDisposed)
+                {
+                    Invalidate(true);
+                    Update();
+                }
+
+                // The snapshot is cosmetic, but the airplane should get time
+                // to cross the loading card. This is async and does NOT sleep
+                // or block the WinForms UI message pump.
+                const int minimumTransitionMs = 900;
+                int remaining = minimumTransitionMs -
+                    (int)transitionStopwatch.ElapsedMilliseconds;
+                if (remaining > 0)
+                {
+                    await Task.Delay(remaining);
+                }
+            }
+            catch (Exception ex)
+            {
+                try
+                {
+                    Logger.Debug(
+                        "UI transition failed: " +
+                        ex.Message);
+                }
+                catch
+                {
+                }
+            }
+            finally
+            {
+                CloseUiTransitionSnapshotWindow(
+                    snapshotWindow);
+
+                uiTransitionInProgress = false;
+            }
+        }
+
         private void ShowEmbeddedSetupMainMenu()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.MainMenu);
@@ -33502,55 +37287,107 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             AddEmbeddedSetupLabel(page, "<SETUP MENU", 4, EmbeddedSetupLskTextY(page, EmbeddedSetupBottomIndex()), 230, 30, ContentAlignment.MiddleLeft, color, EmbeddedSetupMenuFont());
         }
 
+        private void AddEmbeddedSetupOptionCell(
+            Panel page,
+            int lskRow,
+            bool rightSide,
+            string caption,
+            string value,
+            bool enabled = true)
+        {
+            // Use actual canvas pixels for the two columns. The existing
+            // AddEmbeddedSetupLabel scales logical positions and would drift
+            // when positioning a right-hand column at 60-120% UI scale.
+            int gap = Math.Max(2, S(12));
+            int margin = Math.Max(2, S(5));
+            int midpoint = page.ClientSize.Width / 2;
+            int left = rightSide ? midpoint + gap / 2 : margin;
+            int right = rightSide
+                ? page.ClientSize.Width - margin
+                : midpoint - gap / 2;
+            int width = Math.Max(1, right - left);
+            int rowY = rightSide
+                ? EmbeddedSetupRightLskTextY(page, lskRow)
+                : EmbeddedSetupLskTextY(page, lskRow);
+            int y = ScaleChildY(page, rowY);
+            ContentAlignment alignment = rightSide
+                ? ContentAlignment.MiddleRight
+                : ContentAlignment.MiddleLeft;
+            Color titleColor = enabled
+                ? MainPrimaryTextColor()
+                : Color.FromArgb(113, 125, 134);
+            Color valueColor = enabled
+                ? DcduTheme.Amber
+                : Color.FromArgb(113, 125, 134);
+
+            System.Windows.Forms.Label title = new()
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                Font = EmbeddedSetupCaptionFont(),
+                ForeColor = titleColor,
+                Text = caption,
+                TextAlign = alignment,
+                Location = new Point(left, y),
+                Size = new Size(width, Math.Max(1, S(16))),
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+                AutoEllipsis = false
+            };
+            System.Windows.Forms.Label setting = new()
+            {
+                AutoSize = false,
+                BackColor = Color.Transparent,
+                Font = EmbeddedSetupMenuFont(),
+                ForeColor = valueColor,
+                Text = rightSide ? value + ">" : "<" + value,
+                TextAlign = alignment,
+                Location = new Point(left, y + S(15)),
+                Size = new Size(width, Math.Max(1, S(21))),
+                Margin = Padding.Empty,
+                Padding = Padding.Empty,
+                AutoEllipsis = false
+            };
+            page.Controls.Add(title);
+            page.Controls.Add(setting);
+            title.BringToFront();
+            setting.BringToFront();
+        }
+
         private void ShowEmbeddedSetupOptionsPage()
         {
             PrepareEmbeddedSetupPage(EmbeddedSetupPage.Options);
             if (DcduStyleManager.IsA220)
             {
+                // The A220 touch-screen options remain entirely unchanged.
                 Panel a220Page = CreateEmbeddedSetupCanvas();
                 RenderA220SetupOptionsPage(a220Page);
                 return;
             }
+
             Panel page = CreateEmbeddedSetupCanvas();
-            Font titleFont = EmbeddedSetupTitleFont();
-            Font menuFont = EmbeddedSetupMenuFont();
             Color color = MainPrimaryTextColor();
+            // Leave a real gap before LSK row 1, including at 60% scale.
+            AddEmbeddedSetupLabel(page, "SETUP OPTIONS", 0, 0, page.Width, 17,
+                ContentAlignment.MiddleCenter, color, EmbeddedSetupTitleFont());
 
-            int bottom = EmbeddedSetupBottomIndex();
-            int soundRow = 1;
-            int autoDeleteRow = 2;
-            int timerRow = AutoDeleteRequestMessages ? 3 : -1;
-            int fsuipcRow = AutoDeleteRequestMessages ? 4 : 3;
-            int textSizeRow = AutoDeleteRequestMessages
-                ? (DcduStyleManager.IsBoeing ? 5 : bottom)
-                : 4;
+            // All six options remain visible and directly selectable, without
+            // MORE OPTIONS, hidden scrollbars, or an extra navigation page.
+            AddEmbeddedSetupOptionCell(page, 1, false, "SOUND ALERT", EmbeddedSetupOnOff(PlaySound));
+            AddEmbeddedSetupOptionCell(page, 1, true, "AUTO DELETE MSG", EmbeddedSetupOnOff(AutoDeleteRequestMessages));
+            AddEmbeddedSetupOptionCell(page, 2, false, "AUTO DELETE TIMER",
+                AutoDeleteRequestMessages
+                    ? AutoDeleteRequestMessageSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + " SEC"
+                    : "OFF",
+                AutoDeleteRequestMessages);
+            AddEmbeddedSetupOptionCell(page, 2, true, "USE FSUIPC", EmbeddedSetupOnOff(UseFSUIPC));
+            AddEmbeddedSetupOptionCell(page, 3, false, "MSG LSK MODE", EmbeddedSetupOnOff(MessageOverviewLskModeEnabled));
+            AddEmbeddedSetupOptionCell(page, 3, true, "MSG TEXT SIZE", MessageTextSize.ToUpperInvariant());
 
-            AddEmbeddedSetupLabel(page, "SETUP OPTIONS", 0, 2, page.Width, 24, ContentAlignment.MiddleCenter, color, titleFont);
-
-            AddEmbeddedSetupLabel(page, "SOUND ALERT", 4, EmbeddedSetupLskTextY(page, soundRow), 260, 30, ContentAlignment.MiddleLeft, color, menuFont);
-            AddEmbeddedSetupLabel(page, EmbeddedSetupOnOff(PlaySound) + ">", page.Width - 130, EmbeddedSetupRightLskTextY(page, soundRow), 126, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
-
-            AddEmbeddedSetupLabel(page, "AUTO DELETE MSG", 4, EmbeddedSetupLskTextY(page, autoDeleteRow), 300, 30, ContentAlignment.MiddleLeft, color, menuFont);
-            AddEmbeddedSetupLabel(page, EmbeddedSetupOnOff(AutoDeleteRequestMessages) + ">", page.Width - 130, EmbeddedSetupRightLskTextY(page, autoDeleteRow), 126, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
-
-            if (AutoDeleteRequestMessages)
-            {
-                AddEmbeddedSetupLabel(page, "AUTO DELETE TIMER", 4, EmbeddedSetupLskTextY(page, timerRow), 300, 30, ContentAlignment.MiddleLeft, color, menuFont);
-                AddEmbeddedSetupLabel(page, AutoDeleteRequestMessageSeconds.ToString(System.Globalization.CultureInfo.InvariantCulture) + "S>", page.Width - 130, EmbeddedSetupRightLskTextY(page, timerRow), 126, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
-            }
-
-            AddEmbeddedSetupLabel(page, "USE FSUIPC", 4, EmbeddedSetupLskTextY(page, fsuipcRow), 260, 30, ContentAlignment.MiddleLeft, color, menuFont);
-            AddEmbeddedSetupLabel(page, EmbeddedSetupOnOff(UseFSUIPC) + ">", page.Width - 130, EmbeddedSetupRightLskTextY(page, fsuipcRow), 126, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
-
-            int textSizeLabelX = (AutoDeleteRequestMessages && !DcduStyleManager.IsBoeing) ? 150 : 4;
-            int textSizeLabelWidth = (AutoDeleteRequestMessages && !DcduStyleManager.IsBoeing) ? 145 : 280;
-            AddEmbeddedSetupLabel(page, "MSG TEXT SIZE", textSizeLabelX, EmbeddedSetupLskTextY(page, textSizeRow), textSizeLabelWidth, 30, ContentAlignment.MiddleLeft, color, menuFont);
-            AddEmbeddedSetupLabel(page, MessageTextSize.ToUpperInvariant() + ">", page.Width - 190, EmbeddedSetupRightLskTextY(page, textSizeRow), 186, 30, ContentAlignment.MiddleRight, DcduTheme.Amber, menuFont);
-
-            AddEmbeddedSetupLabel(page, "<SETUP MENU", 4, EmbeddedSetupLskTextY(page, bottom), 140, 30, ContentAlignment.MiddleLeft, color, menuFont);
+            AddEmbeddedSetupLabel(page, "<SETUP MENU", 4,
+                EmbeddedSetupLskTextY(page, EmbeddedSetupBottomIndex()),
+                220, 30, ContentAlignment.MiddleLeft, color, EmbeddedSetupMenuFont());
         }
-
-
 
         private static int[] EmbeddedSetupAutoDeleteTimerValues()
         {
@@ -33945,9 +37782,38 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void SetEmbeddedSetupWindowScale(int percent)
         {
-            WindowScalePercent = percent;
-            Properties.Settings.Default.Save();
-            RefreshWindowScaleUi();
+            _ = SetEmbeddedSetupWindowScaleAsync(percent);
+        }
+
+        private async Task SetEmbeddedSetupWindowScaleAsync(int percent)
+        {
+            int normalizedPercent =
+                NormalizeWindowScalePercent(
+                    percent.ToString(
+                        System.Globalization.CultureInfo.InvariantCulture));
+
+            if (normalizedPercent == WindowScalePercent)
+            {
+                ShowEmbeddedSetupStylePage();
+                return;
+            }
+
+            Size targetWindowSize =
+                GetDcduTransitionTargetWindowSize(
+                    DcduStyleManager.CurrentStyle,
+                    normalizedPercent);
+
+            await RunUiTransitionAsync(
+                "APPLYING DISPLAY SCALE...",
+                normalizedPercent.ToString(
+                    System.Globalization.CultureInfo.InvariantCulture) + "%",
+                () =>
+                {
+                    WindowScalePercent = normalizedPercent;
+                    Properties.Settings.Default.Save();
+                    RefreshWindowScaleUi();
+                },
+                targetWindowSize);
         }
 
         private void ResetScaleSensitivePopups()
@@ -34167,12 +38033,23 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void SetEmbeddedSetupDisplayStyle(string style)
         {
+            _ = SetEmbeddedSetupDisplayStyleAsync(style);
+        }
+
+        private async Task SetEmbeddedSetupDisplayStyleAsync(string style)
+        {
             string selected;
-            if (string.Equals(style, DcduStyleManager.Boeing, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(
+                    style,
+                    DcduStyleManager.Boeing,
+                    StringComparison.OrdinalIgnoreCase))
             {
                 selected = DcduStyleManager.Boeing;
             }
-            else if (string.Equals(style, DcduStyleManager.A220, StringComparison.OrdinalIgnoreCase))
+            else if (string.Equals(
+                         style,
+                         DcduStyleManager.A220,
+                         StringComparison.OrdinalIgnoreCase))
             {
                 selected = DcduStyleManager.A220;
             }
@@ -34181,10 +38058,32 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                 selected = DcduStyleManager.Airbus;
             }
 
-            DcduStyleManager.CurrentStyle = selected;
-            Properties.Settings.Default.Save();
-            ApplyDisplayStyle();
-            ShowEmbeddedSetupStylePage();
+            if (string.Equals(
+                    selected,
+                    DcduStyleManager.CurrentStyle,
+                    StringComparison.OrdinalIgnoreCase))
+            {
+                ShowEmbeddedSetupStylePage();
+                return;
+            }
+
+            Size targetWindowSize =
+                GetDcduTransitionTargetWindowSize(
+                    selected,
+                    WindowScalePercent);
+
+            await RunUiTransitionAsync(
+                "APPLYING DCDU STYLE...",
+                selected,
+                () =>
+                {
+                    DcduStyleManager.CurrentStyle = selected;
+                    Properties.Settings.Default.Save();
+                    ResetHardwareMessageOverviewPage();
+                    ApplyDisplayStyle();
+                    ShowEmbeddedSetupStylePage();
+                },
+                targetWindowSize);
         }
 
         private void ToggleEmbeddedSetupPlaySound()
@@ -34233,10 +38132,8 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
                         continue;
                     }
 
-                    int index = outputTable.Controls.GetChildIndex(message);
-                    if (index >= 0 &&
-                        index + 1 < outputTable.Controls.Count &&
-                        outputTable.Controls[index + 1] is TimerLabel menuLabel)
+                    TimerLabel menuLabel = FindMenuLabelForMessage(message);
+                    if (menuLabel != null)
                     {
                         StartAutoDeleteRequestMessageIfNeeded(message, menuLabel);
                     }
@@ -34276,6 +38173,17 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
             ShowEmbeddedSetupOptionsPage();
         }
 
+        private void ToggleEmbeddedSetupMessageOverviewLskMode()
+        {
+            MessageOverviewLskModeEnabled = !MessageOverviewLskModeEnabled;
+            Properties.Settings.Default.Save();
+            ResetHardwareMessageOverviewPage();
+            // Setup is currently covering the main overview. Rebuilding the
+            // overview now made a scroll bar flash through the Boeing menu.
+            // RestoreMainScreenFromEmbeddedPage applies the layout on exit.
+            ShowEmbeddedSetupOptionsPage();
+        }
+
         private void CycleEmbeddedSetupMessageTextSize()
         {
             string current = MessageTextSize;
@@ -34299,9 +38207,20 @@ private static void DrawLogonVersionOnControl(Control control, Rectangle version
 
         private void CloseEmbeddedSetupPages()
         {
-            embeddedSetupPage = EmbeddedSetupPage.None;
-            embeddedSetupInputs.Clear();
-            RestoreMainScreenFromEmbeddedPage();
+            _ = CloseEmbeddedSetupPagesAsync();
+        }
+
+        private async Task CloseEmbeddedSetupPagesAsync()
+        {
+            await RunUiTransitionAsync(
+                "RETURNING TO MAIN DISPLAY...",
+                "RESTORING DCDU",
+                () =>
+                {
+                    embeddedSetupPage = EmbeddedSetupPage.None;
+                    embeddedSetupInputs.Clear();
+                    RestoreMainScreenFromEmbeddedPage();
+                });
         }
 
         private void SettingsButton_Click(object sender, EventArgs e)
@@ -34378,7 +38297,9 @@ along with this program.If not, see <https://www.gnu.org/licenses/>.", String.Fo
 
                 foreach (var item in controlsToMove)
                 {
-                    panel.SetRow(item.Control, item.Position.Row + 1);
+                    panel.SetCellPosition(item.Control,
+                        new TableLayoutPanelCellPosition(
+                            item.Position.Column, item.Position.Row + 1));
                 }
             }
             finally
@@ -34412,7 +38333,8 @@ along with this program.If not, see <https://www.gnu.org/licenses/>.", String.Fo
                     var control = panel.GetControlFromPosition(j, i);
                     if (control != null)
                     {
-                        panel.SetRow(control, i - 1);
+                        panel.SetCellPosition(control,
+                            new TableLayoutPanelCellPosition(j, i - 1));
                     }
                 }
             }
@@ -34424,8 +38346,13 @@ along with this program.If not, see <https://www.gnu.org/licenses/>.", String.Fo
 
             panel.RowCount--;
 
-            panel.AutoScroll = false;
-            panel.AutoScroll = true;
+            // Do not resurrect WinForms AutoScroll for the Airbus/Boeing
+            // LSK-paged message overview when a message is deleted.
+            if (panel.AutoScroll)
+            {
+                panel.AutoScroll = false;
+                panel.AutoScroll = true;
+            }
         }
     }
 }
